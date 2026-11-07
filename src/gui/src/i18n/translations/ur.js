@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const ur = {
         account: 'اکاؤنٹ',
         account_password: 'اکاؤنٹ پاس ورڈ کی تصدیق کریں',
         access_granted_to: 'رسائی مسموح ہے',
-        add_existing_account: 'موجودہ اکاؤنٹ شامل کریں',
+        add_another_account: 'دوسرا اکاؤنٹ شامل کریں',
         all_fields_required: 'تمام شعبوں کی ضرورت ہے',
         apply: 'لگائیں ',
         ascending: 'بڑھتی ہوئی',
@@ -89,11 +89,6 @@ const ur = {
         credits: 'کریڈٹس',
         current_password: 'موجودہ پاس ورڈ',
         cut: 'کاٹیں',
-        clock: 'گھڑی',
-        clock_visible_hide: 'چھپائیں - ہمیشہ پوشیدہ',
-        clock_visible_show: 'دکھائیں - ہمیشہ دکھائی دیں۔',
-        clock_visible_auto:
-      'خودکار - پہلے سے طے شدہ، صرف فل سکرین موڈ میں نظر آتا ہے۔',
         date_modified: 'تاریخ تبدیل',
         default: 'پہلے سے طے شدہ',
         delete: 'حذف کریں',
@@ -358,7 +353,6 @@ const ur = {
         'allow': 'اجازت دینا', // In English: "Allow"
         'associated_websites': 'متعلقہ ویب سائٹس', // In English: "Associated Websites"
         'change': 'تبدیل کرنا', // In English: "Change"
-        'clock_visibility': 'گھڑی کی نمائش', // In English: "Clock Visibility"
         'confirm': 'تصدیق', // In English: "Confirm"
         'confirm_your_email_address': 'اپنے ای میل ایڈریس کی تصدیق کریں', // In English: "Confirm Your Email Address"
         'close_all': 'سب کو بند کریں', // In English: "Close All"

@@ -18,7 +18,18 @@
  */
 
 import { PROCESS_IPC_ATTACHED, Service } from '../definitions.js';
-import launch_app from '../helpers/launch_app.js';
+import launch_app from '../helpers/launchApp.js';
+import { expand_home_path } from '../helpers/expandHomePath.js';
+import { withoutNotificationClick } from '../helpers/notificationTap.js';
+
+// The /apps endpoint serializes `godmode` as a boolean; older cached shapes used 0/1.
+const is_godmode = (app_info) =>
+    !! app_info && (app_info.godmode === true || app_info.godmode === 1);
+
+const resolve_app = async (name) => {
+    if ( ! name || name === 'explorer' ) return null;
+    return puter.apps.get(name, { icon_size: 64 });
+};
 
 export class ExecService extends Service {
     static description = `
@@ -48,9 +59,18 @@ export class ExecService extends Service {
     }
 
     // This method is exposed to apps via IPCService.
-    async launchApp ({ app_name, args, pseudonym, file_paths, items }, { ipc_context, msg_id } = {}) {
+    async launchApp ({ app_name, args, pseudonym, file_paths, items, background }, { ipc_context, msg_id } = {}) {
         const app = ipc_context?.caller?.app;
         const process = ipc_context?.caller?.process;
+
+        // Only a godmode app may launch another godmode app.
+        const target_app_info = await resolve_app(app_name);
+        if ( is_godmode(target_app_info) ) {
+            const caller_app_info = await resolve_app(process?.name);
+            if ( ! is_godmode(caller_app_info) ) {
+                throw new Error('Launching this app is not allowed.');
+            }
+        }
 
         // This mechanism will be replated with xdrpc soon
         const child_instance_id = window.uuidv4();
@@ -60,8 +80,6 @@ export class ExecService extends Service {
             source: process.uuid,
             target: child_instance_id,
         }) : undefined;
-
-        this.log.info('launchApp connection', connection);
 
         const params = {};
         for ( const provider of this.param_providers ) {
@@ -94,12 +112,18 @@ export class ExecService extends Service {
         // Handle file paths if provided and caller is in godmode
         let launch_options = {
             launched_by_exec_service: true,
-            name: app_name,
+            name: target_app_info?.name ?? app_name,
+            app_obj: target_app_info,
             pseudonym,
-            args: args ?? {},
+            args: withoutNotificationClick(args) ?? {},
             parent_instance_id: app?.appInstanceID,
             uuid: child_instance_id,
             params,
+            // A background launch starts the window hidden: the caller wants the
+            // app to do work, not to be looked at. It stays the caller's alone
+            // — no taskbar item, no running dot, and not what the user's own
+            // "open this app" finds — until it shows itself.
+            ...(background === true ? { background: true } : {}),
             ...source_app_metadata,
             ...(connection ? {
                 parent_pseudo_id: connection.backward.uuid,
@@ -116,34 +140,30 @@ export class ExecService extends Service {
         // Check if file_paths are provided and caller has godmode permissions
         if ( file_paths && Array.isArray(file_paths) && file_paths.length > 0 && process ) {
             try {
-                console.log('file_paths', file_paths);
                 // Get caller app info to check godmode status
                 const caller_app_name = process.name;
                 const caller_app_info = await window.get_apps(caller_app_name);
 
-                // Check if caller is in godmode
-                if ( caller_app_info && caller_app_info.godmode === 1 ) {
-                    this.log.info(`⚠️ GODMODE app ${caller_app_name} launching ${app_name} with files:`, file_paths);
-
+                // Check if caller is in godmode. The /apps endpoint serializes
+                // `godmode` as a boolean while older shapes used 0/1, so
+                // accept both (same guard as launchApp.js).
+                if ( caller_app_info && (caller_app_info.godmode === true || caller_app_info.godmode === 1) ) {
                     // Get target app info to create file signatures
                     const target_app_info = await puter.apps.get(app_name);
 
                     // For the first file, create a file signature and set it up like opening a file
                     if ( file_paths.length > 0 ) {
-                        let first_file_path = file_paths[0];
-
-                        // resolve tilde to home path (i.e. ~/Desktop/file.txt -> /[username]/Desktop/file.txt)
-                        if ( first_file_path.startsWith('~/') )
-                        {
-                            first_file_path = window.home_path + first_file_path.slice(1);
-                        }
+                        // i.e. ~/Desktop/file.txt -> /[username]/Desktop/file.txt
+                        const first_file_path = expand_home_path(file_paths[0], window.home_path);
 
                         try {
                             // Get file stats to verify it exists
                             const file_stat = await puter.fs.stat({ path: first_file_path, consistency: 'eventual' });
 
-                            // Create file signature for the target app
-                            const file_signature_result = await puter.fs.sign(target_app_info.uuid, {
+                            // Create file signature for the target app.
+                            // puter.apps.get returns `uid`; `uuid` is kept as
+                            // a fallback for any older cached shape.
+                            const file_signature_result = await puter.fs.sign(target_app_info.uid ?? target_app_info.uuid, {
                                 path: first_file_path,
                                 action: 'write',
                             });
@@ -162,23 +182,35 @@ export class ExecService extends Service {
                         }
                     }
 
-                } else {
-                    console.log(`⚠️ App ${caller_app_name} attempted to launch ${app_name} with files but does not have godmode permissions`);
-                    // Continue with normal launch, ignoring file_paths
                 }
             } catch ( error ) {
-                console.log('Error checking godmode permissions:', error);
+                this.log.warn('Error checking godmode permissions', error);
                 // Continue with normal launch
             }
         }
 
         // The "body" of this method is in a separate file
-        const child_process = await launch_app(launch_options);
+        const child_launch_outcome = await launch_app(launch_options);
+        const launchResult = child_launch_outcome?.launchResult;
+        const child_process = child_launch_outcome?.references?.iframe
+            ? child_launch_outcome
+            : null;
+
+        if ( ! child_process ) {
+            return {
+                appInstanceID: launchResult?.appInstanceID ?? null,
+                usesSDK: false,
+                ...(launchResult ? { response: { launchResult } } : {}),
+            };
+        }
 
         const send_child_launched_msg = (...a) => {
-            if ( ! process ) return;
             // TODO: (maybe) message process instead of iframe
             const parent_iframe = process?.references?.iframe;
+            // The app that launched this one may already be gone — a child it
+            // launched in the background is closed with it, and this fires on
+            // the way out. Nobody to tell.
+            if ( ! parent_iframe?.contentWindow ) return;
             parent_iframe.contentWindow.postMessage({
                 msg: 'childAppLaunched',
                 original_msg_id: msg_id,
@@ -197,10 +229,13 @@ export class ExecService extends Service {
             // Send any saved broadcasts to the new app
             globalThis.services.get('broadcast').sendSavedBroadcastsTo(child_instance_id);
 
-            // If `window-active` is set (meanign the window is focused), focus the window one more time
+            // If `window-active` is set (meaning the window is focused), focus the window one more time
             // this is to ensure that the iframe is `definitely` focused and can receive keyboard events (e.g. keydown)
-            if ( $(child_process.references.el_win).hasClass('window-active') ) {
-                $(child_process.references.el_win).focusWindow();
+            // Never for a hidden window: taking the keyboard for something the
+            // user cannot see would drop them out of the app they are typing in.
+            const $child_win = $(child_process.references.el_win);
+            if ( $child_win.attr('data-is_visible') !== '0' && $child_win.hasClass('window-active') ) {
+                $child_win.focusWindow();
             }
         });
 
@@ -212,9 +247,12 @@ export class ExecService extends Service {
                 window.report_app_closed(child_process.uuid);
             }
 
-            process.references.iframe.contentWindow.postMessage({
+            // Same here: this handler runs inside jQuery's remove(), so a throw
+            // on a dead parent would abort the removal itself and leave the
+            // window in the DOM (running dot and all).
+            parent_iframe?.contentWindow?.postMessage({
                 msg: 'appClosed',
-                appInstanceID: connection.forward.uuid,
+                appInstanceID: connection?.forward?.uuid,
                 statusCode: 0,
             }, '*');
         });
@@ -223,6 +261,7 @@ export class ExecService extends Service {
             appInstanceID: connection ?
                 connection.forward.uuid : child_instance_id,
             usesSDK: true,
+            ...(launchResult ? { response: { launchResult } } : {}),
         };
     }
 

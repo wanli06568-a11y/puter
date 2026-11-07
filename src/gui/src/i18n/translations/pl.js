@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const pl = {
         account: 'Konto',
         account_password: 'Sprawdź hasło do konta',
         access_granted_to: 'Przyznano dostęp do',
-        add_existing_account: 'Dodaj istniejące konto',
+        add_another_account: 'Dodaj inne konto',
         all_fields_required: 'Wszystkie pola są wymagane.',
         allow: 'Pozwól',
         apply: 'Zaaplikuj',
@@ -84,10 +84,6 @@ const pl = {
         credits: 'Licencje',
         current_password: 'Aktualne hasło',
         cut: 'Wytnij',
-        clock: 'Zegar',
-        clock_visible_hide: 'Ukryj - zawsze ukryty',
-        clock_visible_show: 'Pokaż - zawsze widoczny',
-        clock_visible_auto: 'Automatycznie (domyślne) - widoczny tylko w trybie pełnoekranowym',
         close_all: 'Zamknij wszystko',
         created: 'Stworzone',
         date_modified: 'Data zmodyfikowania',
@@ -343,7 +339,6 @@ const pl = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         'change': 'Zmiana',
-        'clock_visibility': 'Widoczność zegara',
         'plural_suffix': undefined, //In polish there is a ton of plural suffixes, so will be left empty eg Samochód (car) → Samochody (cars) and Pies (dog) → Psy (dogs)
         'reading': 'Odczyt %strong%',
         'writing': 'Pisownia %strong%',

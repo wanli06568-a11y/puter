@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const it = {
         account: 'Account',
         account_password: 'Verifica  Password del account',
         access_granted_to: 'Accesso garantito a',
-        add_existing_account: 'Aggiungi un account esistente',
+        add_another_account: 'Aggiungi un altro account',
         all_fields_required: 'Tutti i campi sono richiesti.',
         allow: 'Consenti',
         apply: 'Applica',
@@ -93,11 +93,6 @@ const it = {
         credits: 'Crediti',
         current_password: 'Password attuale',
         cut: 'Taglia',
-        clock: 'Orologio',
-        clock_visible_hide: 'Nascondi - Sempre nascosto',
-        clock_visible_show: 'Mostra - Sempre visibile',
-        clock_visible_auto:
-      'Auto - Default, visibile solo in modalità schermo intero',
         close_all: 'Chiudi tutte',
         created: 'Creata',
         date_modified: 'Data ultima modifica',
@@ -378,7 +373,6 @@ const it = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         change: 'Cambia', // In English: "Change"
-        clock_visibility: 'Visibilità orologio', // In English: "Clock Visibility"
         reading: 'Legendo %strong%', // In English: "Reading %strong%"
         writing: 'Scrivendo %strong%', // In English: "Writing %strong%"
         unzipping: 'Decompressione di %strong%', // In English: "Unzipping %strong%"

@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -23,7 +23,7 @@ const emoji = {
     code: 'emoji',
     dictionary: {
         access_granted_to: '🔓✅',
-        add_existing_account: '➕🔄👤',
+        add_another_account: '➕👤',
         all_fields_required: '📝🔒✅',
         apply: '📋🔄',
         ascending: '🔼',

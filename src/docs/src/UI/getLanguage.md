@@ -4,7 +4,7 @@ description: Retrieves the current language/locale code from the Puter environme
 platforms: [apps]
 ---
 
-Retrieves the current language/locale code from the Puter environment. This function communicates with the host environment to get the active language setting.
+Retrieves the current language/locale code from the Puter environment.
 
 ## Syntax
 ```js
@@ -15,10 +15,12 @@ puter.ui.getLanguage()
 
 This function takes no parameters.
 
-## Return value 
+## Return value
 A `Promise` that resolves to a string containing the current language code (e.g., `en`, `fr`, `es`, `de`).
 
 ## Examples
+### Get the current language
+
 ```html
 <html>
 <body>

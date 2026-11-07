@@ -1,10 +1,12 @@
 ---
 title: puter.fs.readdir()
-description: List files and directories in Puter file system.
+description: List files and directories in the user's own Puter file system.
 platforms: [websites, apps, nodejs, workers]
 ---
 
-Reads the contents of a directory, returning an array of items (files and directories) within it. This method is useful for listing all items in a specified directory in the Puter cloud storage.
+Reads the contents of a directory, returning an array of items (files and directories) within it.
+
+This method is useful for listing all items in a specified directory in the Puter cloud storage.
 
 ## Syntax
 
@@ -25,16 +27,47 @@ If `path` is not absolute, it will be resolved relative to the app's root direct
 
 An object with the following properties:
 
-- `path` (String) - The path to the directory to read. Required when passing options as the only argument.
-- `uid` (String) (optional) - The UID of the directory to read.
+| Option | Type | Description |
+|--------|------|-------------|
+| `path` | `String` | The path to the directory to read. Required when passing options as the only argument. |
+| `recursive` | `Boolean` | If `true`, the contents of subdirectories are listed too. Defaults to `false`. |
+| `depth` | `Number` | How many levels to descend when `recursive` is `true`. Defaults to `10`, which is also the maximum. |
+| `sortBy` | `String` | Sort field. One of `name`, `modified`, `type`, or `size`. Default is `name`. With `recursive`, sorting by `name` orders by full path, so each directory's contents stay together. The other fields sort across the whole subtree. |
+| `sortOrder` | `String` | Either `asc` or `desc`. Default is `asc`. |
+| `limit` | `Number` | Maximum number of entries to return. |
+| `cursor` | `String \| null` | Opts into paginated results. Pass `null` for the first page, then the `cursor` from each page to fetch the next one. The cursor pins the sort, so later pages must not request a different `sortBy` or `sortOrder`. |
+| `offset` | `Number` | Skips the given number of entries. Prefer `cursor` for paging through large directories. On a `recursive` listing, `offset` is ignored when a `cursor` is passed. Start with `offset`, then follow the returned `cursor`. |
+| `includeTotal` | `Boolean` | If `true`, the paginated result includes a `total` count of all entries in the directory. |
+| `stream` | `Boolean` | If `true`, the method returns an async iterator of page objects instead of a promise, for use with `for await ... of`. Combine with `limit` to control the page size, or `cursor` to resume from a previous page. Cannot be combined with `offset`. With `includeTotal`, only the first page carries `total`. |
+| `uid` | `String` | The UID of the directory to read. |
 
 ## Return value
 
 A `Promise` that resolves to an array of [`FSItem`](/Objects/fsitem/) objects (files and directories) within the specified directory.
 
+Each item carries `is_shared`: `true` when it has been shared with someone, `false` when it has not, and `null` for items that are not yours. Only shares on the item itself count — the children of a folder you shared report `false`, since the share lives on the folder. Use [`getShares()`](/FS/getShares/) on an item to see who can reach it, including access inherited from a parent.
+
+When the request includes `cursor` (even `null`) or `includeTotal`, or is `recursive` with a `limit` or `offset`, the promise instead resolves to a page object:
+
+- `items` (Array): The [`FSItem`](/Objects/fsitem/) objects on this page.
+- `cursor` (String) (optional): Present while more pages exist; pass it to the next call.
+- `total` (Number) (optional): Total entry count, present when `includeTotal` was set.
+
+Without pagination params, the full listing is returned as a plain array.
+
+With `stream: true`, the method returns an async iterator of page objects instead:
+
+```js
+for await (const page of puter.fs.readdir({ path: './large-dir', stream: true })) {
+    for (const item of page.items) {
+        console.log(item.name);
+    }
+}
+```
+
 ## Examples
 
-<strong class="example-title">Read a directory</strong>
+### Read a directory
 
 ```html;fs-readdir
 <html>

@@ -1,4 +1,6 @@
-jQuery(document).ready(function () {
+import $ from 'jquery';
+
+$(document).ready(function () {
     //when doc is loaded scroll side nav to active section
     $('#sidebar').scrollTop($('#sidebar').scrollTop() + $('#sidebar a.active').position()?.top
         - $('#sidebar').height() / 2 + $('#sidebar a.active').height() / 2);
@@ -53,6 +55,33 @@ $(document).on('click', function (e) {
         $('#sidebar-wrapper').removeClass('active');
         $('.sidebar-toggle-button').removeClass('active');
     }
+});
+
+// sidebar tooltips: rendered on <body> so the scrolling sidebar doesn't clip them
+const $sidebarTooltip = $('<div class="sidebar-tooltip"></div>');
+
+function showSidebarTooltip (el) {
+    const rect = el.getBoundingClientRect();
+    $sidebarTooltip.text($(el).attr('data-tooltip')).appendTo('body');
+    $sidebarTooltip.css({
+        left: rect.right + 10,
+        top: rect.top + rect.height / 2,
+    }).addClass('visible');
+}
+
+function hideSidebarTooltip () {
+    $sidebarTooltip.removeClass('visible');
+}
+
+$(document).on('mouseenter focus', '[data-tooltip]', function () {
+    showSidebarTooltip(this);
+});
+$(document).on('mouseleave blur click', '[data-tooltip]', hideSidebarTooltip);
+$('#sidebar').on('scroll', hideSidebarTooltip);
+
+// track clicks on the AI builder link as a Plausible custom event
+$(document).on('click', 'a[href^="https://builder.puter.com"]', function () {
+    window.plausible?.('AI Builder Click');
 });
 
 function fetchGitHubData () {

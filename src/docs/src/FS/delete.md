@@ -1,6 +1,6 @@
 ---
 title: puter.fs.delete()
-description: Deletes a file or directory in Puter file system.
+description: Deletes a file or directory in the user's own Puter file system.
 platforms: [websites, apps, nodejs, workers]
 ---
 
@@ -18,24 +18,30 @@ puter.fs.delete(options)
 
 #### `paths` (String | String[]) (required)
 
-A single path or array of paths of the file(s) or directory(ies) to delete.
-If a path is not absolute, it will be resolved relative to the app's root directory.
+A single path or array of paths of the file(s) or directory(ies) to delete. A UID can be given in place of a path.
+If a path is not absolute, it will be resolved relative to the app's root directory. A relative name that looks like a UID is read as one; prefix it with `./` to address a file by that name.
 
 #### `options` (Object) (optional)
 
 The options for the `delete` operation. The following options are supported:
 
-- `paths` (String | String[]) - A single path or array of paths to delete. Required when passing options as the only argument.
-- `recursive` (Boolean) - Whether to delete the directory recursively. Defaults to `true`.
-- `descendantsOnly` (Boolean) - Whether to delete only the descendants of the directory and not the directory itself. Defaults to `false`.
+| Option | Type | Description |
+|--------|------|-------------|
+| `paths` | `String \| String[]` | A single path or array of paths to delete. Required when passing options as the only argument. |
+| `recursive` | `Boolean` | Whether to delete the directory recursively. Defaults to `true`. |
+| `descendantsOnly` | `Boolean` | Whether to delete only the descendants of the directory and not the directory itself. Defaults to `false`. |
 
 ## Return value
 
 A `Promise` that will resolve when the file or directory is deleted.
 
+Deleting an item withdraws every [share](/FS/share/) on it and on everything
+inside it, links and unclaimed invites included. Moving an item to Trash counts
+as deleting it here, and restoring it does not bring the shares back.
+
 ## Examples
 
-<strong class="example-title">Delete a file</strong>
+### Delete a file
 
 ```html;fs-delete
 <html>
@@ -57,7 +63,7 @@ A `Promise` that will resolve when the file or directory is deleted.
 </html>
 ```
 
-<strong class="example-title">Delete a directory</strong>
+### Delete a directory
 
 ```html;fs-delete-directory
 <html>

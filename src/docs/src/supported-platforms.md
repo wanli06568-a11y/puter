@@ -18,7 +18,7 @@ You can use it across all kinds of web development technologies, from static HTM
 
 <div class="example-content" data-section="npm" style="display:block;">
 
-### Installation via NPM
+#### Installation via NPM
 
 ```plaintext
 npm install @heyputer/puter.js
@@ -26,7 +26,7 @@ npm install @heyputer/puter.js
 
 <br>
 
-### Importing Puter.js
+#### Importing Puter.js
 
 ```js
 // ESM
@@ -44,20 +44,29 @@ const puter = require("@heyputer/puter.js");
 
 <div class="example-content" data-section="cdn">
 
-### Usage via CDN
+#### Usage via CDN
 
 ```html;ai-chatgpt
 <html>
 <body>
     <script src="https://js.puter.com/v2/"></script>
     <script>
-        puter.ai.chat(`What is life?`, { model: "gpt-5-nano" }).then(puter.print);
+        puter.ai.chat(`What is life?`, { model: "gpt-6-luna" }).then(puter.print);
     </script>
 </body>
 </html>
 ```
 
 </div>
+
+### Unsupported contexts
+
+Puter identifies your app by its origin, so a page the browser gives no origin to cannot be signed in:
+
+- **Pages opened straight from disk** (`file:///...`). Serve the file instead — `python3 -m http.server` or `npx http-server` is enough, and `http://localhost` works like any other origin.
+- **Iframes sandboxed without `allow-same-origin`.** Add `allow-same-origin` to the `sandbox` attribute, or load Puter.js from the parent page.
+
+In both cases Puter.js shows an "Unsupported Origin" dialog on load, and `puter.auth.signIn()` rejects with [`unsupported_origin`](/Auth/signIn/).
 
 ### Starter templates for web
 
@@ -87,8 +96,6 @@ The Puter ecosystem hosts over 60,000 live applications, from essential tools li
 
 ## **Node.js**
 
-> **Note:** Node.js support is currently in beta.
-
 Puter.js works seamlessly in Node.js environments, allowing you to integrate AI, databases, and cloud storage with your Node.js applications. This makes it ideal for building backend services and APIs, performing server-side data processing, or creating CLI tools and automation scripts.
 
 ```js
@@ -105,6 +112,8 @@ puter.ai.chat("What color was Napoleon's white horse?").then((response) => {
 ```
 
 Get started quickly with the [Node.js + Express template](https://github.com/HeyPuter/node.js-express.js).
+
+<div class="info">If your environment has browser access (e.g. CLI tools), you can use <code>getAuthToken()</code> to obtain a token via web-based login.</div>
 
 ## **Serverless Workers**
 

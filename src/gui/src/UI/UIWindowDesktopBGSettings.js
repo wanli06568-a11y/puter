@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -178,9 +178,9 @@ async function UIWindowDesktopBGSettings (options) {
                         'Authorization': `Bearer ${window.auth_token}`,
                     },
                     statusCode: {
-                        401: function () {
-                            window.logout();
-                        },
+                        401: function (xhr) {
+                        window.handle401(xhr);
+                    },
                     },
                 });
                 $(el_window).close();

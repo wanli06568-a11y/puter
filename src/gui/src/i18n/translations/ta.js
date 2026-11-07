@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const ta = {
         account: 'கணக்கு',
         account_password: 'கணக்கு கடவுச்சொல்லை சரிபார்க்கவும்',
         access_granted_to: 'அனுமதி வழங்கப்பட்ட',
-        add_existing_account: 'ஏற்கனவே உள்ள கணக்கைச் சேர்க்கவும்',
+        add_another_account: 'மற்றொரு கணக்கைச் சேர்க்கவும்',
         all_fields_required: 'அனைத்து புலங்களும் தேவை.',
         allow: 'அனுமதி',
         apply: 'விண்ணப்பிக்கவும்',
@@ -95,11 +95,6 @@ const ta = {
         credits: 'கடன்கள்',
         current_password: 'தற்போதைய கடவுச்சொல்',
         cut: 'வெட்டு',
-        clock: 'கடிகாரம்',
-        clock_visible_hide: 'மறை - எப்போதும் மறைந்திருக்கும்',
-        clock_visible_show: 'காட்டு - எப்போதும் தெரியும்',
-        clock_visible_auto:
-      'தானியங்கு - இயல்புநிலை, முழுத்திரை பயன்முறையில் மட்டுமே தெரியும்.',
         close_all: 'அனைத்தையும் மூடு',
         created: 'உருவாக்கப்பட்டது',
         date_modified: 'தேதி மாற்றப்பட்டது',
@@ -385,7 +380,6 @@ const ta = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         change: 'மாற்றம்',
-        clock_visibility: 'கடிகாரத் தெரிவுநிலை',
         confirm: 'உறுதி',
         reading: 'வாசித்தல் %strong%',
         writing: 'எழுதுதல் %strong%',

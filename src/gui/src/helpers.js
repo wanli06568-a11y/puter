@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -17,22 +17,38 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import path from './lib/path.js';
+import { createUploadThumbnailGenerator } from './services/pdfThumbnails/index.js';
+import { dedupedName } from './helpers/dedupedName.js';
+import { archiveEntryPath } from './helpers/archiveEntryPath.js';
+import get_html_element_from_options from './helpers/getHtmlElementFromOptions.js';
+import globToRegExp from './helpers/globToRegExp.js';
+import item_icon from './helpers/itemIcon.js';
+import { is_owned_by_me, trash_path_for } from './helpers/pathOwner.js';
+import { invalidate_shared_roots } from './helpers/sharedAccess.js';
+import truncate_filename from './helpers/truncateFilename.js';
+import update_title_based_on_uploads from './helpers/updateTitleBasedOnUploads.js';
+import update_username_in_gui from './helpers/updateUsernameInGui.js';
+import { notifyItemWatchers } from './helpers/watchItems.js';
+import { select_uploaded_items } from './helpers/uploadSelection.js';
+import { templateMenuItem } from './helpers/templateMenuItem.js';
+import { uuidv4 } from './helpers/uuidv4.js';
 import mime from './lib/mime.js';
+import path from './lib/path.js';
 import UIAlert from './UI/UIAlert.js';
 import UIItem from './UI/UIItem.js';
-import UIWindowLogin from './UI/UIWindowLogin.js';
-import UIWindowSaveAccount from './UI/UIWindowSaveAccount.js';
-import update_username_in_gui from './helpers/update_username_in_gui.js';
-import update_title_based_on_uploads from './helpers/update_title_based_on_uploads.js';
-import truncate_filename from './helpers/truncate_filename.js';
+import UIAuthLogin from './UI/Auth/UIAuthLogin.js';
 import UIWindowProgress from './UI/UIWindowProgress.js';
-import globToRegExp from './helpers/globToRegExp.js';
-import get_html_element_from_options from './helpers/get_html_element_from_options.js';
-import item_icon from './helpers/item_icon.js';
+import UIWindowSaveAccount from './UI/UIWindowSaveAccount.js';
+
+// localStorage keys for the GUI session token. The retired key is never read
+// for authentication — a token in that format no longer verifies — only
+// cleared, so it doesn't sit in a browser forever.
+window.AUTH_TOKEN_KEY_V2 = 'auth_token_v2';
+window.AUTH_TOKEN_KEY_RETIRED = 'auth_token';
 
 window.is_auth = () => {
-    if ( localStorage.getItem('auth_token') === null || window.auth_token === null )
+    const stored = localStorage.getItem(window.AUTH_TOKEN_KEY_V2);
+    if ( stored === null || window.auth_token === null )
     {
         return false;
     }
@@ -40,6 +56,136 @@ window.is_auth = () => {
     {
         return true;
     }
+};
+
+/**
+ * Central handler for `401 { code: 'reauth_required' }`.
+ *
+ * The backend `authProbe` middleware emits this 401 shape whenever a
+ * token is retired/revoked/expired. The GUI must NOT silently logout:
+ * that loses window/URL state and surprises the user. Instead we:
+ *   1. Snapshot enough state to land back where we were after sign-in.
+ *   2. Clear the token key (and the retired one, if a value lingers).
+ *   3. Show a soft modal explaining what happened.
+ *   4. Re-open the login dialog, forwarding `auth_id` so temp users can
+ *      re-attach to the same identity.
+ *
+ * Idempotent: parallel 401s while the modal is already open are dropped.
+ */
+window._reauthInProgress = false;
+window.handleReauthRequired = async (signal = {}) => {
+    if ( window._reauthInProgress ) return;
+    window._reauthInProgress = true;
+    try {
+        // Snapshot the current URL so login can land us back here.
+        try {
+            sessionStorage.setItem('reauth_return_to', window.location.href);
+        } catch ( e ) {
+            // sessionStorage may be unavailable in embedded contexts; non-fatal.
+        }
+        // Drop both keys — once we have a reauth signal the current token
+        // must not be used again, and a stale v1 key would re-trigger the
+        // same modal on the next boot.
+        try {
+            localStorage.removeItem(window.AUTH_TOKEN_KEY_V2);
+            localStorage.removeItem(window.AUTH_TOKEN_KEY_RETIRED);
+        } catch ( e ) { /* ignore */ }
+        window.auth_token = null;
+
+        // Soft modal. UIAlert is the lightest-weight existing surface.
+        try {
+            await UIAlert({
+                message: i18n('reauth_required_message') || 'Your session was updated for security — please sign in again.',
+                buttons: [
+                    {
+                        label: i18n('sign_in') || 'Sign in',
+                        value: 'sign_in',
+                        type: 'primary',
+                    },
+                ],
+            });
+        } catch ( e ) {
+            // If the alert surface isn't available (very early in boot),
+            // fall through to the login dialog directly.
+        }
+
+        // Open the login window, forwarding auth_id.
+        try {
+            const login = await UIAuthLogin({
+                reload_on_success: true,
+                auth_id: signal.auth_id,
+                reauth_reason: signal.reason,
+                redirect_url: sessionStorage.getItem('reauth_return_to') || window.location.href,
+            });
+            if ( login ) {
+                try { sessionStorage.removeItem('reauth_return_to'); } catch ( e ) { /* ignore */ }
+            }
+        } catch ( e ) {
+            console.error('Reauth login flow failed:', e);
+        }
+    } finally {
+        window._reauthInProgress = false;
+    }
+};
+
+/**
+ * Inspect a jQuery / fetch error payload for the v2 `reauth_required` shape
+ * and route to either the reauth modal (soft) or the legacy hard-logout.
+ *
+ * Accepts a jQuery xhr-like object OR a parsed response body.
+ */
+window.handle401 = (xhrOrBody) => {
+    let body = null;
+    if ( xhrOrBody && typeof xhrOrBody === 'object' ) {
+        if ( 'responseJSON' in xhrOrBody && xhrOrBody.responseJSON ) {
+            body = xhrOrBody.responseJSON;
+        } else if ( 'responseText' in xhrOrBody && xhrOrBody.responseText ) {
+            try { body = JSON.parse(xhrOrBody.responseText); } catch ( e ) { body = null; }
+        } else if ( xhrOrBody.code ) {
+            body = xhrOrBody;
+        }
+    }
+    if ( body?.code === 'reauth_required' ) {
+        window.handleReauthRequired({ reason: body.reason, auth_id: body.auth_id });
+        return;
+    }
+    // A fresh session that still gets 401s is signed out for real.
+    if ( window.local_sign_out_was_recent() ) {
+        window.logout();
+        return;
+    }
+    window.sign_out_locally();
+};
+
+const LOCAL_SIGN_OUT_AT_KEY = 'puter.local_sign_out_at';
+const LOCAL_SIGN_OUT_RECENT_MS = 60 * 1000;
+
+window.local_sign_out_was_recent = () => {
+    try {
+        const at = Number(sessionStorage.getItem(LOCAL_SIGN_OUT_AT_KEY));
+        return at > 0 && Date.now() - at < LOCAL_SIGN_OUT_RECENT_MS;
+    } catch ( e ) {
+        return false;
+    }
+};
+
+/**
+ * Drops this tab's token and user without ending the session on the server.
+ * The reload signs the tab back in from the session cookie when it still
+ * holds, so a token the server stopped accepting costs nothing but a reload.
+ */
+window.sign_out_locally = () => {
+    try { sessionStorage.setItem(LOCAL_SIGN_OUT_AT_KEY, String(Date.now())); } catch ( e ) { /* ignore */ }
+    try { puter._cache.flushall(); } catch ( e ) { /* ignore */ }
+    try {
+        localStorage.removeItem(window.AUTH_TOKEN_KEY_V2);
+        localStorage.removeItem(window.AUTH_TOKEN_KEY_RETIRED);
+        localStorage.removeItem('user');
+    } catch ( e ) { /* ignore */ }
+    window.auth_token = null;
+    window.user = null;
+    window.onbeforeunload = null;
+    window.location.reload();
 };
 
 window.suggest_apps_for_fsentry = async (options) => {
@@ -55,8 +201,8 @@ window.suggest_apps_for_fsentry = async (options) => {
             'Authorization': `Bearer ${window.auth_token}`,
         },
         statusCode: {
-            401: function () {
-                window.logout();
+            401: function (xhr) {
+                window.handle401(xhr);
             },
         },
         success: function (res) {
@@ -77,10 +223,26 @@ window.suggest_apps_for_fsentry = async (options) => {
  * @returns
  */
 window.byte_format = (bytes) => {
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
     if ( bytes === 0 ) return '0 Byte';
-    const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+    let i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+    if ( i < 0 ) i = 0;
+    if ( i >= sizes.length ) i = sizes.length - 1;
     return `${(bytes / Math.pow(1024, i)).toFixed(2) } ${ sizes[i]}`;
+};
+
+/**
+ * Returns a fill color for a usage progress bar that shifts from green at 0%
+ * toward red as the percentage approaches 100%, passing through yellow/orange
+ * in the middle. Uses HSL so the transition is smooth.
+ *
+ * @param {number} percent - 0..100 (clamped)
+ * @returns {string} CSS color
+ */
+window.usage_bar_color = (percent) => {
+    const p = Math.max(0, Math.min(100, Number(percent) || 0)) / 100;
+    const hue = 120 * (1 - p);
+    return `hsl(${hue.toFixed(0)}, 70%, 45%)`;
 };
 
 /**
@@ -98,10 +260,7 @@ window.byte_format = (bytes) => {
  * let id = window.uuidv4(); // Generate a new UUID
  *
  */
-window.uuidv4 = () => {
-    return ([1e7] + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, c =>
-        (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
-};
+window.uuidv4 = uuidv4;
 
 /**
  * Checks if the provided string is a valid email format.
@@ -217,7 +376,7 @@ window.validate_fsentry_name = function (name) {
 };
 
 /**
- * A function that generates a unique identifier by combining a random adjective, a random noun, and a random number (between 0 and 9999).
+ * A function that generates a unique identifier by combining a random adjective, a random noun, and a random number.
  * The result is returned as a string with components separated by hyphens.
  * It is useful when you need to create unique identifiers that are also human-friendly.
  *
@@ -226,7 +385,7 @@ window.validate_fsentry_name = function (name) {
  * @example
  *
  * let identifier = window.generate_identifier();
- * // identifier would be something like 'clever-idea-123'
+ * // identifier would be something like 'clever-idea-483920'
  *
  */
 window.generate_identifier = function () {
@@ -243,9 +402,12 @@ window.generate_identifier = function () {
         'ladybug', 'snail', 'camel', 'kangaroo', 'koala', 'panda', 'piglet', 'sheep', 'wolf', 'fox', 'deer', 'mouse', 'seal',
         'chicken', 'cow', 'dinosaur', 'puppy', 'kitten', 'circle', 'square', 'garden', 'otter', 'bunny', 'meerkat', 'harp'];
 
-    // return a random combination of first_adj + noun + number (between 0 and 9999)
-    // e.g. clever-idea-123
-    return `${first_adj[Math.floor(Math.random() * first_adj.length)] }-${ nouns[Math.floor(Math.random() * nouns.length)] }-${ Math.floor(Math.random() * 10000)}`;
+    // return a random combination of first_adj + noun + number
+    // e.g. clever-idea-483920. The word lists only reach ~3.6k pairs, so the
+    // number carries the entropy: this name is offered as a subdomain, and
+    // subdomains are globally unique, so a narrow suffix makes the taken-name
+    // error a routine part of publishing rather than a rarity.
+    return `${first_adj[Math.floor(Math.random() * first_adj.length)] }-${ nouns[Math.floor(Math.random() * nouns.length)] }-${ Math.floor(Math.random() * 1000000)}`;
 };
 
 /**
@@ -374,18 +536,20 @@ window.check_fsentry_against_allowed_file_types_string = function (fsentry, allo
         $elem.data('taphold_cancelled', false); // If event has been cancelled.
 
         // Set the timer for the hold event.
-        $elem.data('taphold_timer',
-                        setTimeout(function ()
-                        {
-                            // If event hasn't been cancelled/clicked already, then go ahead and trigger the hold.
-                            if ( !$elem.data('taphold_cancelled')
-                                && !$elem.data('taphold_clicked') )
-                            {
-                                // Trigger the hold event, and set the flag to say it's been triggered.
-                                $elem.trigger(jQuery.extend(event, jQuery.Event('taphold')));
-                                $elem.data('taphold_triggered', true);
-                            }
-                        }, settings.duration));
+        $elem.data(
+            'taphold_timer',
+            setTimeout(function ()
+            {
+                // If event hasn't been cancelled/clicked already, then go ahead and trigger the hold.
+                if ( !$elem.data('taphold_cancelled')
+                    && !$elem.data('taphold_clicked') )
+                {
+                    // Trigger the hold event, and set the flag to say it's been triggered.
+                    $elem.trigger(jQuery.extend(event, jQuery.Event('taphold')));
+                    $elem.data('taphold_triggered', true);
+                }
+            }, settings.duration),
+        );
     }
 
     // When user ends a tap or click, decide what we should do.
@@ -459,7 +623,34 @@ window.refresh_user_data = async (auth_token) => {
 
 window.update_auth_data = async (auth_token, user) => {
     window.auth_token = auth_token;
-    localStorage.setItem('auth_token', auth_token);
+    // Write the v2 key going forward and clear any lingering v1 key so
+    // a single localStorage source-of-truth is used.
+    localStorage.setItem(window.AUTH_TOKEN_KEY_V2, auth_token);
+    localStorage.removeItem(window.AUTH_TOKEN_KEY_RETIRED);
+
+    // Set http-only session cookie when user is changing.
+    // This ensures user-protected endpoints, which only refer to the http-only cookie,
+    // act on the intended user.
+    // Only the server can set this cookie, so we call the `/session/sync-cookie` endpoint.
+    const userChanging = !window.user || window.user.uuid !== user.uuid;
+    if ( userChanging && auth_token && (window.gui_origin || window.location?.origin) ) {
+        try {
+            const origin = window.gui_origin || window.location.origin;
+            await fetch(`${origin}/session/sync-cookie`, {
+                method: 'GET',
+                credentials: 'include',
+                headers: { Authorization: `Bearer ${auth_token}` },
+            });
+        } catch (e) {
+            console.error('Failed to sync session cookie:', e);
+            // Sign-in waits on this with its card still up, above every
+            // ordinary window.
+            await UIAlert({
+                message: `Failed to sync session cookie: ${ e.message}`,
+                stay_on_top: true,
+            });
+        }
+    }
 
     // Has username changed?
     if ( window.user?.username !== user.username )
@@ -472,39 +663,19 @@ window.update_auth_data = async (auth_token, user) => {
         $('.user-email').html(html_encode(user.email));
     }
 
-    // ----------------------------------------------------
-    // get .profile file and update user profile
-    // ----------------------------------------------------
-    user.profile = {};
-    puter.fs.read(`/${user.username}/Public/.profile`).then((blob) => {
-        blob.text()
-            .then(text => {
-                const profile = JSON.parse(text);
-                if ( profile.picture ) {
-                    window.user.profile.picture = html_encode(profile.picture);
-                }
-
-                // update profile picture in GUI
-                if ( window.user.profile.picture ) {
-                    $('.profile-pic').css('background-image', `url(${window.user.profile.picture})`);
-                }
-            })
-            .catch(error => {
-                console.error('Error converting Blob to JSON:', error);
-            });
-    }).catch((e) => {
-        if ( e?.code === 'subject_does_not_exist' ) {
-            // create .profile file
-            puter.fs.write(`/${user.username}/Public/.profile`, JSON.stringify({}));
-        }
-    });
-
-    // ----------------------------------------------------
+    // Keep this account's last known profile until the fresh one loads below;
+    // the account picker reads pictures from the stored copy.
+    const known_profile = window.logged_in_users.find(known => known.uuid === user.uuid)?.profile;
+    user.profile = { ...(known_profile ?? user.profile ?? {}) };
 
     const to_storable_user = user => {
         const storable_user = { ...user };
         delete storable_user.taskbar_items;
         return storable_user;
+    };
+    const store_users = () => {
+        localStorage.setItem('user', JSON.stringify(to_storable_user(window.user)));
+        localStorage.setItem('logged_in_users', JSON.stringify(window.logged_in_users.map(to_storable_user)));
     };
 
     // update this session's user data
@@ -531,9 +702,32 @@ window.update_auth_data = async (auth_token, user) => {
             userobj.auth_token = window.auth_token;
             window.logged_in_users.push(userobj);
         }
-        // update local storage
-        localStorage.setItem('logged_in_users', JSON.stringify(window.logged_in_users.map(to_storable_user)));
+        store_users();
     }
+
+    // Loaded only after puter.js holds this account's token, so it can't
+    // return the previous account's profile.
+    puter.auth.getProfile().then((profile) => {
+        // Another account may have signed in while this was loading.
+        if ( !profile || window.user !== user ) return;
+        const shown_picture = user.profile.picture ?? null;
+        user.profile = {
+            displayName: profile.displayName ?? null,
+            bio: profile.bio ?? null,
+            picture: profile.picture ? html_encode(profile.picture) : null,
+        };
+        store_users();
+        if ( profile.displayName ) {
+            $('.dashboard-profile-display-name').text(profile.displayName);
+        }
+        // the account tab may have rendered before the profile arrived
+        if ( user.profile.picture !== shown_picture ) {
+            $('.profile-pic').css('background-image', `url(${user.profile.picture || window.icons['profile.svg']})`);
+            $('.dashboard-profile-remove-picture').prop('hidden', !user.profile.picture);
+        }
+    }).catch((error) => {
+        console.error('Error loading profile:', error);
+    });
 
     window.desktop_path = `/${ window.user.username }/Desktop`;
     window.trash_path = `/${ window.user.username }/Trash`;
@@ -544,6 +738,7 @@ window.update_auth_data = async (auth_token, user) => {
     window.desktop_path = `/${ window.user.username }/Desktop`;
     window.home_path = `/${ window.user.username}`;
     window.public_path = `/${ window.user.username }/Public`;
+    window.shared_path = 'puter://shared';
 
     if ( window.user !== null && !window.user.is_temp ) {
         $('.user-options-login-btn, .user-options-create-account-btn').hide();
@@ -557,16 +752,25 @@ window.update_auth_data = async (auth_token, user) => {
 window.mutate_user_preferences = function (user_preferences_delta) {
     for ( const [key, value] of Object.entries(user_preferences_delta) ) {
         // Don't wait for set to be done for better efficiency
-        puter.kv.set(`user_preferences.${key}`, value);
+        puter.kv.set(`user_preferences.${key}`, value)
+            .catch(err => console.warn(`Could not save user_preferences.${key}:`, err));
     }
     // There may be syncing issues across multiple devices
     window.update_user_preferences({ ...window.user_preferences, ...user_preferences_delta });
 };
 
+/**
+ * The language to render in for a saved `language` preference. The stored
+ * value can be anything, and i18n/Intl throw on some bad locales.
+ */
+window.resolve_language = (language) => (window.listSupportedLanguages().some(lang => lang.code === language)
+    ? language
+    : 'en');
+
 window.update_user_preferences = function (user_preferences) {
     window.user_preferences = user_preferences;
     localStorage.setItem('user_preferences', JSON.stringify(user_preferences));
-    const language = user_preferences.language ?? 'en';
+    const language = window.resolve_language(user_preferences.language);
     window.locale = language;
 
     // Broadcast locale change to apps
@@ -574,6 +778,32 @@ window.update_user_preferences = function (user_preferences) {
     broadcastService.sendBroadcast('localeChanged', {
         language: language,
     }, { sendToNewAppInstances: true });
+};
+
+/**
+ * Read the account's saved preferences and apply them. A read that fails
+ * keeps what this browser last loaded.
+ */
+window.load_user_preferences = async function () {
+    const user_preferences = {
+        show_hidden_files: window.user_preferences.show_hidden_files,
+        language: window.user_preferences.language,
+    };
+    try {
+        user_preferences.show_hidden_files = JSON.parse(await puter.kv.get('user_preferences.show_hidden_files'));
+    } catch (e) {
+        console.error('Error loading show_hidden_files', e);
+    }
+    try {
+        user_preferences.language = await puter.kv.get('user_preferences.language');
+    } catch (e) {
+        console.error('Error loading language', e);
+    }
+    const entries = await puter.kv.list('user_preferences.default_apps.*', true).catch(() => []);
+    for ( const entry of entries ) {
+        user_preferences[entry.key.substring(17)] = entry.value;
+    }
+    window.update_user_preferences(user_preferences);
 };
 
 window.sendWindowWillCloseMsg = function (iframe_element) {
@@ -591,9 +821,59 @@ window.sendWindowWillCloseMsg = function (iframe_element) {
 window.logout = () => {
     // clear cache
     puter._cache.flushall();
+    // Clear both old and new token keys. Cookie clear is handled by
+    // the backend logout endpoint.
+    try {
+        localStorage.removeItem(window.AUTH_TOKEN_KEY_V2);
+        localStorage.removeItem(window.AUTH_TOKEN_KEY_RETIRED);
+    } catch ( e ) { /* ignore */ }
     $(document).trigger('logout');
     // document.dispatchEvent(new Event("logout", { bubbles: true}));
 };
+
+// Global jQuery ajax error interceptor. Catches any `401 { code:
+// 'reauth_required' }` that wasn't already handled by a more specific
+// `statusCode[401]` callback on the call site, so we don't have to
+// audit every legacy `$.ajax` call when the reauth signal rolls out.
+if ( typeof $ !== 'undefined' && $.fn ) {
+    $(document).ajaxError(function (event, jqxhr, settings, thrownError) {
+        if ( jqxhr?.status !== 401 ) return;
+        if ( window._reauthInProgress ) return;
+        let body = jqxhr.responseJSON;
+        if ( ! body && jqxhr.responseText ) {
+            try { body = JSON.parse(jqxhr.responseText); } catch ( e ) { /* ignore */ }
+        }
+        if ( body?.code === 'reauth_required' ) {
+            window.handleReauthRequired({ reason: body.reason, auth_id: body.auth_id });
+        }
+    });
+}
+
+// Multi-tab propagation. If another tab signs in (sets the v2 token) or
+// signs out (clears it), reflect that here without forcing a full page
+// reload when we can avoid it.
+if ( typeof window !== 'undefined' && window.addEventListener ) {
+    window.addEventListener('storage', (event) => {
+        if ( event.key !== window.AUTH_TOKEN_KEY_V2 ) return;
+        if ( event.newValue ) {
+            // A peer tab just (re)authed. Pick up the fresh token so
+            // subsequent requests stop bouncing on reauth_required.
+            window.auth_token = event.newValue;
+            try { puter?.setAuthToken?.(event.newValue, window.api_origin); } catch ( e ) { /* ignore */ }
+            // If our own reauth modal is up, the new token from a peer
+            // tab is good enough — dismiss and reload to pick up the new
+            // session.
+            if ( window._reauthInProgress ) {
+                window.location.reload();
+            }
+        } else {
+            // A peer tab signed out; it already ended the session if it meant to.
+            if ( ! window._reauthInProgress ) {
+                window.sign_out_locally();
+            }
+        }
+    });
+}
 
 /**
  * Checks if the current document is in fullscreen mode.
@@ -698,8 +978,10 @@ window.get_apps = async (app_names, callback) => {
         })();
 
         for ( const name of uniqueMissing ) {
-            getAppsInflight.set(name,
-                            fetchPromise.then((appMap) => appMap.get(name) ?? null));
+            getAppsInflight.set(
+                name,
+                fetchPromise.then((appMap) => appMap.get(name) ?? null),
+            );
         }
 
         pendingPromises.push(fetchPromise.then((appMap) => {
@@ -738,39 +1020,14 @@ window.get_apps = async (app_names, callback) => {
 };
 
 /**
- * Sends an "itemChanged" event to all watching applications associated with a specific item.
+ * Sends an "itemChanged" event to the apps watching an item, re-checking that
+ * each one can still see it. See `helpers/watchItems.js`.
  *
- * @function sendItemChangeEventToWatchingApps
- * @memberof window
- * @param {string} item_uid - Unique identifier of the item that experienced the change.
- * @param {Object} event_data - Additional data about the event to be passed to the watching applications.
- *
- * @description
- * This function sends an "itemChanged" message to all applications that are currently watching
- * the specified item. If an application's iframe is not found or no longer valid,
- * it is removed from the list of watchers.
- *
- * The function expects that `window.watchItems` contains a mapping of item UIDs to arrays of app instance IDs.
- *
- * @example
- * // Example usage to send a change event to watching applications of an item with UID "item123".
- * window.sendItemChangeEventToWatchingApps('item123', { property: 'value' });
+ * @param {string} item_uid - Unique identifier of the item that changed.
+ * @param {Object} event_data - Data about the change, passed to the apps.
  */
 window.sendItemChangeEventToWatchingApps = function (item_uid, event_data) {
-    if ( window.watchItems[item_uid] ) {
-        window.watchItems[item_uid].forEach(app_instance_id => {
-            const iframe = $(`.window[data-element_uuid="${app_instance_id}"]`).find('.window-app-iframe');
-            if ( iframe && iframe.length > 0 ) {
-                iframe.get(0)?.contentWindow
-                    .postMessage({
-                        msg: 'itemChanged',
-                        data: event_data,
-                    }, '*');
-            } else {
-                window.watchItems[item_uid].splice(window.watchItems[item_uid].indexOf(app_instance_id), 1);
-            }
-        });
-    }
+    notifyItemWatchers(item_uid, event_data);
 };
 
 /**
@@ -787,6 +1044,8 @@ window.sendItemChangeEventToWatchingApps = function (item_uid, event_data) {
  */
 
 window.show_save_account_notice_if_needed = function (message) {
+    // A failed read must not read as "not shown yet" — that would repeat the
+    // notice on every save — so the catch goes on the end of the chain.
     puter.kv.get({
         key: 'save_account_notice_shown',
     }).then(async function (value) {
@@ -794,7 +1053,7 @@ window.show_save_account_notice_if_needed = function (message) {
             puter.kv.set({
                 key: 'save_account_notice_shown',
                 value: true,
-            });
+            }).catch(err => console.warn('Could not save save_account_notice_shown:', err));
             // Show the notice
             setTimeout(async () => {
                 const alert_resp = await UIAlert({
@@ -831,27 +1090,16 @@ window.show_save_account_notice_if_needed = function (message) {
                     });
 
                 } else if ( alert_resp === 'login' ) {
-                    let login_result = await UIWindowLogin({
+                    let login_result = await UIAuthLogin({
                         show_signup_button: false,
                         reload_on_success: true,
                         send_confirmation_code: false,
-                        window_options: {
-                            show_in_taskbar: false,
-                            backdrop: true,
-                            close_on_backdrop_click: false,
-                        },
                     });
                     // FIXME: Report login error.
                 }
             }, window.desktop_loading_fade_delay + 1000);
         }
-    });
-};
-
-window.onpopstate = (event) => {
-    if ( event.state !== null && event.state.window_id !== null ) {
-        $(`.window[data-id="${event.state.window_id}"]`).focusWindow();
-    }
+    }).catch(err => console.warn('Could not check save_account_notice_shown:', err));
 };
 
 window.sort_items = (item_container, sort_by, sort_order) => {
@@ -943,6 +1191,9 @@ window.create_folder = async (basedir, appendto_element) => {
             },
         });
     } catch ( err ) {
+        if ( err.code === 'directory_depth_limit_exceeded' ) {
+            await UIAlert({ message: i18n('directory_depth_limit_exceeded') });
+        }
     }
 };
 
@@ -957,6 +1208,7 @@ window.create_file = async (options) => {
     try {
         puter.fs.upload(new File(content, filename), dirname, {
             generateThumbnails: true,
+            thumbnailGenerator: createUploadThumbnailGenerator(),
             success: async function (data) {
                 const created_file = $(appendto_element).find(`.item[data-path="${html_encode(dirname)}/${html_encode(data.name)}"]`);
                 if ( created_file.length > 0 ) {
@@ -991,29 +1243,7 @@ window.available_templates = () => {
                 return [];
             }
 
-            let result = [];
-
-            hasTemplateFiles.forEach(element => {
-                const extIndex = element.name.lastIndexOf('.');
-                const name = extIndex === -1
-                    ? element.name
-                    : element.name.slice(0, extIndex);
-                let extension = extIndex === -1
-                    ? ''
-                    : element.name.slice(extIndex + 1);
-
-                if ( extension == 'txt' ) extension = 'text';
-
-                const _path = path.join(templatesPath, element.name);
-
-                const itemStructure = {
-                    path: _path,
-                    html: `${extension.toUpperCase()} ${name}`,
-                    extension: extension,
-                    name: element.name,
-                };
-                result.push(itemStructure);
-            });
+            const result = hasTemplateFiles.map(element => templateMenuItem(templatesPath, element.name));
 
             // Assign to window.file_templates when ready
             window.file_templates = result;
@@ -1057,19 +1287,29 @@ window.copy_clipboard_items = async function (dest_path, dest_container_element)
     window.update_explorer_footer_selected_items_count($(dest_container_element).closest('.window'));
 
     let overwrite_all = false;
-    (async () => {
+    // Resolves with the created items' paths once every clipboard entry has
+    // been copied (or skipped/cancelled) — callers may await it to highlight
+    // the new rows, or fire-and-forget it as before.
+    return (async () => {
         let copy_progress_window_init_ts = Date.now();
 
         // only show progress window if it takes longer than 2s to copy
         let progwin;
-        let progwin_timeout = setTimeout(async () => {
+        let latest_status;
+        const arm_progwin = () => setTimeout(async () => {
             progwin = await UIWindowProgress({
                 operation_id: copy_op_id,
                 on_cancel: () => {
                     window.operation_cancelled[copy_op_id] = true;
                 },
             });
-        }, 0);
+            // Opened mid-operation: show the file being copied rather than
+            // the default "Preparing..." status.
+            if ( latest_status ) {
+                progwin.set_status(latest_status);
+            }
+        }, 2000);
+        let progwin_timeout = arm_progwin();
 
         const copied_item_paths = [];
 
@@ -1077,7 +1317,9 @@ window.copy_clipboard_items = async function (dest_path, dest_container_element)
             let copy_path = window.clipboard[i].path;
             let item_with_same_name_already_exists = true;
             let overwrite = overwrite_all;
-            progwin?.set_status(i18n('copying_file', copy_path));
+            let keep_both = false;
+            latest_status = i18n('copying_file', copy_path);
+            progwin?.set_status(latest_status);
 
             do {
                 if ( overwrite )
@@ -1097,13 +1339,15 @@ window.copy_clipboard_items = async function (dest_path, dest_container_element)
                         source: copy_path,
                         destination: dest_path,
                         overwrite: overwrite || overwrite_all,
-                        // if user is copying an item to where its source is, change the name so there is no conflict
-                        dedupeName: dest_path === path.dirname(copy_path),
+                        // dedupe when the user chose "Keep Both" on a conflict, or
+                        // when copying an item to where its source is — either way
+                        // the copy gets a "name (1)" style name instead of conflicting
+                        dedupeName: keep_both || dest_path === path.dirname(copy_path),
                     });
 
                     // remove overwritten item from the DOM
                     if ( resp[0].overwritten?.id ) {
-                        $(`.item[data-uid=${resp[0].overwritten.id}]`).removeItems();
+                        $(`.item[data-uid='${resp[0].overwritten.id}']`).removeItems();
                     }
 
                     // copy new path for undo copy
@@ -1113,25 +1357,36 @@ window.copy_clipboard_items = async function (dest_path, dest_container_element)
                     break;
                 } catch ( err ) {
                     if ( err.code === 'item_with_same_name_exists' ) {
+                        // The operation is paused on user input, so pause the
+                        // progress-window timer too — otherwise "Preparing..."
+                        // pops up on top of the dialog while it waits.
+                        clearTimeout(progwin_timeout);
                         const alert_resp = await UIAlert({
-                            message: `<strong>${html_encode(err.entry_name)}</strong> already exists.`,
+                            message: i18n('item_already_exists', [err.entry_name], false),
                             buttons: [
                                 { label: i18n('replace'), type: 'primary', value: 'replace' },
                                 ... (window.clipboard.length > 1) ? [{ label: i18n('replace_all'), value: 'replace_all' }] : [],
+                                { label: i18n('keep_both'), value: 'keep_both' },
                                 ... (window.clipboard.length > 1) ? [{ label: i18n('skip'), value: 'skip' }] : [{ label: i18n('cancel'), value: 'cancel' }],
                             ],
                         });
+                        progwin_timeout = arm_progwin();
                         if ( alert_resp === 'replace' ) {
                             overwrite = true;
                         } else if ( alert_resp === 'replace_all' ) {
                             overwrite = true;
                             overwrite_all = true;
+                        } else if ( alert_resp === 'keep_both' ) {
+                            keep_both = true;
                         } else if ( alert_resp === 'skip' || alert_resp === 'cancel' ) {
                             item_with_same_name_already_exists = false;
                         }
                     }
                     else {
-                        if ( err.message ) {
+                        // An out-of-storage copy already shows the SDK's
+                        // upgrade dialog — a second, generic alert on top of
+                        // it would just bury the actionable one.
+                        if ( err.message && err.code !== 'storage_limit_reached' ) {
                             UIAlert(err.message);
                         }
                         item_with_same_name_already_exists = false;
@@ -1161,6 +1416,10 @@ window.copy_clipboard_items = async function (dest_path, dest_container_element)
                 });
             }
         }
+
+        // Resolve with the paths that were actually created so callers can
+        // highlight the new items (a cancelled or skipped item isn't listed).
+        return copied_item_paths;
     })();
 };
 
@@ -1178,14 +1437,21 @@ window.copy_items = function (el_items, dest_path) {
 
         // only show progress window if it takes longer than 2s to copy
         let progwin;
-        let progwin_timeout = setTimeout(async () => {
+        let latest_status;
+        const arm_progwin = () => setTimeout(async () => {
             progwin = await UIWindowProgress({
                 operation_id: copy_op_id,
                 on_cancel: () => {
                     window.operation_cancelled[copy_op_id] = true;
                 },
             });
+            // Opened mid-operation: show the file being copied rather than
+            // the default "Preparing..." status.
+            if ( latest_status ) {
+                progwin.set_status(latest_status);
+            }
         }, 2000);
+        let progwin_timeout = arm_progwin();
 
         const copied_item_paths = [];
 
@@ -1193,7 +1459,9 @@ window.copy_items = function (el_items, dest_path) {
             let copy_path = $(el_items[i]).attr('data-path');
             let item_with_same_name_already_exists = true;
             let overwrite = overwrite_all;
-            progwin?.set_status(i18n('copying_file', copy_path));
+            let keep_both = false;
+            latest_status = i18n('copying_file', copy_path);
+            progwin?.set_status(latest_status);
 
             do {
                 if ( overwrite )
@@ -1210,13 +1478,15 @@ window.copy_items = function (el_items, dest_path) {
                         source: copy_path,
                         destination: dest_path,
                         overwrite: overwrite || overwrite_all,
-                        // if user is copying an item to where the source is, automatically change the name so there is no conflict
-                        dedupeName: dest_path === path.dirname(copy_path),
+                        // dedupe when the user chose "Keep Both" on a conflict, or
+                        // when copying an item to where its source is — either way
+                        // the copy gets a "name (1)" style name instead of conflicting
+                        dedupeName: keep_both || dest_path === path.dirname(copy_path),
                     });
 
                     // remove overwritten item from the DOM
                     if ( resp[0].overwritten?.id ) {
-                        $(`.item[data-uid=${resp.overwritten.id}]`).removeItems();
+                        $(`.item[data-uid='${resp[0].overwritten.id}']`).removeItems();
                     }
 
                     // copy new path for undo copy
@@ -1226,25 +1496,39 @@ window.copy_items = function (el_items, dest_path) {
                     item_with_same_name_already_exists = false;
                 } catch ( err ) {
                     if ( err.code === 'item_with_same_name_exists' ) {
+                        // The operation is paused on user input, so pause the
+                        // progress-window timer too — otherwise "Preparing..."
+                        // pops up on top of the dialog while it waits.
+                        clearTimeout(progwin_timeout);
                         const alert_resp = await UIAlert({
-                            message: `<strong>${html_encode(err.entry_name)}</strong> already exists.`,
+                            message: i18n('item_already_exists', [err.entry_name], false),
                             buttons: [
                                 { label: i18n('replace'), type: 'primary', value: 'replace' },
                                 ... (el_items.length > 1) ? [{ label: i18n('replace_all'), value: 'replace_all' }] : [],
+                                { label: i18n('keep_both'), value: 'keep_both' },
                                 ... (el_items.length > 1) ? [{ label: i18n('skip'), value: 'skip' }] : [{ label: i18n('cancel'), value: 'cancel' }],
                             ],
                         });
+                        progwin_timeout = arm_progwin();
                         if ( alert_resp === 'replace' ) {
                             overwrite = true;
                         } else if ( alert_resp === 'replace_all' ) {
                             overwrite = true;
                             overwrite_all = true;
+                        } else if ( alert_resp === 'keep_both' ) {
+                            keep_both = true;
                         } else if ( alert_resp === 'skip' || alert_resp === 'cancel' ) {
                             item_with_same_name_already_exists = false;
                         }
                     }
                     else {
-                        if ( err.message ) {
+                        // An out-of-storage copy already shows the SDK's
+                        // upgrade dialog — a second, generic alert on top of
+                        // it would just bury the actionable one.
+                        if ( err.code === 'storage_limit_reached' ) {
+                            // handled by the SDK prompt
+                        }
+                        else if ( err.message ) {
                             UIAlert(err.message);
                         }
                         else if ( err ) {
@@ -1323,7 +1607,9 @@ window.delete_item = async function (el_item, descendants_only = false) {
             $(`.item[data-shortcut_to_path="${html_encode($(el_item).attr('data-path'))}" i]`).attr('data-shortcut_to_path', '');
         });
     } catch ( err ) {
-        UIAlert(err.responseText);
+        // Nothing was deleted: bring back what was faded out above.
+        $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).stop(true).fadeIn(150);
+        UIAlert(err?.message ?? err?.responseText ?? String(err));
     }
 };
 
@@ -1421,22 +1707,42 @@ window.trigger_download = (paths) => {
         });
         return;
 
-        fetch(e.download, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${ puter.authToken}`,
-            },
-            body: JSON.stringify({
-                anti_csrf,
-            }),
-        })
-            .then(res => res.blob())
-            .then(blob => {
-                saveAs(blob, e.filename);
-            });
-
     });
+};
+
+/**
+ * Updates every Trash icon in the UI to reflect whether the trash is empty:
+ * the taskbar item, desktop items (and shortcuts to Trash), open explorer
+ * window head icons, and the Dashboard's Files-tab sidebar.
+ *
+ * @param {boolean} is_empty - Whether the trash is empty
+ */
+window.update_trash_icons = function (is_empty) {
+    const icon = is_empty ? window.icons['trash.svg'] : window.icons['trash-full.svg'];
+    $('[data-app="trash"]').find('.taskbar-icon > img').attr('src', icon);
+    $(`.item[data-path="${html_encode(window.trash_path)}" i], .item[data-shortcut_to_path="${html_encode(window.trash_path)}" i]`).find('.item-icon > img').attr('src', icon);
+    $(`.window[data-path="${html_encode(window.trash_path)}" i]`).find('.window-head-icon').attr('src', icon);
+    $('.directories [data-folder="Trash"] img').attr('src', icon);
+    $('.files-tab .place-row[data-place="Trash"] .item-icon > img').attr('src', icon);
+};
+
+/**
+ * Checks whether the trash is empty, updates every Trash icon accordingly,
+ * and notifies the user's other open tabs. Call after operations that change
+ * trash contents without going through window.move_items or
+ * window.empty_trash (e.g. permanent delete, direct restore).
+ *
+ * @returns {Promise<void>}
+ */
+window.refresh_trash_state = async function () {
+    // 'strong' consistency: an 'eventual' stat can be served from the SDK
+    // cache, which is stale right after a trash mutation and — when seeded
+    // by readdir — lacks the `is_empty` field entirely.
+    const trash = await puter.fs.stat({ path: window.trash_path, consistency: 'strong' });
+    if ( window.socket ) {
+        window.socket.emit('trash.is_empty', { is_empty: trash.is_empty });
+    }
+    window.update_trash_icons(trash.is_empty);
 };
 
 /**
@@ -1447,6 +1753,10 @@ window.trigger_download = (paths) => {
  * @returns {Promise<void>}
  */
 window.move_items = async function (el_items, dest_path, is_undo = false) {
+    // The Shared view is a query, not a directory — nothing can be moved
+    // into it. Backstop for any drop target the surfaces fail to exclude.
+    if ( dest_path === window.shared_path ) return;
+
     let move_op_id = window.operation_id++;
     window.operation_cancelled[move_op_id] = false;
 
@@ -1478,14 +1788,21 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
 
     // only show progress window if it takes longer than 2s to move
     let progwin;
-    let progwin_timeout = setTimeout(async () => {
+    let latest_status;
+    const arm_progwin = () => setTimeout(async () => {
         progwin = await UIWindowProgress({
             operation_id: move_op_id,
             on_cancel: () => {
                 window.operation_cancelled[move_op_id] = true;
             },
         });
+        // Opened mid-operation: show the file being moved rather than the
+        // default "Preparing..." status.
+        if ( latest_status ) {
+            progwin.set_status(latest_status);
+        }
     }, 2000);
+    let progwin_timeout = arm_progwin();
 
     // storing moved items for undo ability
     const moved_items = [];
@@ -1507,9 +1824,21 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
             continue;
         }
 
+        // Deleting sends an item to its owner's trash, not yours.
+        const is_trashing = dest_path === window.trash_path;
+        const item_dest_path = is_trashing
+            ? trash_path_for(
+                $(el_item).attr('data-path'),
+                $(el_item).attr('data-owner'),
+            )
+            : dest_path;
+
         // cannot move item to its own path, skip it
-        if ( path.dirname($(el_item).attr('data-path')) === dest_path ) {
+        if ( path.dirname($(el_item).attr('data-path')) === item_dest_path ) {
+            // pause the progress-window timer while waiting for the user
+            clearTimeout(progwin_timeout);
             await UIAlert(`<p>Moving <strong>${html_encode($(el_item).attr('data-name'))}</strong></p>Cannot move item to its current location.`);
+            progwin_timeout = arm_progwin();
 
             continue;
         }
@@ -1517,6 +1846,7 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
         // if an item with the same name already exists in the destination path
         let item_with_same_name_already_exists = false;
         let overwrite = overwrite_all;
+        let keep_both = false;
         let untrashed_at_least_one_item = false;
 
         // --------------------------------------------------------
@@ -1560,7 +1890,7 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                 // --------------------------------------------------------
                 // Trashing
                 // --------------------------------------------------------
-                if ( dest_path === window.trash_path ) {
+                if ( is_trashing ) {
                     new_name = $(el_item).attr('data-uid');
                     metadata = {
                         original_name: $(el_item).attr('data-name'),
@@ -1577,13 +1907,14 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                     }
 
                     // change trash icons to 'trash-full.svg'
-                    $('[data-app="trash"]').find('.taskbar-icon > img').attr('src', window.icons['trash-full.svg']);
-                    $(`.item[data-path="${html_encode(window.trash_path)}" i], .item[data-shortcut_to_path="${html_encode(window.trash_path)}" i]`).find('.item-icon > img').attr('src', window.icons['trash-full.svg']);
-                    $(`.window[data-path="${html_encode(window.trash_path)}" i]`).find('.window-head-icon').attr('src', window.icons['trash-full.svg']);
+                    window.update_trash_icons(false);
                 }
 
                 // moving an item into a trashed directory? deny.
                 else if ( dest_path.startsWith(window.trash_path) ) {
+                    // the pending timer would otherwise open an orphan
+                    // progress window after the operation already bailed
+                    clearTimeout(progwin_timeout);
                     progwin?.close();
                     UIAlert('Cannot move items into a deleted folder.');
                     return;
@@ -1603,13 +1934,17 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                 // --------------------------------------------------------
                 // update progress window with current item being moved
                 // --------------------------------------------------------
-                progwin?.set_status(i18n(status_i18n_string, path_to_show_on_progwin));
+                latest_status = i18n(status_i18n_string, path_to_show_on_progwin);
+                progwin?.set_status(latest_status);
 
                 // execute move
                 let resp = await puter.fs.move({
                     source: $(el_item).attr('data-uid'),
-                    destination: dest_path,
+                    destination: item_dest_path,
                     overwrite: overwrite || overwrite_all,
+                    // "Keep Both" conflict resolution: move under a deduped
+                    // "name (1)" style name instead of overwriting
+                    dedupeName: keep_both,
                     newName: new_name,
                     // recycling requires making all missing dirs
                     createMissingParents: recycling,
@@ -1620,16 +1955,29 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                 let fsentry = resp.moved;
 
                 // path must use the real name from DB
-                fsentry.path = path.join(dest_path, fsentry.name);
+                fsentry.path = path.join(item_dest_path, fsentry.name);
 
                 // skip next loop iteration because this iteration was successful
                 item_with_same_name_already_exists = false;
 
-                // update all shortcut_to_path
-                $(`.item[data-shortcut_to_path="${html_encode($(el_item).attr('data-path'))}" i]`).attr('data-shortcut_to_path', fsentry.path);
+                // update all shortcut_to_path — compare raw attribute values
+                // (item rows store paths unencoded, so an html_encode()d
+                // selector misses names containing & < > " ')
+                const moved_from_path_lc = String($(el_item).attr('data-path') || '').toLowerCase();
+                $('.item[data-shortcut_to_path]').filter(function () {
+                    return String($(this).attr('data-shortcut_to_path')).toLowerCase() === moved_from_path_lc;
+                }).attr('data-shortcut_to_path', fsentry.path);
 
-                // Remove all items with matching uids
-                $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).fadeOut(150, function () {
+                // Remove all items with matching uids from their OLD location(s).
+                // Exclude any row already at the item's new path: a concurrent
+                // item.moved socket handler may have just created a row at the
+                // destination (e.g. the dashboard file view showing the target
+                // directory), and removing by uid alone would delete it too.
+                // Raw case-insensitive compare, for the same reason as above.
+                const dest_item_path_lc = fsentry.path.toLowerCase();
+                $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).not(function () {
+                    return String($(this).attr('data-path') || '').toLowerCase() === dest_item_path_lc;
+                }).fadeOut(150, function () {
                     // find all parent windows that contain this item
                     let parent_windows = $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).closest('.window');
                     // remove this item
@@ -1642,7 +1990,7 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                 });
 
                 // if trashing, close windows of trashed items and its descendants
-                if ( dest_path === window.trash_path ) {
+                if ( is_trashing ) {
                     $(`.window[data-path="${html_encode($(el_item).attr('data-path'))}" i]`).close();
                     // todo this has to be case-insensitive but the `i` selector doesn't work on ^=
                     $(`.window[data-path^="${html_encode($(el_item).attr('data-path'))}/"]`).close();
@@ -1652,18 +2000,21 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                 else {
                     // todo this has to be case-insensitive but the `i` selector doesn't work on ^=
                     $(`.window[data-path^="${html_encode($(el_item).attr('data-path'))}/"], .window[data-path="${html_encode($(el_item).attr('data-path'))}" i]`).each(function () {
-                        window.update_window_path(this, $(this).attr('data-path').replace($(el_item).attr('data-path'), path.join(dest_path, fsentry.name)));
+                        window.update_window_path(this, $(this).attr('data-path').replace($(el_item).attr('data-path'), path.join(item_dest_path, fsentry.name)));
                     });
                 }
 
-                if ( dest_path === window.trash_path ) {
+                // The dashboard's Back/Forward follows a moved folder, and
+                // forgets a trashed one.
+                if ( $(el_item).attr('data-is_dir') === '1' ) {
+                    window.dashboard_object?.folderMoved?.($(el_item).attr('data-path'), is_trashing ? null : fsentry.path);
+                }
+
+                if ( is_trashing ) {
                     // if trashing dir...
                     if ( $(el_item).attr('data-is_dir') === '1' ) {
-                        // disassociate all its websites
-                        // todo, some client-side check to see if this dir has at least one associated website before sending ajax request
-                        // FIXME: dir_uuid is not defined, is this the same as the data-uid attribute?
-                        // puter.hosting.delete(dir_uuid)
-
+                        // Its websites stay registered: the server doesn't
+                        // serve a root in Trash, and restoring brings them back.
                         $(`.mywebsites-dir-path[data-uuid="${$(el_item).attr('data-uid')}"]`).remove();
                         // remove the website badge from all instances of the dir
                         $(`.item[data-uid="${$(el_item).attr('data-uid')}"]`).find('.item-has-website-badge').fadeOut(300);
@@ -1672,7 +2023,7 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
 
                 // if replacing an existing item, remove the old item that was just replaced
                 if ( resp.overwritten?.id ) {
-                    $(`.item[data-uid=${resp.overwritten.id}]`).removeItems();
+                    $(`.item[data-uid='${resp.overwritten.id}']`).removeItems();
                 }
 
                 // if this is trash, get original name from item metadata
@@ -1680,19 +2031,19 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
 
                 // create new item on matching containers
                 const options = {
-                    appendTo: $(`.item-container[data-path="${html_encode(dest_path)}" i]`),
+                    appendTo: $(`.item-container[data-path="${html_encode(item_dest_path)}" i]`),
                     immutable: fsentry.immutable || (fsentry.writable === false),
                     associated_app_name: fsentry.associated_app?.name,
                     uid: fsentry.uid,
                     path: fsentry.path,
                     icon: await item_icon(fsentry),
-                    name: (dest_path === window.trash_path) ? $(el_item).attr('data-name') : fsentry.name,
+                    name: is_trashing ? $(el_item).attr('data-name') : fsentry.name,
                     is_dir: fsentry.is_dir,
                     size: fsentry.size,
                     type: fsentry.type,
                     modified: fsentry.modified,
                     is_selected: false,
-                    is_shared: (dest_path === window.trash_path) ? false : fsentry.is_shared,
+                    is_shared: is_trashing ? false : fsentry.is_shared,
                     is_shortcut: fsentry.is_shortcut,
                     shortcut_to: fsentry.shortcut_to,
                     shortcut_to_path: fsentry.shortcut_to_path,
@@ -1701,6 +2052,10 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                     suggested_apps: fsentry.suggested_apps,
                 };
                 UIItem(options);
+                // In dashboard mode, also create item via dashboard's renderer
+                if ( window.is_dashboard_mode && window.UIDashboardFileItem ) {
+                    window.UIDashboardFileItem(fsentry);
+                }
                 moved_items.push({ 'options': options, 'original_path': $(el_item).attr('data-path') });
 
                 // this operation may have created some missing directories,
@@ -1726,11 +2081,15 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                             suggested_apps: dir.suggested_apps,
                         });
                     }
+                    // In dashboard mode, also create parent dirs via dashboard's renderer
+                    if ( window.is_dashboard_mode && window.UIDashboardFileItem ) {
+                        window.UIDashboardFileItem(dir);
+                    }
                     window.sort_items(item_container);
                 });
 
                 //sort each container
-                $(`.item-container[data-path="${html_encode(dest_path)}" i]`).each(function () {
+                $(`.item-container[data-path="${html_encode(item_dest_path)}" i]`).each(function () {
                     window.sort_items(this, $(this).attr('data-sort_by'), $(this).attr('data-sort_order'));
                 });
             } catch ( err ) {
@@ -1740,19 +2099,27 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                 if ( err.code === 'item_with_same_name_exists' ) {
                     item_with_same_name_already_exists = true;
 
+                    // The operation is paused on user input, so pause the
+                    // progress-window timer too — otherwise "Preparing..."
+                    // pops up on top of the dialog while it waits.
+                    clearTimeout(progwin_timeout);
                     const alert_resp = await UIAlert({
-                        message: `<strong>${html_encode(err.entry_name)}</strong> already exists.`,
+                        message: i18n('item_already_exists', [err.entry_name], false),
                         buttons: [
                             { label: i18n('replace'), type: 'primary', value: 'replace' },
                             ... (el_items.length > 1) ? [{ label: i18n('replace_all'), value: 'replace_all' }] : [],
+                            { label: i18n('keep_both'), value: 'keep_both' },
                             ... (el_items.length > 1) ? [{ label: i18n('skip'), value: 'skip' }] : [{ label: i18n('cancel'), value: 'cancel' }],
                         ],
                     });
+                    progwin_timeout = arm_progwin();
                     if ( alert_resp === 'replace' ) {
                         overwrite = true;
                     } else if ( alert_resp === 'replace_all' ) {
                         overwrite = true;
                         overwrite_all = true;
+                    } else if ( alert_resp === 'keep_both' ) {
+                        keep_both = true;
                     } else if ( alert_resp === 'skip' || alert_resp === 'cancel' ) {
                         item_with_same_name_already_exists = false;
                     }
@@ -1774,15 +2141,7 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
 
         // check if trash is empty
         if ( untrashed_at_least_one_item ) {
-            const trash = await puter.fs.stat({ path: window.trash_path, consistency: 'eventual' });
-            if ( window.socket ) {
-                window.socket.emit('trash.is_empty', { is_empty: trash.is_empty });
-            }
-            if ( trash.is_empty ) {
-                $('[data-app="trash"]').find('.taskbar-icon > img').attr('src', window.icons['trash.svg']);
-                $(`.item[data-path="${html_encode(window.trash_path)}" i]`).find('.item-icon > img').attr('src', window.icons['trash.svg']);
-                $(`.window[data-path="${html_encode(window.trash_path)}" i]`).find('.window-head-icon').attr('src', window.icons['trash.svg']);
-            }
+            await window.refresh_trash_state();
         }
     }
 
@@ -1846,10 +2205,13 @@ window.refresh_desktop_background = function () {
 };
 
 window.determine_website_url = function (fsentry_path) {
-    // search window.sites and if any site has `dir_path` set and the fsentry_path starts with that dir_path + '/', return the site's url + path
-    for ( let i = 0; i < window.sites.length; i++ ) {
-        if ( window.sites[i].dir_path && fsentry_path.startsWith(`${window.sites[i].dir_path }/`) ) {
-            return window.sites[i].address + fsentry_path.replace(window.sites[i].dir_path, '');
+    // The address an item has under a site serving a folder above it. The
+    // site's folder and address come with its root_dir.
+    for ( const site of window.sites ) {
+        const dir_path = site.root_dir?.path;
+        const address = site.root_dir?.subdomains?.find((entry) => entry.subdomain === site.subdomain)?.address;
+        if ( dir_path && address && fsentry_path.startsWith(`${dir_path}/`) ) {
+            return address + fsentry_path.slice(dir_path.length);
         }
     }
 
@@ -1867,35 +2229,167 @@ window.update_sites_cache = function () {
 };
 
 /**
+ * Fetches subdomains for directories and updates UI items with subdomain data.
+ * This function can be called after readdir to update website badges asynchronously.
+ *
+ * @param {Array} fsentries - Array of filesystem entries (from readdir)
+ * @param {jQuery|HTMLElement} [container] - Optional container to limit search scope. If not provided, searches entire document.
+ * @returns {Promise<void>}
+ */
+window.updateSubdomainsForItems = async function (fsentries, container) {
+    if ( !fsentries || fsentries.length === 0 ) {
+        // Early return - no action is needed
+        return;
+    }
+
+    // Extract directory IDs and create a map of id -> fsentry
+    const directoryIds = [];
+    const fsentryById = new Map();
+
+    for ( const fsentry of fsentries ) {
+        if ( fsentry.is_dir && fsentry.id != null ) {
+            directoryIds.push(fsentry.id);
+            fsentryById.set(fsentry.id, fsentry);
+        }
+    }
+
+    // No directories means no subdomains
+    if ( directoryIds.length === 0 ) {
+        return;
+    }
+
+    try {
+        const subdomainResults = await puter.fs.readdirSubdomains({ directory_ids: directoryIds });
+
+        // Create a map of directory_id -> subdomain data
+        const subdomainMap = new Map();
+        for ( const result of subdomainResults ) {
+            subdomainMap.set(result.directory_id, {
+                subdomains: result.subdomains,
+                has_website: result.has_website,
+            });
+        }
+
+        // Update UI items with subdomain data
+        // Always search entire document first to ensure we find items regardless of DOM structure
+        for ( const fsentry of fsentries ) {
+            if ( !fsentry.is_dir || !fsentry.id ) continue;
+
+            const subdomainData = subdomainMap.get(fsentry.id);
+            const has_website = subdomainData ? subdomainData.has_website : false;
+            const subdomains = subdomainData ? subdomainData.subdomains : [];
+
+            // Find the item element - search entire document by uid first
+            let $item = $(document).find(`.item[data-uid="${fsentry.uid}"]`);
+
+            // If not found by uid, try path-based search
+            if ( $item.length === 0 && fsentry.path ) {
+                // Escape special characters in path for jQuery selector
+                const escapedPath = fsentry.path.replace(/[!"#$%&'()*+,.\/:;<=>?@[\\\]^`{|}~]/g, '\\$&');
+                $item = $(document).find(`.item[data-path="${escapedPath}"]`);
+            }
+
+            if ( $item.length > 0 ) {
+                // Update has_website attribute
+                $item.attr('data-has_website', has_website ? '1' : '0');
+
+                // Update website badge visibility
+                const $badge = $item.find('.item-has-website-badge');
+                if ( $badge.length > 0 ) {
+                    $badge.css('display', has_website ? 'block' : 'none');
+                } else {
+                }
+
+                // Update cache with subdomain data
+                if ( fsentry.path ) {
+                    const key = puter.fsCacheKey('item', fsentry.path);
+                    const cachedItem = await puter._cache.get(key);
+                    if ( cachedItem ) {
+                        cachedItem.subdomains = subdomains;
+                        cachedItem.has_website = has_website;
+                        puter._cache.set(key, cachedItem);
+                    }
+                }
+            } else {
+                console.warn('[updateSubdomainsForItems] Item not found for directory:', {
+                    name: fsentry.name,
+                    uid: fsentry.uid,
+                    id: fsentry.id,
+                    path: fsentry.path,
+                });
+            }
+        }
+
+        console.log('[updateSubdomainsForItems] Update complete');
+    } catch ( error ) {
+        // Silently fail subdomain fetching - don't block the UI
+        console.error('[updateSubdomainsForItems] Failed to fetch subdomains:', error);
+    }
+};
+
+// This flow owns its own file input rather than borrowing the shell's
+// #upload-file-dialog. That element is shared, and on the dashboard the Files
+// tab assigns an onchange PROPERTY to it — which jQuery's unbind() cannot
+// remove — so a single selection used to fire both handlers and start two
+// concurrent uploads of the same files. When the two destinations coincided
+// (both default to Desktop) the signed batch writes raced and the loser failed
+// with "Entry already exists"; when they differed, the files also landed in
+// the Files tab's directory. A private input keeps the two flows independent.
+let el_upload_dialog_input = null;
+
+// Destination for the pending selection. Module-level rather than captured per
+// call because the input's change handler is bound once, and only one native
+// file dialog can be open at a time — matching the old behaviour, where
+// re-binding meant the most recent caller's target won.
+let upload_dialog_target_path = null;
+
+const get_upload_dialog_input = () => {
+    if ( el_upload_dialog_input?.isConnected ) {
+        return el_upload_dialog_input;
+    }
+
+    el_upload_dialog_input = document.createElement('input');
+    el_upload_dialog_input.type = 'file';
+    el_upload_dialog_input.name = 'file';
+    el_upload_dialog_input.multiple = true;
+    el_upload_dialog_input.style.display = 'none';
+    document.body.appendChild(el_upload_dialog_input);
+
+    el_upload_dialog_input.addEventListener('change', function () {
+        // Snapshot into an array before clearing: `value = ''` empties the live
+        // FileList in place, and upload_items consumes it asynchronously.
+        const files = Array.from(el_upload_dialog_input.files ?? []);
+        el_upload_dialog_input.value = '';
+        if ( files.length === 0 ) {
+            return;
+        }
+        try {
+            window.upload_items(files, upload_dialog_target_path);
+        }
+        catch ( err ) {
+            UIAlert(err.message ?? err);
+        }
+    });
+
+    return el_upload_dialog_input;
+};
+
+/**
  *
  * @param {*} el_target_container
  * @param {*} target_path
  */
 
 window.init_upload_using_dialog = function (el_target_container, target_path = null) {
-    $('#upload-file-dialog').unbind('onchange');
-    $('#upload-file-dialog').unbind('change');
-    $('#upload-file-dialog').unbind('onChange');
+    upload_dialog_target_path = target_path === null
+        ? $(el_target_container).attr('data-path')
+        : path.resolve(target_path);
 
-    target_path = target_path === null ? $(el_target_container).attr('data-path') : path.resolve(target_path);
-    $('#upload-file-dialog').trigger('click');
-    $('#upload-file-dialog').on('change', async function (e) {
-        if ( $('#upload-file-dialog').val() !== '' ) {
-            const files = $('#upload-file-dialog')[0].files;
-            if ( files.length > 0 ) {
-                try {
-                    window.upload_items(files, target_path);
-                }
-                catch ( err ) {
-                    UIAlert(err.message ?? err);
-                }
-                $('#upload-file-dialog').val('');
-            }
-        }
-        else {
-            return;
-        }
-    });
+    const el_input = get_upload_dialog_input();
+    // Clearing before opening lets the same file be picked twice in a row; an
+    // unchanged value fires no change event.
+    el_input.value = '';
+    el_input.click();
 };
 
 window.upload_items = async function (items, dest_path) {
@@ -1908,85 +2402,92 @@ window.upload_items = async function (items, dest_path) {
     }
 
     puter.fs.upload(
-                    // what to upload
-                    items,
-                    // where to upload
-                    dest_path,
-                    // options
-                    {
-                        generateThumbnails: true,
-                        // init
-                        init: async (operation_id, xhr) => {
-                            opid = operation_id;
-                            // create upload progress window
-                            upload_progress_window = await UIWindowProgress({
-                                title: i18n('upload'),
-                                icon: window.icons['app-icon-uploader.svg'],
-                                operation_id: operation_id,
-                                show_progress: true,
-                                on_cancel: () => {
-                                    window.show_save_account_notice_if_needed();
-                                    xhr.abort();
-                                },
-                            });
-                            // add to active_uploads
-                            window.active_uploads[opid] = 0;
-                        },
-                        // start
-                        start: async function () {
-                            // change upload progress window message to uploading
-                            upload_progress_window.set_status('Uploading');
-                            upload_progress_window.set_progress(0);
-                        },
-                        // progress
-                        progress: async function (operation_id, op_progress) {
-                            upload_progress_window.set_progress(op_progress);
-                            // update active_uploads
-                            window.active_uploads[opid] = op_progress;
-                            // update title if window is not visible
-                            if ( document.visibilityState !== 'visible' ) {
-                                update_title_based_on_uploads();
-                            }
-                        },
-                        // success
-                        success: async function (items) {
-                            // DONE
-                            // Add action to actions_history for undo ability
-                            const files = [];
-                            if ( typeof items[Symbol.iterator] === 'function' ) {
-                                for ( const item of items ) {
-                                    files.push(item.path);
-                                }
-                            } else {
-                                files.push(items.path);
-                            }
+        // what to upload
+        items,
+        // where to upload
+        dest_path,
+        // options
+        {
+            generateThumbnails: true,
+            thumbnailGenerator: createUploadThumbnailGenerator(),
+            // init
+            init: async (operation_id, xhr) => {
+                opid = operation_id;
+                // register before the first await, so a failure while the progress
+                // window is still opening can't delete the entry before it exists
+                window.active_uploads[opid] = 0;
+                // create upload progress window
+                upload_progress_window = await UIWindowProgress({
+                    title: i18n('upload'),
+                    icon: window.icons['app-icon-uploader.svg'],
+                    operation_id: operation_id,
+                    show_progress: true,
+                    on_cancel: () => {
+                        window.show_save_account_notice_if_needed();
+                        xhr.abort();
+                    },
+                });
+            },
+            // start
+            start: async function () {
+                // change upload progress window message to uploading
+                upload_progress_window.set_status('Uploading');
+                upload_progress_window.set_progress(0);
+            },
+            // progress
+            progress: async function (operation_id, op_progress) {
+                upload_progress_window.set_progress(op_progress);
+                // update active_uploads
+                window.active_uploads[opid] = op_progress;
+                // update title if window is not visible
+                if ( document.visibilityState !== 'visible' ) {
+                    update_title_based_on_uploads();
+                }
+            },
+            // success
+            success: async function (items) {
+                // DONE
+                // Add action to actions_history for undo ability
+                const files = [];
+                if ( typeof items[Symbol.iterator] === 'function' ) {
+                    for ( const item of items ) {
+                        files.push(item.path);
+                    }
+                } else {
+                    files.push(items.path);
+                }
 
-                            window.actions_history.push({
-                                operation: 'upload',
-                                data: files,
-                            });
-                            // close progress window after a bit of delay for a better UX
-                            setTimeout(() => {
-                                setTimeout(() => {
-                                    upload_progress_window.close();
-                                    window.show_save_account_notice_if_needed();
-                                }, Math.abs(window.upload_progress_hide_delay));
-                            });
-                            // remove from active_uploads
-                            delete window.active_uploads[opid];
-                        },
-                        // error
-                        error: async function (err) {
-                            upload_progress_window.show_error(i18n('error_uploading_files'), err.message);
-                            // remove from active_uploads
-                            delete window.active_uploads[opid];
-                        },
-                        // abort
-                        abort: async function (operation_id) {
-                            // remove from active_uploads
-                            delete window.active_uploads[opid];
-                        },
-                    });
+                window.actions_history.push({
+                    operation: 'upload',
+                    data: files,
+                });
+
+                // highlight the uploaded items in the destination
+                select_uploaded_items(dest_path, files);
+
+                // close progress window after a bit of delay for a better UX
+                setTimeout(() => {
+                    setTimeout(() => {
+                        upload_progress_window.close();
+                        window.show_save_account_notice_if_needed();
+                    }, Math.abs(window.upload_progress_hide_delay));
+                });
+                // remove from active_uploads
+                delete window.active_uploads[opid];
+            },
+            // error
+            error: async function (err) {
+                upload_progress_window.show_error(i18n('error_uploading_files', [], false), err.message);
+                // remove from active_uploads
+                delete window.active_uploads[opid];
+            },
+            // abort
+            abort: async function (operation_id) {
+                // remove from active_uploads
+                delete window.active_uploads[opid];
+            },
+        },
+    );
 };
 
 window.empty_trash = async function () {
@@ -2028,9 +2529,7 @@ window.empty_trash = async function () {
                 window.socket.emit('trash.is_empty', { is_empty: true });
             }
             // use the 'empty trash' icon for Trash
-            $('[data-app="trash"]').find('.taskbar-icon > img').attr('src', window.icons['trash.svg']);
-            $(`.item[data-path="${html_encode(window.trash_path)}" i], .item[data-shortcut_to_path="${html_encode(window.trash_path)}" i]`).find('.item-icon > img').attr('src', window.icons['trash.svg']);
-            $(`.window[data-path="${window.trash_path}"]`).find('.window-head-icon').attr('src', window.icons['trash.svg']);
+            window.update_trash_icons(true);
             // remove all items with trash paths
             // todo this has to be case-insensitive but the `i` selector doesn't work on ^=
             $(`.item[data-path^="${window.trash_path}/"]`).removeItems();
@@ -2059,32 +2558,6 @@ window.copy_to_clipboard = async function (text) {
     else {
         document.execCommand('copy');
     }
-};
-
-window.getUsage = () => {
-    return fetch(`${window.api_origin }/drivers/usage`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${ window.auth_token}`,
-        },
-        method: 'GET',
-    })
-        .then(response => {
-        // Check if the response is ok (status code in the range 200-299)
-            if ( ! response.ok ) {
-                throw new Error('Network response was not ok');
-            }
-            return response.json(); // Parse the response as JSON
-        })
-        .then(data => {
-        // Handle the JSON data
-            return data;
-        })
-        .catch(error => {
-        // Handle any errors
-            console.error('There has been a problem with your fetch operation:', error);
-        });
-
 };
 
 window.getAppUIDFromOrigin = async function (origin) {
@@ -2135,7 +2608,7 @@ window.getUserAppToken = async function (origin) {
 
 window.checkUserSiteRelationship = async function (origin) {
     try {
-        const response = await fetch(`${window.api_origin }/auth/check-app `, {
+        const response = await fetch(`${window.api_origin }/auth/check-app`, {
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${ window.auth_token}`,
@@ -2207,7 +2680,10 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
         progwin?.set_status(i18n('zip', 'Selection(s)'));
     }, 500);
 
-    let toBeZipped = {};
+    const toBeZipped = {};
+    // Shared items from different people can share a name; each keeps its
+    // own entry rather than overwriting the other.
+    const topNames = [];
 
     let perItemAdditionProgress = window.zippingProgressConfig.SEQUENCING / el_items.length;
     let currentProgress = 0;
@@ -2215,6 +2691,8 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
         const el_item = el_items[idx];
         if ( window.operation_cancelled[zip_operation_id] ) return;
         let targetPath = $(el_item).attr('data-path');
+        const topName = dedupedName(path.basename(targetPath), topNames);
+        topNames.push(topName);
 
         // if directory, zip the directory
         if ( $(el_item).attr('data-is_dir') === '1' ) {
@@ -2226,12 +2704,10 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
             for ( let cIdx = 0; cIdx < children.length; cIdx++ ) {
                 const child = children[cIdx];
 
-                if ( ! child.relativePath ) {
-                    // Add empty directiories to the zip
-                    toBeZipped = {
-                        ...toBeZipped,
-                        [`${path.basename(child.path)}/`]: [await blobToUint8Array(new Blob()), { level: 9 }],
-                    };
+                if ( child.emptyDirPath !== undefined ) {
+                    // Add empty directories to the zip, where they sit
+                    const dirPath = el_items.length === 1 ? child.emptyDirPath : `${topName}/${child.emptyDirPath}`;
+                    toBeZipped[dirPath || `${topName}/`] = [await blobToUint8Array(new Blob()), { level: 9 }];
                 } else {
                     // Add files from directory to the zip
                     let relativePath;
@@ -2241,17 +2717,14 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
                     }
                     else
                     {
-                        relativePath = `${path.basename(targetPath) }/${ child.relativePath}`;
+                        relativePath = `${topName}/${child.relativePath}`;
                     }
 
                     // read file content
                     progwin?.set_status(i18n('sequencing', child.relativePath));
                     let content = await puter.fs.read(child.path);
                     try {
-                        toBeZipped = {
-                            ...toBeZipped,
-                            [relativePath]: [await blobToUint8Array(content), { level: 9 }],
-                        };
+                        toBeZipped[relativePath] = [await blobToUint8Array(content), { level: 9 }];
                     } catch (e) {
                         console.error(e);
                     }
@@ -2264,10 +2737,7 @@ window.zipItems = async function (el_items, targetDirPath, download = true) {
         else {
             progwin?.set_status(i18n('reading', path.basename($(el_items[0]).attr('data-path'))));
             let content = await puter.fs.read(targetPath);
-            toBeZipped = {
-                ...toBeZipped,
-                [path.basename(targetPath)]: [await blobToUint8Array(content), { level: 9 }],
-            };
+            toBeZipped[topName] = [await blobToUint8Array(content), { level: 9 }];
             currentProgress += perItemAdditionProgress;
             progwin?.set_progress(currentProgress.toPrecision(2));
         }
@@ -2338,7 +2808,8 @@ async function readDirectoryRecursive (path, baseDir = '') {
     const entries = await puter.fs.readdir(path, { consistency: 'eventual' });
 
     if ( entries.length === 0 ) {
-        allFiles.push({ path });
+        // An empty folder, by where it sits in the folder being read.
+        allFiles.push({ path, emptyDirPath: baseDir });
     } else {
         // Process each entry
         for ( const entry of entries ) {
@@ -2416,10 +2887,12 @@ window.unzipItem = async function (itemPath) {
             let perItemProgress = window.zippingProgressConfig.WRITING / Object.keys(unzipped).length;
             let queuedFileWrites = [];
             Object.keys(unzipped).forEach(fileItem => {
+                const entryPath = archiveEntryPath(fileItem);
+                if ( entryPath === null ) return;
                 try {
                     let fileData = new Blob([new Uint8Array(unzipped[fileItem], unzipped[fileItem].byteOffset, unzipped[fileItem].length)]);
                     progwin?.set_status(i18n('writing', fileItem));
-                    queuedFileWrites.push(new File([fileData], fileItem));
+                    queuedFileWrites.push(new File([fileData], entryPath));
                     currentProgress += perItemProgress;
                     progwin?.set_progress(currentProgress.toPrecision(2));
                 } catch (e) {
@@ -2427,30 +2900,32 @@ window.unzipItem = async function (itemPath) {
                 }
             });
             queuedFileWrites.length && puter.fs.upload(
-                            // what to upload
-                            queuedFileWrites,
-                            // where to upload
-                            `${rootdir.path }/`,
-                            // options
-                            {
-                                createFileParent: true,
-                                generateThumbnails: true,
-                                progress: async function (operation_id, op_progress) {
-                                    progwin.set_progress(op_progress);
-                                    // update title if window is not visible
-                                    if ( document.visibilityState !== 'visible' ) {
-                                        update_title_based_on_uploads();
-                                    }
-                                },
-                                success: async function (items) {
-                                    progwin?.set_progress(window.zippingProgressConfig.TOTAL.toPrecision(2));
-                                    // close progress window
-                                    clearTimeout(progwin_timeout);
-                                    setTimeout(() => {
-                                        progwin?.close();
-                                    }, Math.max(0, window.unzip_progress_hide_delay - (Date.now() - start_ts)));
-                                },
-                            });
+                // what to upload
+                queuedFileWrites,
+                // where to upload
+                `${rootdir.path }/`,
+                // options
+                {
+                    createFileParent: true,
+                    generateThumbnails: true,
+                    thumbnailGenerator: createUploadThumbnailGenerator(),
+                    progress: async function (operation_id, op_progress) {
+                        progwin.set_progress(op_progress);
+                        // update title if window is not visible
+                        if ( document.visibilityState !== 'visible' ) {
+                            update_title_based_on_uploads();
+                        }
+                    },
+                    success: async function (items) {
+                        progwin?.set_progress(window.zippingProgressConfig.TOTAL.toPrecision(2));
+                        // close progress window
+                        clearTimeout(progwin_timeout);
+                        setTimeout(() => {
+                            progwin?.close();
+                        }, Math.max(0, window.unzip_progress_hide_delay - (Date.now() - start_ts)));
+                    },
+                },
+            );
         }
     });
 };
@@ -2669,34 +3144,38 @@ window.untarItem = async function (itemPath) {
         let queuedFileWrites = [];
 
         for ( let fileItem of files ) {
-            if ( ! fileItem.isDir ) {
+            const entryPath = archiveEntryPath(fileItem.name);
+            if ( !fileItem.isDir && entryPath !== null ) {
                 let fileData = new Blob([fileItem.content]);
                 progwin?.set_status(i18n('writing', fileItem.name));
-                queuedFileWrites.push(new File([fileData], fileItem.name));
+                queuedFileWrites.push(new File([fileData], entryPath));
                 currentProgress += perItemProgress;
                 progwin?.set_progress(currentProgress.toPrecision(2));
             }
         }
 
-        queuedFileWrites.length && puter.fs.upload(queuedFileWrites,
-                        `${rootdir.path }/`,
-                        {
-                            createFileParent: true,
-                            generateThumbnails: true,
-                            progress: async function (operation_id, op_progress) {
-                                progwin.set_progress(op_progress);
-                                if ( document.visibilityState !== 'visible' ) {
-                                    update_title_based_on_uploads();
-                                }
-                            },
-                            success: async function (items) {
-                                progwin?.set_progress(window.zippingProgressConfig.TOTAL.toPrecision(2));
-                                clearTimeout(progwin_timeout);
-                                setTimeout(() => {
-                                    progwin?.close();
-                                }, Math.max(0, window.unzip_progress_hide_delay - (Date.now() - start_ts)));
-                            },
-                        });
+        queuedFileWrites.length && puter.fs.upload(
+            queuedFileWrites,
+            `${rootdir.path }/`,
+            {
+                createFileParent: true,
+                generateThumbnails: true,
+                thumbnailGenerator: createUploadThumbnailGenerator(),
+                progress: async function (operation_id, op_progress) {
+                    progwin.set_progress(op_progress);
+                    if ( document.visibilityState !== 'visible' ) {
+                        update_title_based_on_uploads();
+                    }
+                },
+                success: async function (items) {
+                    progwin?.set_progress(window.zippingProgressConfig.TOTAL.toPrecision(2));
+                    clearTimeout(progwin_timeout);
+                    setTimeout(() => {
+                        progwin?.close();
+                    }, Math.max(0, window.unzip_progress_hide_delay - (Date.now() - start_ts)));
+                },
+            },
+        );
     } catch ( err ) {
         UIAlert(err.message);
         clearTimeout(progwin_timeout);
@@ -2751,18 +3230,26 @@ function parseTar (data) {
     return files;
 }
 
-window.rename_file = async (options, new_name, old_name, old_path, el_item, el_item_name, el_item_icon, el_item_name_editor, website_url, is_undo = false) => {
+/**
+ * @param {(fsentry: object | null) => void} [onDone] - Runs after the row is
+ *     updated: with the renamed entry, or null once a failed rename is undone.
+ */
+window.rename_file = async (options, new_name, old_name, old_path, el_item, el_item_name, el_item_icon, el_item_name_editor, website_url, is_undo = false, onDone) => {
     puter.fs.rename({
         uid: options.uid === 'null' ? null : options.uid,
         new_name: new_name,
-        excludeSocketID: window.socket.id,
+        excludeSocketID: window.socket?.id,
         success: async (fsentry) => {
+            // A renamed shared item is cached under its old path — drop the
+            // cache so mode lookups against the new path don't miss.
+            if ( ! is_owned_by_me(old_path) ) invalidate_shared_roots();
+
             // Add action to actions_history for undo ability
             if ( ! is_undo )
             {
                 window.actions_history.push({
                     operation: 'rename',
-                    data: { options, new_name, old_name, old_path, el_item, el_item_name, el_item_icon, el_item_name_editor, website_url },
+                    data: { options, new_name, old_name, old_path, el_item, el_item_name, el_item_icon, el_item_name_editor, website_url, onDone },
                 });
             }
 
@@ -2789,19 +3276,22 @@ window.rename_file = async (options, new_name, old_name, old_path, el_item, el_i
             const new_icon = (options.is_dir ? window.icons['folder.svg'] : (await item_icon(fsentry)).image);
             $(el_item_icon).find('.item-icon-icon').attr('src', new_icon);
 
-            // Set new `data-name`
+            // Set new `data-name`. Attributes and form values are stored raw:
+            // .attr()/.val() don't parse HTML, so an encoded name would come
+            // back as "a&amp;b" wherever it is read (sorting, type-to-select,
+            // the dashboard's column truncation).
             options.name = new_name;
-            $(el_item).attr('data-name', html_encode(new_name));
-            $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).attr('data-name', html_encode(new_name));
-            $(`.window-${options.uid}`).attr('data-name', html_encode(new_name));
+            $(el_item).attr('data-name', new_name);
+            $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).attr('data-name', new_name);
+            $(`.window-${options.uid}`).attr('data-name', new_name);
 
             // Set new `title` attribute
-            $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).attr('title', html_encode(new_name));
-            $(`.window-${options.uid}`).attr('title', html_encode(new_name));
+            $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).attr('title', new_name);
+            $(`.window-${options.uid}`).attr('title', new_name);
 
             // Set new value for `item-name-editor`
-            $(`.item[data-uid='${$(el_item).attr('data-uid')}'] .item-name-editor`).val(html_encode(new_name));
-            $(`.item[data-uid='${$(el_item).attr('data-uid')}'] .item-name`).attr('title', html_encode(new_name));
+            $(`.item[data-uid='${$(el_item).attr('data-uid')}'] .item-name-editor`).val(new_name);
+            $(`.item[data-uid='${$(el_item).attr('data-uid')}'] .item-name`).attr('title', new_name);
 
             // Set new `data-path` attribute
             options.path = path.join(path.dirname(options.path), options.name);
@@ -2821,7 +3311,7 @@ window.rename_file = async (options, new_name, old_name, old_path, el_item, el_i
 
             // Update the paths of all elements whose paths start with `old_path`
             $(`[data-path^="${`${html_encode(old_path) }/`}"]`).each(function () {
-                const new_el_path = _.replace($(this).attr('data-path'), `${old_path }/`, `${new_path}/`);
+                const new_el_path = $(this).attr('data-path').replace(`${old_path }/`, `${new_path}/`);
                 $(this).attr('data-path', new_el_path);
             });
 
@@ -2847,6 +3337,8 @@ window.rename_file = async (options, new_name, old_name, old_path, el_item, el_i
             $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).parent('.item-container').each(function () {
                 window.sort_items(this, $(el_item).closest('.item-container').attr('data-sort_by'), $(el_item).closest('.item-container').attr('data-sort_order'));
             });
+
+            onDone?.(fsentry);
         },
         error: function (err) {
             // reset to old name
@@ -2855,13 +3347,16 @@ window.rename_file = async (options, new_name, old_name, old_path, el_item, el_i
 
             // hide item name editor
             $(el_item_name_editor).hide();
-            $(el_item_name_editor).val(html_encode($(el_item).attr('data-name')));
+            $(el_item_name_editor).val($(el_item).attr('data-name'));
 
-            //show error
-            if ( err.message ) {
-                UIAlert(err.message);
-            }
+            onDone?.(null);
+
+            // A network failure rejects with no message, and the name going
+            // back on its own would look like the rename was ignored.
+            UIAlert(err?.message || i18n('error_unknown_cause', [], false));
         },
+    }).catch(() => {
+        // Handled by the error callback above.
     });
 };
 
@@ -2884,30 +3379,27 @@ window.delete_item_with_path = async function (path) {
 };
 
 window.undo_last_action = async () => {
-    if ( window.actions_history.length > 0 ) {
-        const last_action = window.actions_history.pop();
+    if ( window.actions_history.length === 0 ) return;
 
-        // Undo the create file action
-        if ( last_action.operation === 'create_file' || last_action.operation === 'create_folder' ) {
-            const lastCreatedItem = last_action.data;
-            window.undo_create_file_or_folder(lastCreatedItem);
-        } else if ( last_action.operation === 'rename' ) {
-            const { options, new_name, old_name, old_path, el_item, el_item_name, el_item_icon, el_item_name_editor, website_url }  = last_action.data;
-            window.rename_file(options, old_name, new_name, old_path, el_item, el_item_name, el_item_icon, el_item_name_editor, website_url, true);
-        } else if ( last_action.operation === 'upload' ) {
-            const files = last_action.data;
-            window.undo_upload(files);
-        } else if ( last_action.operation === 'copy' ) {
-            const files = last_action.data;
-            window.undo_copy(files);
-        } else if ( last_action.operation === 'move' ) {
-            const items = last_action.data;
-            window.undo_move(items);
-        } else if ( last_action.operation === 'delete' ) {
-            const items = last_action.data;
-            window.undo_delete(items);
-        }
-    }
+    const last_action = window.actions_history.pop();
+    const { operation, data } = last_action;
+
+    // Map operations to their undo handlers
+    const undoHandlers = {
+        create_file: () => window.undo_create_file_or_folder(data),
+        create_folder: () => window.undo_create_file_or_folder(data),
+        upload: () => window.undo_upload(data),
+        copy: () => window.undo_copy(data),
+        move: () => window.undo_move(data),
+        delete: () => window.undo_delete(data),
+        rename: () => {
+            const { options, new_name, old_name, old_path, el_item, el_item_name, el_item_icon, el_item_name_editor, website_url, onDone } = data;
+            window.rename_file(options, old_name, new_name, old_path, el_item, el_item_name, el_item_icon, el_item_name_editor, website_url, true, onDone);
+        },
+    };
+
+    const handler = undoHandlers[operation];
+    if ( handler ) handler();
 };
 
 window.undo_create_file_or_folder = async (item) => {
@@ -2942,14 +3434,18 @@ window.undo_delete = async (items) => {
 };
 
 window.store_auto_arrange_preference = (preference) => {
-    puter.kv.set('user_preferences.auto_arrange_desktop', preference);
+    // localStorage still carries it for this device either way.
+    puter.kv.set('user_preferences.auto_arrange_desktop', preference)
+        .catch(err => console.warn('Could not save auto_arrange_desktop:', err));
     localStorage.setItem('auto_arrange', preference);
 };
 
 window.get_auto_arrange_data = async () => {
-    const preferenceValue = await puter.kv.get('user_preferences.auto_arrange_desktop');
+    // Best-effort, like every other preference read: falling back to the
+    // default keeps the desktop arranging itself rather than not appearing.
+    const preferenceValue = await puter.kv.get('user_preferences.auto_arrange_desktop').catch(() => null);
     window.is_auto_arrange_enabled = preferenceValue === null ? true : preferenceValue;
-    const positions = await puter.kv.get('desktop_item_positions');
+    const positions = await puter.kv.get('desktop_item_positions').catch(() => null);
     window.desktop_item_positions = (!positions || typeof positions !== 'object' || Array.isArray(positions)) ? {} : positions;
 };
 
@@ -2978,32 +3474,14 @@ window.set_desktop_item_positions = async (el_desktop) => {
 };
 
 window.save_desktop_item_positions = () => {
-    puter.kv.set('desktop_item_positions', window.desktop_item_positions);
+    puter.kv.set('desktop_item_positions', window.desktop_item_positions)
+        .catch(err => console.warn('Could not save desktop_item_positions:', err));
 };
 
 window.delete_desktop_item_positions = () => {
     window.desktop_item_positions = {};
-    puter.kv.del('desktop_item_positions');
-};
-
-window.change_clock_visible = (clock_visible) => {
-    let newValue = clock_visible || window.user_preferences.clock_visible;
-
-    newValue === 'auto' && window.is_fullscreen() ? $('#clock').show() : $('#clock').hide();
-
-    newValue === 'show' && $('#clock').show();
-    newValue === 'hide' && $('#clock').hide();
-
-    if ( clock_visible ) {
-        // save clock_visible to user preferences
-        window.mutate_user_preferences({
-            clock_visible: newValue,
-        });
-
-        return;
-    }
-
-    $('select.change-clock-visible').val(window.user_preferences.clock_visible);
+    puter.kv.del('desktop_item_positions')
+        .catch(err => console.warn('Could not clear desktop_item_positions:', err));
 };
 
 // Finds the `.window` element for the given app instance ID
@@ -3014,22 +3492,6 @@ window.window_for_app_instance = (instance_id) => {
 // Finds the `iframe` element for the given app instance ID
 window.iframe_for_app_instance = (instance_id) => {
     return $(window.window_for_app_instance(instance_id)).find('.window-app-iframe').get(0);
-};
-
-// Run any callbacks to say that the app has launched
-window.report_app_launched = (instance_id, { uses_sdk = true }) => {
-    const child_launch_callback = window.child_launch_callbacks[instance_id];
-    if ( child_launch_callback ) {
-        const parent_iframe = window.iframe_for_app_instance(child_launch_callback.parent_instance_id);
-        // send confirmation to requester window
-        parent_iframe.contentWindow.postMessage({
-            msg: 'childAppLaunched',
-            original_msg_id: child_launch_callback.launch_msg_id,
-            child_instance_id: instance_id,
-            uses_sdk: uses_sdk,
-        }, '*');
-        delete window.child_launch_callbacks[instance_id];
-    }
 };
 
 // Run any callbacks to say that the app has closed
@@ -3093,45 +3555,17 @@ window.countSubstr = (str, substring) => {
     return count;
 };
 
-window.detectHostOS = function () {
-    var userAgent = window.navigator.userAgent;
-    var platform = window.navigator.platform;
-    var macosPlatforms = ['Macintosh', 'MacIntel', 'MacPPC', 'Mac68K'];
-    var windowsPlatforms = ['Win32', 'Win64', 'Windows', 'WinCE'];
-
-    if ( macosPlatforms.indexOf(platform) !== -1 ) {
-        return 'macos';
-    } else if ( windowsPlatforms.indexOf(platform) !== -1 ) {
-        return 'windows';
-    } else {
-        return 'other';
-    }
-};
-
+// Updates the signed-in user's profile; `username` is kept for callers that
+// still pass it.
 window.update_profile = function (username, key_vals) {
-    puter.fs.read(`/${username}/Public/.profile`).then((blob) => {
-        blob.text()
-            .then(text => {
-                const profile = JSON.parse(text);
-
-                for ( const key in key_vals ) {
-                    profile[key] = key_vals[key];
-                    // update window.user.profile
-                    window.user.profile[key] = key_vals[key];
-                }
-
-                puter.fs.write(`/${username}/Public/.profile`, JSON.stringify(profile));
-            })
-            .catch(error => {
-                console.error('Error converting Blob to JSON:', error);
-            });
-    }).catch((e) => {
-        if ( e?.code === 'subject_does_not_exist' ) {
-            // create .profile file
-            puter.fs.write(`/${username}/Public/.profile`, JSON.stringify({}));
+    return puter.auth.updateProfile(key_vals).then((profile) => {
+        window.user.profile = window.user.profile ?? {};
+        for ( const key in key_vals ) {
+            window.user.profile[key] = profile?.[key] ?? key_vals[key];
         }
-        // Ignored
-        console.log(e);
+        return profile;
+    }).catch((e) => {
+        console.error('Error updating profile:', e);
     });
 };
 
@@ -3144,24 +3578,9 @@ window.blob2str = (blob) => {
     });
 };
 
+// Another user's picture is only available while they are on a paid plan.
 window.get_profile_picture = async function (username) {
-    let icon;
-    // try getting profile pic
-    try {
-        let stat = await puter.fs.stat({ path: `/${ username }/Public/.profile`, consistency: 'eventual' });
-        if ( stat.size > 0 && stat.is_dir === false && stat.size < 1000000 ) {
-            let profile_json = await puter.fs.read(`/${ username }/Public/.profile`);
-            profile_json = await blob2str(profile_json);
-            const profile = JSON.parse(profile_json);
-
-            if ( profile.picture && profile.picture.startsWith('data:image') ) {
-                icon = profile.picture;
-            }
-        }
-    } catch (e) {
-    }
-
-    return icon;
+    return (await puter.auth.getProfilePicture(username)) ?? undefined;
 };
 
 window.format_with_units = (num, { mulUnits, divUnits, precision = 3 }) => {
@@ -3186,23 +3605,6 @@ window.format_with_units = (num, { mulUnits, divUnits, precision = 3 }) => {
     const rounded = Number.parseFloat(scaled.toPrecision(precision));
 
     return `${rounded}${symbol}`;
-};
-
-window.format_SI = (num) => {
-    if ( num === 0 ) return '0';
-
-    const mulUnits = ['', 'K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'];
-    const divUnits = ['m', 'µ', 'n', 'p', 'f', 'a', 'z', 'y'];
-
-    return window.format_with_units(num, { mulUnits, divUnits });
-};
-
-window.format_credits = (num) => {
-    if ( num === 0 ) return '0';
-
-    const mulUnits = ['', 'K', 'M', 'B', 'T', 'Q'];
-
-    return window.format_with_units(num, { mulUnits });
 };
 
 /**
@@ -3336,7 +3738,7 @@ window.handle_same_name_exists = async ({
             return false;
         }
         const alert_resp = await UIAlert({
-            message: `<strong>${html_encode(err.entry_name)}</strong> already exists.`,
+            message: i18n('item_already_exists', [err.entry_name], false),
             buttons: [
                 {
                     label: i18n('replace'),

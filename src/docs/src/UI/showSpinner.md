@@ -1,18 +1,28 @@
 ---
 title: puter.ui.showSpinner()
 description: Shows an overlay with a spinner in the center of the screen.
-platforms: [apps]
+platforms: [websites, apps]
 ---
 
-Shows an overlay with a spinner in the center of the screen. If multiple instances of `puter.ui.showSpinner()` are called, only one spinner will be shown until all instances are hidden.
+Shows an overlay with a spinner in the center of the screen.
+
+If multiple instances of `puter.ui.showSpinner()` are called, only one spinner will be shown until all instances are hidden.
 
 ## Syntax
 ```js
 puter.ui.showSpinner()
+puter.ui.showSpinner(html)
 ```
 
+## Parameters
+
+#### `html` (String) (optional)
+Custom message rendered under the spinner. Accepts plain text or HTML. Defaults to `"Working..."`.
+
 ## Examples
-```html
+### Show the spinner for 3 seconds
+
+```html;ui-spinner
 <html>
 <body>
     <script src="https://js.puter.com/v2/"></script>

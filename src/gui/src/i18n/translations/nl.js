@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const nl = {
         account: 'Account',
         account_password: 'Verifieer Account Wachtwoord',
         access_granted_to: 'Toegang gegeven aan',
-        add_existing_account: 'Bestaand Account Toevoegen',
+        add_another_account: 'Ander Account Toevoegen',
         all_fields_required: 'Alle velden zijn vereist.',
         allow: 'Toestaan',
         apply: 'Toepassen',
@@ -84,10 +84,6 @@ const nl = {
         credits: 'Credits',
         current_password: 'Huidig Wachtwoord',
         cut: 'Knippen',
-        clock: 'Klok',
-        clock_visible_hide: 'Verbergen - Altijd verborgen',
-        clock_visible_show: 'Weergeven - Altijd zichtbaar',
-        clock_visible_auto: 'Auto - Standaard, alleen zichtbaar in de volledige schermmodus.',
         close_all: 'Alles Sluiten',
         created: 'Gemaakt',
         date_modified: 'Datum Gewijzigd',
@@ -344,7 +340,6 @@ const nl = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         'change': 'Wijzig',
-        'clock_visibility': 'Klok zichtbaarheid',
         'reading': 'Lezen %strong%',
         'writing': 'Schrijven %strong%',
         'unzipping': 'Decomprimeren %strong%',

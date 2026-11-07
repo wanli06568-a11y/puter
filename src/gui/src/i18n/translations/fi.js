@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const fi = {
         account: 'Tili',
         account_password: 'Vahvista tilin salasana',
         access_granted_to: 'Käyttöoikeus myönnetty',
-        add_existing_account: 'Kirjaudu olemassaolevalla tilillä',
+        add_another_account: 'Lisää toinen tili',
         all_fields_required: 'Kaikki kentät on täytettävä.',
         allow: 'Salli',
         apply: 'Käytä', // TODO: Ambiguous meaning
@@ -111,11 +111,6 @@ const fi = {
         credits: 'Tekijät',
         current_password: 'Nykyinen salasana',
         cut: 'Leikkaa',
-        clock: 'Kello',
-        clock_visible_hide: 'Piilota - aina piilossa',
-        clock_visible_show: 'Näytä - aina näkyvissä',
-        clock_visible_auto:
-      'Automaattinen - oletus, näkyy vain koko näytön tilassa.',
         close_all: 'Sulje kaikki',
         created: 'Luotu',
         date_modified: 'Muokkauspäivämäärä',
@@ -436,7 +431,6 @@ const fi = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         change: 'muutos', // In English: "Change"
-        clock_visibility: 'kellon näkyvyys', // In English: "Clock Visibility"
         reading: 'lukeminen', // In English: "Reading %strong%"
         writing: 'kirjoittaminen', // In English: "Writing %strong%"
         unzipping: 'purkaminen', // In English: "Unzipping %strong%"

@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -22,6 +22,8 @@ window.clipboard = [];
 window.actions_history = [];
 window.window_nav_history = {};
 window.window_nav_history_current_position = {};
+window.dashboard_nav_history = [];
+window.dashboard_nav_history_current_position = 0;
 window.progress_tracker = [];
 window.upload_item_global_id = 0;
 window.app_instance_ids = new Set();
@@ -53,8 +55,10 @@ if ( window.logged_in_users === null )
     window.logged_in_users = [];
 }
 
-// this sessions's user
-window.auth_token = localStorage.getItem('auth_token');
+// this session's user. Only the current key is read: a token under the
+// retired key can't authenticate anything, so its holder starts signed out
+// (and the key itself is cleared on the next token write or sign-out).
+window.auth_token = localStorage.getItem('auth_token_v2');
 try {
     window.user = JSON.parse(localStorage.getItem('user'));
 } catch (e) {
@@ -66,7 +70,7 @@ if ( window.logged_in_users.length === 0 && window.user !== null ) {
     let tuser = window.user;
     tuser.auth_token = window.auth_token;
     window.logged_in_users.push(tuser);
-    localStorage.setItem('logged_in_users', window.logged_in_users);
+    localStorage.setItem('logged_in_users', JSON.stringify(window.logged_in_users));
 }
 
 window.last_window_zindex = 1;
@@ -89,6 +93,11 @@ if ( window.user !== undefined && window.user !== null ) {
 }
 window.root_dirname = 'Puter';
 
+// Not a real directory — items shared with this user live under their owners'
+// paths. Deliberately not path-shaped so it can never collide with a folder
+// someone actually creates.
+window.shared_path = 'puter://shared';
+
 // user preferences, persisted across sessions, cached in localStorage
 try {
     window.user_preferences = JSON.parse(localStorage.getItem('user_preferences'));
@@ -99,8 +108,7 @@ try {
 if ( window.user_preferences === null ) {
     window.user_preferences = {
         show_hidden_files: false,
-        language: navigator.language.split('-')[0] || navigator.userLanguage || 'en',
-        clock_visible: 'auto',
+        language: null,
     };
 }
 
@@ -126,7 +134,6 @@ window.show_twitter_link = true;
 window.animate_window_opening = true;
 window.animate_window_closing = true;
 window.desktop_loading_fade_delay = (window.first_visit_ever && window.first_visit_animation ? 6000 : 1000);
-window.watchItems = [];
 window.appdata_signatures = {};
 window.appCallbackFunctions = [];
 
@@ -178,6 +185,11 @@ $(window).on( 'resize', function () {
 
     window.desktop_height = new_desktop_height;
     window.desktop_width = new_desktop_width;
+
+    // Update all maximized windows to fit the new viewport
+    $('.window[data-is_maximized="1"]').each(function () {
+        window.update_maximized_window_for_taskbar(this);
+    });
 });
 
 // for now `active_element` is basically the last element that was clicked,
@@ -217,26 +229,49 @@ window.file_templates = [];
 // default language
 window.locale = 'en';
 
-// the width of the panel
-window.PANEL_WIDTH = 400;
-
 // the transaction class
 window.Transaction = class {
-    constructor (name) {
+    constructor (name, attributes = {}) {
         this.name = name;
         this.id = uuidv4();
+        // Reported alongside the timing so a slow transaction can be
+        // attributed to a particular subject rather than only a name.
+        this.attributes = { ...attributes };
+    }
+
+    /**
+     * Absolute, but read off the monotonic clock. A plain wall-clock read
+     * can jump mid-transaction when the system clock is adjusted, which
+     * lands as a negative or wildly inflated duration. Adding `timeOrigin`
+     * keeps the stamps on a real timeline (reporters place spans by
+     * absolute time) while the gap between two of them stays monotonic.
+     */
+    #now () {
+        return typeof performance !== 'undefined'
+            && typeof performance.now === 'function'
+            && typeof performance.timeOrigin === 'number'
+            ? performance.timeOrigin + performance.now()
+            : Date.now();
     }
 
     start () {
-        this.start_ts = Date.now();
+        this.start_ts = this.#now();
+    }
+
+    /**
+     * Annotate the transaction with anything learned after it started (the
+     * resolved app name, which entry point triggered it, how it finished).
+     */
+    annotate (attributes) {
+        Object.assign(this.attributes, attributes);
     }
 
     getDuration () {
-        return Date.now() - this.start_ts;
+        return this.#now() - this.start_ts;
     }
 
     end () {
-        this.end_ts = Date.now();
+        this.end_ts = this.#now();
         this.duration = this.end_ts - this.start_ts;
 
         // emit an event

@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const fa = {
         account: 'حساب کاربری',
         account_password: 'تایید رمزعبور',
         access_granted_to: 'دسترسی داده شده به',
-        add_existing_account: 'افزودن حساب کاربری موجود',
+        add_another_account: 'افزودن حساب کاربری دیگر',
         all_fields_required: 'تمامی فیلدها الزامی هستند.',
         allow: 'اجازه دسترسی',
         apply: 'اعمال',
@@ -45,7 +45,6 @@ const fa = {
         change_password: 'تغییر رمز عبور',
         change_ui_colors: 'تغییر رنگ‌های رابط کاربری',
         change_username: 'تغییر نام کاربری',
-        clock_visibility: 'قابلیت دیدن ساعت',
         close: 'بستن',
         close_all_windows: 'بستن همه پنجره ها',
         close_all_windows_confirm: 'آیا مطمئن هستید که می‌خواهید همه پنجره‌ها را ببندید؟',
@@ -94,11 +93,6 @@ const fa = {
         credits: 'اعتبار',
         current_password: 'رمز عبور فعلی',
         cut: 'برش',
-        clock: 'ساعت',
-        clock_visible_hide: 'مخفی-همیشه مخفی',
-        clock_visible_show: 'نمایش-همیشه قابل مشاهده',
-        clock_visible_auto:
-      'خودکار - به صورت پیش‌فرض، قابل مشاهده فقط در حالت تمام-صفحه',
         close_all: 'بستن همه',
         created: 'ایجاد شده',
         date_modified: 'تاریخ تغییر',

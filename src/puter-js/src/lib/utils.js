@@ -1,50 +1,8 @@
-import { FileReaderPoly } from "./polyfills/fileReaderPoly.js";
-import { showUsageLimitDialog } from "../modules/UsageLimitDialog.js";
-
-/**
- * Parses a given response text into a JSON object. If the parsing fails due to invalid JSON format,
- * the original response text is returned.
- *
- * @param {string} responseText - The response text to be parsed into JSON. It is expected to be a valid JSON string.
- * @returns {Object|string} The parsed JSON object if the responseText is valid JSON, otherwise returns the original responseText.
- * @example
- * // returns { key: "value" }
- * parseResponse('{"key": "value"}');
- *
- * @example
- * // returns "Invalid JSON"
- * parseResponse('Invalid JSON');
- */
-async function parseResponse (target) {
-    if ( target.responseType === 'blob' ) {
-        // Get content type of the blob
-        const contentType = target.getResponseHeader('content-type');
-        if ( contentType.startsWith('application/json') ) {
-            // If the blob is JSON, parse it
-            const text = await target.response.text();
-            try {
-                return JSON.parse(text);
-            } catch ( error ) {
-                return text;
-            }
-        } else if ( contentType.startsWith('application/octet-stream') ) {
-            // If the blob is an octet stream, return the blob
-            return target.response;
-        }
-
-        // Otherwise return an ojbect
-        return {
-            success: true,
-            result: target.response,
-        };
-    }
-    const responseText = target.responseText;
-    try {
-        return JSON.parse(responseText);
-    } catch ( error ) {
-        return responseText;
-    }
-}
+import { FileReaderPoly } from './polyfills/fileReaderPoly.js';
+import {
+    buildXhr, driverCall, isVerificationGateCode, parseResponse, requestTimeoutError,
+    resolveReauth, resolveVerificationGate,
+} from './networkUtils.js';
 
 /**
  * A function that generates a UUID (Universally Unique Identifier) using the version 4 format,
@@ -66,16 +24,6 @@ function uuidv4 () {
         (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
 }
 
-const createDeferred = () => {
-    let resolve;
-    let reject;
-    const promise = new Promise((res, rej) => {
-        resolve = res;
-        reject = rej;
-    });
-    return { promise, resolve, reject };
-};
-
 /**
  * Initializes and returns an XMLHttpRequest object configured for a specific API endpoint, method, and headers.
  *
@@ -89,26 +37,43 @@ const createDeferred = () => {
  * @returns {XMLHttpRequest} The initialized XMLHttpRequest object.
  */
 function initXhr (endpoint, APIOrigin, authToken, method = 'post', contentType = 'text/plain;actually=json', responseType = undefined) {
-    const xhr = new XMLHttpRequest();
-    xhr.open(method, APIOrigin + endpoint, true);
-    if ( authToken )
-    {
-        xhr.setRequestHeader('Authorization', `Bearer ${ authToken}`);
-    }
-    xhr.setRequestHeader('Content-Type', contentType);
-    xhr.responseType = responseType ?? '';
-
-    // Add API call logging if available
-    if ( globalThis.puter?.apiCallLogger?.isEnabled() ) {
-        xhr._puterRequestId = {
+    return buildXhr({
+        url: APIOrigin + endpoint,
+        method,
+        headers: { 'Content-Type': contentType },
+        // `includePuterAuth` re-reads the live token at build time, so a replay
+        // picks up a freshly-minted token (same as the old replay path, which
+        // passed `globalThis.puter.authToken`).
+        includePuterAuth: !! authToken,
+        withCredentials: true,
+        responseType: responseType ?? '',
+        logId: {
             method,
             service: 'xhr',
             operation: endpoint.replace(/^\//, ''),
             params: { endpoint, contentType, responseType },
-        };
-    }
+        },
+    });
+}
 
-    return xhr;
+/**
+ * Re-issue an XHR once whatever refused it has been cleared (a reauth, a
+ * verification gate). Rebuilds the request from the captured `_puterReq` spec
+ * (with a fresh token via `buildXhr`) and routes the new response back through
+ * the same callbacks. Returns true if a replay was scheduled, false otherwise.
+ */
+function replayXhr (response, success_cb, error_cb, resolve_func, reject_func) {
+    const xhr = response.target ?? response;
+    const spec = xhr?._puterReq;
+    if ( ! spec ) return false;
+    // Already a replay attempt — don't loop into reauth a second time if
+    // even the fresh token comes back rejected. The retry path is one-shot.
+    if ( spec._replayed ) return false;
+    const newSpec = { ...spec, _replayed: true };
+    const newXhr = buildXhr(newSpec);
+    setupXhrEventHandlers(newXhr, success_cb, error_cb, resolve_func, reject_func);
+    newXhr.send(typeof newSpec.buildBody === 'function' ? newSpec.buildBody() : spec.body);
+    return true;
 }
 
 /**
@@ -132,6 +97,23 @@ async function handle_resp (success_cb, error_cb, resolve_func, reject_func, res
     const resp = await parseResponse(response);
     // error - unauthorized
     if ( response.status === 401 ) {
+        const spec = response._puterReq;
+        // A replay's 401 is final: one sign-in per call.
+        const reauth = spec?._replayed ? null : await resolveReauth(resp, {
+            interactive: spec?.interactiveReauth !== false,
+            sentToken: spec?._sentAuthToken,
+        });
+        if ( reauth?.action === 'replay' ) {
+            // Replay the original request with the fresh token. If the replay
+            // can't be scheduled (no captured request, or already retried),
+            // fall through to the generic Unauthorized rejection below.
+            if ( replayXhr(response, success_cb, error_cb, resolve_func, reject_func) ) {
+                return;
+            }
+        } else if ( reauth?.action === 'reject' ) {
+            if ( error_cb && typeof error_cb === 'function' ) error_cb(reauth.error);
+            return reject_func(reauth.error);
+        }
         // if error callback is provided, call it
         if ( error_cb && typeof error_cb === 'function' )
         {
@@ -140,8 +122,24 @@ async function handle_resp (success_cb, error_cb, resolve_func, reject_func, res
         // reject promise
         return reject_func({ status: 401, message: 'Unauthorized' });
     }
+    // error - account verification gate. Inside the desktop the user is walked
+    // through the flow and the request replayed once; everywhere else (and
+    // when they back out, or the replay is refused too) the rejection reaches
+    // the caller unchanged.
+    else if (
+        response.status === 403 &&
+        isVerificationGateCode(resp?.code) &&
+        ! response._puterReq?._replayed
+    ) {
+        const gate = await resolveVerificationGate(resp.code, resp.factors);
+        if ( gate.verified && replayXhr(response, success_cb, error_cb, resolve_func, reject_func) ) {
+            return;
+        }
+        if ( error_cb && typeof error_cb === 'function' ) error_cb(resp);
+        return reject_func(resp);
+    }
     // error - other
-    else if ( response.status !== 200 ) {
+    else if ( response.status < 200 || response.status >= 300 ) {
         // if error callback is provided, call it
         if ( error_cb && typeof error_cb === 'function' )
         {
@@ -152,14 +150,6 @@ async function handle_resp (success_cb, error_cb, resolve_func, reject_func, res
     }
     // success
     else {
-        // This is a driver error
-        if ( resp.success === false && resp.error?.code === 'permission_denied' ) {
-            let perm = await puter.ui.requestPermission({ permission: 'driver:puter-image-generation:generate' });
-            // try sending again if permission was granted
-            if ( perm.granted ) {
-                // todo repeat request
-            }
-        }
         // if success callback is provided, call it
         if ( success_cb && typeof success_cb === 'function' )
         {
@@ -224,364 +214,95 @@ function setupXhrEventHandlers (xhr, success_cb, error_cb, resolve_func, reject_
         }
         return handle_error(error_cb, reject_func, this);
     });
-}
 
-const NOOP = () => {
-};
-class Valid {
-    static callback (cb) {
-        return (cb && typeof cb === 'function') ? cb : undefined;
-    }
+    // The idle timeout ends a request by aborting it (see `watchIdle`).
+    xhr.addEventListener('abort', function () {
+        if ( ! xhr._puterTimedOut ) return;
+        const error = requestTimeoutError();
+        if ( globalThis.puter?.apiCallLogger?.isEnabled() && xhr._puterRequestId ) {
+            globalThis.puter.apiCallLogger.logRequest({
+                service: xhr._puterRequestId.service,
+                operation: xhr._puterRequestId.operation,
+                params: xhr._puterRequestId.params,
+                error,
+            });
+        }
+        return handle_error(error_cb, reject_func, error);
+    });
 }
 
 /**
- * Makes the hybrid promise/callback function for a particular driver method
- * @param {string[]} arg_defs - argument names (for now; definitions eventually)
- * @param {string} driverInterface - name of the interface
- * @param {string} driverName - name of the driver
- * @param {string} driverMethod - name of the method
+ * Makes the function for one driver method: the returned function takes either
+ * a named-parameters object or the positional arguments listed in `argNames`,
+ * optionally followed by legacy success/error callbacks, and resolves the
+ * driver's `result`.
+ *
+ * `error` is forwarded to `driverCall` as `onError`; `success` is consumed so
+ * it stays off the wire but is never invoked — these methods are promise-only.
+ * That is deliberate: it has never fired, so invoking it now would double-run
+ * handlers in apps that pass one and also await the promise.
+ *
+ * @param {{
+ *   iface: string,
+ *   method: string,
+ *   argNames?: string[],
+ *   driver?: string,
+ *   puter?: unknown,
+ *   testMode?: boolean,
+ *   readonly?: boolean,
+ *   signal?: AbortSignal,
+ *   responseType?: '' | 'text' | 'blob',
+ *   preprocess?: (args: Record<string, unknown>) => Record<string, unknown>,
+ *   transform?: (result: unknown) => unknown,
+ *   upgradePrompt?: import('./types.js').UpgradePromptContext,
+ * }} spec `iface`/`driver`/`method`/`testMode` address the driver call itself
+ *   (see `driverCall`); the rest configures this wrapper. `upgradePrompt`
+ *   names the public method (`puter.email.sendTransactional`) in the upgrade
+ *   prompt a refusal raises, and says why the method needs a plan.
+ * @returns {(...args: unknown[]) => Promise<unknown>}
  */
-function make_driver_method (arg_defs, driverInterface, driverName, driverMethod, settings = {}) {
+function makeDriverMethod (spec) {
+    const { iface, method, argNames = [], driver, puter, testMode } = spec;
+    const { readonly, responseType, preprocess, transform, upgradePrompt } = spec;
+
     return async function (...args) {
         let driverArgs = {};
-        let options = {};
+        let onError;
 
-        // Check if the first argument is an object and use it as named parameters
-        if ( args.length === 1 && typeof args[0] === 'object' && !Array.isArray(args[0]) ) {
+        if ( args.length === 1 && typeof args[0] === 'object' && ! Array.isArray(args[0]) ) {
+            // Named parameters — the callbacks travel with them, so they have
+            // to come off before the rest goes on the wire.
             driverArgs = { ...args[0] };
-            options = {
-                success: driverArgs.success,
-                error: driverArgs.error,
-            };
-            // Remove callback functions from driverArgs if they exist
+            onError = driverArgs.error;
             delete driverArgs.success;
             delete driverArgs.error;
         } else {
-            // Handle as individual arguments
-            arg_defs.forEach((argName, index) => {
+            argNames.forEach((argName, index) => {
                 driverArgs[argName] = args[index];
             });
-            options = {
-                success: args[arg_defs.length],
-                error: args[arg_defs.length + 1],
-            };
+            // `argNames.length` is the legacy success slot, deliberately
+            // skipped; the error callback follows it.
+            onError = args[argNames.length + 1];
         }
 
-        // preprocess
-        if ( settings.preprocess && typeof settings.preprocess === 'function' ) {
-            driverArgs = settings.preprocess(driverArgs);
+        if ( typeof preprocess === 'function' ) {
+            driverArgs = preprocess(driverArgs);
         }
 
-        return await driverCall(options, driverInterface, driverName, driverMethod, driverArgs, settings);
+        // Drivers read the test-mode flag off their arguments; the top-level
+        // `test_mode` field `driverCall` still sends is the older wire shape
+        // and no longer reaches them. Without this the `testMode` positional
+        // argument silently makes a real, billed upstream call. An explicit
+        // `test_mode` in the caller's options wins.
+        if ( testMode === true && driverArgs.test_mode === undefined ) {
+            driverArgs = { ...driverArgs, test_mode: true };
+        }
+
+        return await driverCall(
+            { iface, driver, method, args: driverArgs, testMode, puter },
+            { readonly, responseType, transform, onError, upgradePrompt, signal: spec.signal },
+        );
     };
-}
-
-async function driverCall (options, driverInterface, driverName, driverMethod, driverArgs, settings) {
-    const deferred = createDeferred();
-
-    driverCall_(options,
-                    deferred.resolve,
-                    deferred.reject,
-                    driverInterface,
-                    driverName,
-                    driverMethod,
-                    driverArgs,
-                    undefined,
-                    undefined,
-                    settings);
-
-    return await deferred.promise;
-}
-
-// This function encapsulates the logic for sending a driver call request
-async function driverCall_ (
-    options = {},
-    resolve_func, reject_func,
-    driverInterface, driverName, driverMethod, driverArgs,
-    method,
-    contentType = 'text/plain;actually=json',
-    settings = {},
-) {
-    // Generate request ID for logging
-    // Store request info for logging
-    let requestInfo = null;
-    if ( globalThis.puter?.apiCallLogger?.isEnabled() ) {
-        requestInfo = {
-            interface: driverInterface,
-            driver: driverName,
-            method: driverMethod,
-            args: driverArgs,
-        };
-    }
-
-    // If there is no authToken and the environment is web, try authenticating with Puter
-    if ( !puter.authToken && puter.env === 'web' ) {
-        try {
-            await puter.ui.authenticateWithPuter();
-        } catch (e) {
-            // Log authentication error
-            if ( requestInfo && globalThis.puter?.apiCallLogger?.isEnabled() ) {
-                globalThis.puter.apiCallLogger.logRequest({
-                    service: 'drivers',
-                    operation: `${driverInterface}::${driverMethod}`,
-                    params: { interface: driverInterface, driver: driverName, method: driverMethod, args: driverArgs },
-                    error: { code: 'auth_canceled', message: 'Authentication canceled' },
-                });
-            }
-            return reject_func({
-                error: {
-                    code: 'auth_canceled', message: 'Authentication canceled',
-                },
-            });
-        }
-    }
-
-    const success_cb = Valid.callback(options.success) ?? NOOP;
-    const error_cb = Valid.callback(options.error) ?? NOOP;
-    // create xhr object
-    const xhr = initXhr('/drivers/call', puter.APIOrigin, undefined, 'POST', contentType);
-
-    // Store request info for later logging
-    if ( requestInfo ) {
-        xhr._puterDriverRequestInfo = requestInfo;
-    }
-
-    if ( settings.responseType ) {
-        xhr.responseType = settings.responseType;
-    }
-
-    // ===============================================
-    // TO UNDERSTAND THIS CODE, YOU MUST FIRST
-    // UNDERSTAND THE FOLLOWING TEXT:
-    //
-    // Everything between here and the comment reading
-    // "=== END OF STREAMING ===" is ONLY for handling
-    // requests with content type "application/x-ndjson"
-    // ===============================================
-
-    let is_stream = false;
-    let signal_stream_update = null;
-    let lastLength = 0;
-    let response_complete = false;
-
-    let buffer = '';
-
-    // NOTE: linked-list technically would perform better,
-    //       but in practice there are at most 2-3 lines
-    //       buffered so this does not matter.
-    const lines_received = [];
-
-    xhr.onreadystatechange = () => {
-        if ( xhr.readyState === 2 ) {
-            if ( xhr.getResponseHeader('Content-Type') !==
-                'application/x-ndjson'
-            ) return;
-            is_stream = true;
-            const Stream = async function* Stream () {
-                while ( !response_complete ) {
-                    const signal = createDeferred();
-                    signal_stream_update = signal.resolve;
-                    await signal.promise;
-                    if ( response_complete ) break;
-                    while ( lines_received.length > 0 ) {
-                        const line = lines_received.shift();
-                        if ( line.trim() === '' ) continue;
-                        const lineObject = (JSON.parse(line));
-
-                        // Check for usage limit errors in streaming responses
-                        if ( lineObject?.error?.code === 'insufficient_funds' || lineObject?.metadata?.usage_limited === true ) {
-                            if ( puter.env === 'web' ) {
-                                showUsageLimitDialog('You have reached your usage limit for this account.<br>Please upgrade to continue.');
-                            }
-                        }
-
-                        if ( typeof (lineObject.text) === 'string' ) {
-                            Object.defineProperty(lineObject, 'toString', {
-                                enumerable: false,
-                                value: () => lineObject.text,
-                            });
-                        }
-                        yield lineObject;
-                    }
-                }
-            };
-
-            const startedStream = Stream();
-            Object.defineProperty(startedStream, 'start', {
-                enumerable: false,
-                value: async (controller) => {
-                    const texten = new TextEncoder();
-                    for await ( const part of startedStream ) {
-                        controller.enqueue(texten.encode(part));
-                    }
-                    controller.close();
-                },
-            });
-
-            return resolve_func(startedStream);
-        }
-        if ( xhr.readyState === 4 ) {
-            response_complete = true;
-            if ( is_stream ) {
-                signal_stream_update?.();
-            }
-        }
-    };
-
-    xhr.onprogress = function () {
-        if ( ! signal_stream_update ) return;
-
-        const newText = xhr.responseText.slice(lastLength);
-        lastLength = xhr.responseText.length; // Update lastLength to the current length
-
-        let hasUpdates = false;
-        for ( let i = 0; i < newText.length; i++ ) {
-            buffer += newText[i];
-            if ( newText[i] === '\n' ) {
-                hasUpdates = true;
-                lines_received.push(buffer);
-                buffer = '';
-            }
-        }
-
-        if ( hasUpdates ) {
-            signal_stream_update();
-        }
-    };
-
-    // ========================
-    // === END OF STREAMING ===
-    // ========================
-
-    // load: success or error
-    xhr.addEventListener('load', async function (response) {
-        if ( is_stream ) {
-            return;
-        }
-        const resp = await parseResponse(response.target);
-
-        // Log driver call response
-        if ( this._puterDriverRequestInfo && globalThis.puter?.apiCallLogger?.isEnabled() ) {
-            globalThis.puter.apiCallLogger.logRequest({
-                service: 'drivers',
-                operation: `${this._puterDriverRequestInfo.interface}::${this._puterDriverRequestInfo.method}`,
-                params: { interface: this._puterDriverRequestInfo.interface, driver: this._puterDriverRequestInfo.driver, method: this._puterDriverRequestInfo.method, args: this._puterDriverRequestInfo.args },
-                result: response.status >= 400 || resp?.success === false ? null : resp,
-                error: response.status >= 400 || resp?.success === false ? resp : null,
-            });
-        }
-
-        // Check for usage limit errors and show upgrade dialog
-        const isInsufficientFunds = (response.target?.status === 402) ||
-            (resp?.error?.code === 'insufficient_funds') ||
-            (resp?.error?.status === 402);
-        const isUsageLimited = resp?.metadata?.usage_limited === true;
-
-        if ( (isInsufficientFunds || isUsageLimited) && puter.env === 'web' ) {
-            showUsageLimitDialog('Your account has not enough funding to complete this request.<br>Please upgrade to continue.');
-        }
-
-        // HTTP Error - unauthorized
-        if ( response.status === 401 || resp?.code === 'token_auth_failed' ) {
-            if ( resp?.code === 'token_auth_failed' && puter.env === 'web' ) {
-                try {
-                    puter.resetAuthToken();
-                    await puter.ui.authenticateWithPuter();
-                } catch (e) {
-                    return reject_func({
-                        error: {
-                            code: 'auth_canceled', message: 'Authentication canceled',
-                        },
-                    });
-                }
-            }
-            // if error callback is provided, call it
-            if ( error_cb && typeof error_cb === 'function' )
-            {
-                error_cb({ status: 401, message: 'Unauthorized' });
-            }
-            // reject promise
-            return reject_func({ status: 401, message: 'Unauthorized' });
-        }
-        // HTTP Error - other
-        else if ( response.status && response.status !== 200 ) {
-            // if error callback is provided, call it
-            error_cb(resp);
-            // reject promise
-            return reject_func(resp);
-        }
-        // HTTP Success
-        else {
-            // Driver Error: permission denied
-            if ( resp.success === false && resp.error?.code === 'permission_denied' ) {
-                let perm = await puter.ui.requestPermission({ permission: `driver:${ driverInterface }:${ driverMethod}` });
-                // try sending again if permission was granted
-                if ( perm.granted ) {
-                    // repeat request with permission granted
-                    return driverCall_(options, resolve_func, reject_func, driverInterface, driverMethod, driverArgs, method, contentType, settings);
-                } else {
-                    // if error callback is provided, call it
-                    error_cb(resp);
-                    // reject promise
-                    return reject_func(resp);
-                }
-            }
-            // Driver Error: other
-            else if ( resp.success === false ) {
-                // if error callback is provided, call it
-                error_cb(resp);
-                // reject promise
-                return reject_func(resp);
-            }
-
-            let result = resp.result !== undefined ? resp.result : resp;
-            if ( settings.transform ) {
-                result = await settings.transform(result);
-            }
-
-            // Success: if callback is provided, call it
-            if ( resolve_func.success )
-            {
-                success_cb(result);
-            }
-            // Success: resolve with the result
-            return resolve_func(result);
-        }
-    });
-
-    // error
-    xhr.addEventListener('error', function (e) {
-        // Log driver call error
-        if ( this._puterDriverRequestInfo && globalThis.puter?.apiCallLogger?.isEnabled() ) {
-            globalThis.puter.apiCallLogger.logRequest({
-                service: 'drivers',
-                operation: `${this._puterDriverRequestInfo.interface}::${this._puterDriverRequestInfo.method}`,
-                params: { interface: this._puterDriverRequestInfo.interface, driver: this._puterDriverRequestInfo.driver, method: this._puterDriverRequestInfo.method, args: this._puterDriverRequestInfo.args },
-                error: { message: 'Network error occurred', event: e.type },
-            });
-        }
-        return handle_error(error_cb, reject_func, this);
-    });
-
-    // send request
-    xhr.send(JSON.stringify({
-        interface: driverInterface,
-        driver: driverName,
-        test_mode: settings?.test_mode,
-        method: driverMethod,
-        args: driverArgs,
-        auth_token: puter.authToken,
-    }));
-
-}
-
-async function blob_to_url (blob) {
-    const reader = new (globalThis.FileReader || FileReaderPoly)();
-    return await new Promise((resolve, reject) => {
-        reader.onloadend = () => resolve(reader.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-    });
 }
 
 function blobToDataUri (blob) {
@@ -597,20 +318,15 @@ function blobToDataUri (blob) {
     });
 }
 
-function arrayBufferToDataUri (arrayBuffer) {
-    return new Promise((resolve, reject) => {
-        const blob = new Blob([arrayBuffer]);
-        const reader = new (globalThis.FileReader || FileReaderPoly)();
-        reader.onload = function (event) {
-            resolve(event.target.result);
-        };
-        reader.onerror = function (error) {
-            reject(error);
-        };
-        reader.readAsDataURL(blob);
-    });
-}
+const VIDEO_EXTENSIONS = ['mp4', 'webm', 'mov', 'mpeg', 'avi', 'mkv', 'm4v', 'ogv'];
+
+const isVideoInput = (url) => {
+    if ( typeof url !== 'string' ) return false;
+    if ( url.startsWith('data:video/') ) return true;
+    const ext = url.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase();
+    return VIDEO_EXTENSIONS.includes(ext);
+};
 
 export {
-    arrayBufferToDataUri, blob_to_url, blobToDataUri, driverCall, handle_error, handle_resp, initXhr, make_driver_method, parseResponse, setupXhrEventHandlers, uuidv4
+    blobToDataUri, handle_error, initXhr, isVideoInput, makeDriverMethod, setupXhrEventHandlers, uuidv4,
 };

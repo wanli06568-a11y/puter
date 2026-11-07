@@ -35,12 +35,23 @@ puter.ai.chat(`Why did the chicken cross the road?`).then(console.log);
 
 #### Use in Node.js
 
+Initialize Puter.js with your auth token using the `init` function:
+
 ```js
 import { init } from "@heyputer/puter.js/src/init.cjs";
 const puter = init(process.env.puterAuthToken);
 
 // Example: Use AI to answer a question
 puter.ai.chat("What color was Napoleon's white horse?").then(console.log);
+```
+
+If your environment has browser access, you can obtain a token via browser login:
+
+```js
+import { init, getAuthToken } from "@heyputer/puter.js/src/init.cjs";
+
+const authToken = await getAuthToken(); // performs browser based auth
+const puter = init(authToken);
 ```
 
 </div>
@@ -67,6 +78,8 @@ puter.ai.chat("What color was Napoleon's white horse?").then(console.log);
   </body>
 </html>
 ```
+
+<div class="info">Serve this page rather than double-clicking it. Puter identifies your app by its origin, and a page opened straight from disk (<code>file:///</code>) has none — see <a href="/supported-platforms/">Supported Platforms</a>. Any local server works: <code>python3 -m http.server</code>, then open <code>http://localhost:8000</code>.</div>
 
 </div>
 

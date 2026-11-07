@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -18,7 +18,7 @@
  */
 
 import path from '../lib/path.js';
-import UIWindowClaimReferral from './UIWindowClaimReferral.js';
+
 import UIContextMenu from './UIContextMenu.js';
 import UIItem from './UIItem.js';
 import UIAlert from './UIAlert.js';
@@ -27,22 +27,48 @@ import UIWindowSaveAccount from './UIWindowSaveAccount.js';
 import UIWindowDesktopBGSettings from './UIWindowDesktopBGSettings.js';
 import UIWindowMyWebsites from './UIWindowMyWebsites.js';
 import UIWindowFeedback from './UIWindowFeedback.js';
-import UIWindowLogin from './UIWindowLogin.js';
+import UIAuthLogin from './Auth/UIAuthLogin.js';
 import UIWindowQR from './UIWindowQR.js';
-import UIWindowRefer from './UIWindowRefer.js';
+
 import UIWindowProgress from './UIWindowProgress.js';
 import UITaskbar from './UITaskbar.js';
-import new_context_menu_item from '../helpers/new_context_menu_item.js';
-import refresh_item_container from '../helpers/refresh_item_container.js';
+import new_context_menu_item from '../helpers/newContextMenuItem.js';
+import refresh_item_container from '../helpers/refreshItemContainer.js';
 import changeLanguage from '../i18n/i18nChangeLanguage.js';
-import UIWindowSettings from './Settings/UIWindowSettings.js';
 import UIWindowTaskManager from './UIWindowTaskManager.js';
-import truncate_filename from '../helpers/truncate_filename.js';
+import truncate_filename from '../helpers/truncateFilename.js';
 import UINotification from './UINotification.js';
 import UIWindowWelcome from './UIWindowWelcome.js';
-import launch_app from '../helpers/launch_app.js';
-import item_icon from '../helpers/item_icon.js';
+import launch_app from '../helpers/launchApp.js';
+import { urlFileLaunchOptions } from '../helpers/confirmUrlFileAccess.js';
+import item_icon from '../helpers/itemIcon.js';
+import { SHARED_PATH_PARAM, clear_shared_param } from '../helpers/parseSharedPath.js';
+import resolve_shared_item from '../helpers/resolveSharedItem.js';
+import {
+    answerNotificationReceipts,
+    applyToastMark,
+    createNotificationFeed,
+    createReplayLog,
+    listUndismissed,
+    missedAfterReconnect,
+    notificationSocketAcks,
+} from '../helpers/notificationFeed.js';
+import { getNotification, markNotificationAcknowledged } from '../helpers/notificationApi.js';
+import {
+    elementsWithData,
+    handleNotificationTap,
+    openAppForTap,
+    setPushTapHandler,
+    storedTapHandler,
+} from '../helpers/notificationTap.js';
+import { closeLocalBanner, startPushWorker } from '../helpers/pushWorker.js';
+import { syncBrowserPush } from '../helpers/pushSync.js';
+import { get_app_by_uid } from '../helpers/getAppByUid.js';
+import { httpsIconFor, notificationTarget, senderNameFor } from './Dashboard/notificationCenter.js';
+import apply_item_added_to_containers from '../helpers/applyItemAddedToContainers.js';
+import parse_item_metadata from '../helpers/parseItemMetadata.js';
 import UIWindowSearch from './UIWindowSearch.js';
+import { resolve_default_app } from '../helpers/defaultApp.js';
 
 async function UIDesktop (options) {
     // start a transaction if we're not in embedded or fullpage mode
@@ -67,7 +93,10 @@ async function UIDesktop (options) {
     window.toolbar_auto_hide_enabled = true; // Set default value
 
     // Load the toolbar auto-hide preference
-    let toolbar_auto_hide_enabled_val = await puter.kv.get('toolbar_auto_hide_enabled');
+    // Preferences are best-effort: a KV read that fails (offline, rate
+    // limited, no usage left on the account) leaves the default in place
+    // rather than stopping the desktop from rendering.
+    let toolbar_auto_hide_enabled_val = await puter.kv.get('toolbar_auto_hide_enabled').catch(() => null);
     if ( toolbar_auto_hide_enabled_val === 'false' || toolbar_auto_hide_enabled_val === false ) {
         window.toolbar_auto_hide_enabled = false;
     }
@@ -110,18 +139,41 @@ async function UIDesktop (options) {
             }
 
             // Set flag to true
-            puter.kv.set('has_set_default_app_user_permissions', true);
+            await puter.kv.set('has_set_default_app_user_permissions', true);
         }
-    });
+    // Awaited above so a failed write reaches this: it leaves the flag unset
+    // and the whole thing is retried next boot, which is what we want.
+    }).catch(err => console.warn('Could not apply default app permissions:', err));
     // connect socket.
     window.socket = io(`${window.gui_origin }/`, {
         auth: {
             auth_token: window.auth_token,
+            acks: notificationSocketAcks(),
         },
+        transports: ['websocket', 'polling'],
+        withCredentials: true,
     });
+    answerNotificationReceipts(window.socket);
 
     window.socket.on('error', (error) => {
         console.error('GUI Socket Error:', error);
+    });
+
+    // Pick up reauth_required signals delivered via the socket.io
+    // handshake. SocketService emits `Error { data: { code:
+    // 'reauth_required', reason, auth_id } }` for legacy/revoked/expired
+    // tokens. Without this branch the disconnect would look like a
+    // silent network failure to the user.
+    window.socket.on('connect_error', (err) => {
+        const signal = err?.data;
+        if ( signal?.code === 'reauth_required' ) {
+            window.handleReauthRequired({
+                reason: signal.reason,
+                auth_id: signal.auth_id,
+            });
+        } else {
+            console.error('GUI Socket connect_error:', err);
+        }
     });
 
     window.socket.on('connect', function () {
@@ -176,8 +228,7 @@ async function UIDesktop (options) {
     });
 
     window.socket.on('trash.is_empty', async (msg) => {
-        $(`.item[data-path="${html_encode(window.trash_path)}" i]`).find('.item-icon > img').attr('src', msg.is_empty ? window.icons['trash.svg'] : window.icons['trash-full.svg']);
-        $(`.window[data-path="${html_encode(window.trash_path)}" i]`).find('.window-head-icon').attr('src', msg.is_empty ? window.icons['trash.svg'] : window.icons['trash-full.svg']);
+        window.update_trash_icons(msg.is_empty);
         // empty trash windows if needed
         if ( msg.is_empty )
         {
@@ -186,51 +237,125 @@ async function UIDesktop (options) {
     });
 
     /**
+     * Clicking a share notification opens the item, or Shared if grouped.
+     * Shares the notification center's predicate so a toast and a list entry
+     * never disagree about where a click goes.
+     */
+    const share_notification_click = (notification) => {
+        const target = notificationTarget(notification);
+        if ( target === null ) return undefined;
+        if ( target.kind === 'shared-item' ) {
+            return () => {
+                open_shared_item(target.path);
+            };
+        }
+        // Grouped: open where they all landed rather than picking one.
+        return () => {
+            UIWindow({
+                path: window.shared_path,
+                title: i18n('shared'),
+                icon: window.icons['sidebar-folder-shared.svg'],
+                is_dir: true,
+                app: 'explorer',
+            });
+        };
+    };
+
+    // The desktop has no notification list, so other types only clear.
+    const tap_surface = {
+        share: (notification) => share_notification_click(notification)?.(),
+        openApp: (route) => openAppForTap(route, { getApp: get_app_by_uid, launch: launch_app }),
+    };
+    const tap_notification = (tap) => handleNotificationTap(tap, tap_surface);
+
+    const toasts_for = (uid) => $(elementsWithData($('.notification').get(), 'uid', uid));
+
+    setPushTapHandler(storedTapHandler({
+        fetchRow: getNotification,
+        surface: tap_surface,
+        found: (uid) => {
+            toasts_for(uid).remove();
+            update_tab_notif_count_badge();
+            void markNotificationAcknowledged(uid).catch((err) => {
+                console.warn('Could not acknowledge notification:', err);
+            });
+        },
+    }));
+    startPushWorker().then(() => syncBrowserPush());
+
+    /**
+     * Raise one notification, whichever path it arrived on. `replay` names
+     * what the feed already claimed as shown while catching up, so the same
+     * row isn't marked twice.
+     */
+    const show_notification = ({ uid, notification, app_uid }, { replay = false } = {}) => {
+        // A notification can be re-sent under its own uid when what it says has
+        // grown — several people sharing with you is one notification that
+        // counts them. Refresh the one on screen rather than stacking a copy.
+        const $showing = toasts_for(uid);
+        if ( $showing.length ) {
+            $showing.find('.notification-title').text(notification.title);
+            $showing.find('.notification-text').text(notification.text ?? '');
+            return;
+        }
+
+        UINotification({
+            sender: senderNameFor(notification),
+            title: notification.title,
+            text: notification.text,
+            icon: window.icons[notification.icon] ?? httpsIconFor(notification) ?? undefined,
+            value: notification,
+            uid,
+            click: () => void tap_notification({ uid, notification, appUid: app_uid }),
+            close: () => applyToastMark('dismissed', uid, {
+                eventsPath: notification_feed.isActive(),
+            }),
+        });
+
+        if ( ! replay ) {
+            void applyToastMark('shown', uid, { eventsPath: notification_feed.isActive() });
+        }
+    };
+
+    /**
+     * Notifications over the events surface, where the server says it has
+     * them. It renders through the same path the socket wire does, and the
+     * listeners below stand down only while it is up.
+     */
+    const replayLog = createReplayLog();
+    const notification_feed = createNotificationFeed({
+        deliver: (items, { replay }) => {
+            for ( const item of replayLog.admit(items, { replay }) ) show_notification(item, { replay });
+        },
+    });
+    void notification_feed.start();
+
+    // A replayed notification with no text of its own shows its title twice.
+    const showReplayed = ({ uid, notification }) => show_notification({
+        uid,
+        notification: { ...notification, text: notification.text ?? notification.title },
+    }, { replay: true });
+
+    // A frozen or sleeping tab reconnects on resume; raise what it missed.
+    const knownAtLoad = listUndismissed()
+        .then((rows) => new Set(rows.map((row) => row.uid)))
+        .catch(() => null);
+    window.socket.io?.on('reconnect', () => {
+        void Promise.all([knownAtLoad, listUndismissed()])
+            .then(([known, rows]) => {
+                if ( ! known ) return;
+                for ( const item of missedAfterReconnect(rows, { known, log: replayLog }) ) showReplayed(item);
+            })
+            .catch((err) => console.warn('Could not catch up on notifications:', err));
+    });
+
+    /**
      * This event is triggered if a user receives a notification during
      * an active session.
      */
     window.socket.on('notif.message', async ({ uid, notification }) => {
-        let icon = window.icons[notification.icon];
-        let round_icon = false;
-
-        if ( notification.template === 'file-shared-with-you' && notification.fields?.username ) {
-            let profile_pic = await get_profile_picture(notification.fields?.username);
-            if ( profile_pic ) {
-                icon = profile_pic;
-                round_icon = true;
-            }
-        }
-
-        UINotification({
-            title: notification.title,
-            text: notification.text,
-            icon: icon,
-            round_icon: round_icon,
-            value: notification,
-            uid,
-            close: async () => {
-                await fetch(`${window.api_origin}/notif/mark-ack`, {
-                    method: 'POST',
-                    headers: {
-                        Authorization: `Bearer ${puter.authToken}`,
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ uid }),
-                });
-            },
-            click: async (notif) => {
-                if ( notification.template === 'file-shared-with-you' ) {
-                    let item_path = `/${ notification.fields.username}`;
-                    UIWindow({
-                        path: `/${ notification.fields.username}`,
-                        title: path.basename(item_path),
-                        icon: await item_icon({ is_dir: true, path: item_path }),
-                        is_dir: true,
-                        app: 'explorer',
-                    });
-                }
-            },
-        });
+        if ( notification_feed.isActive() ) return;
+        for ( const item of replayLog.admit([{ uid, notification }]) ) show_notification(item);
     });
 
     /**
@@ -240,61 +365,23 @@ async function UIDesktop (options) {
      *
      * It is not necessary to query unreads separately. If this stops working,
      * then this event should be fixed rather than querying unreads separately.
+     * Each reconnect brings one, whichever path is live; this page raises what it missed.
      */
-    window.__already_got_unreads = false;
     window.socket.on('notif.unreads', async ({ unreads }) => {
-        if ( window.__already_got_unreads ) return;
-        window.__already_got_unreads = true;
-
-        for ( const notif_info of unreads ) {
-            const notification = notif_info.notification;
-            let icon = window.icons[notification.icon];
-            let round_icon = false;
-
-            if ( notification.template === 'file-shared-with-you' && notification.fields?.username ) {
-                let profile_pic = await get_profile_picture(notification.fields?.username);
-                if ( profile_pic ) {
-                    icon = profile_pic;
-                    round_icon = true;
-                }
-            }
-
-            UINotification({
-                icon,
-                round_icon,
-                title: notification.title,
-                text: notification.text ?? notification.title,
-                uid: notif_info.uid,
-                close: async () => {
-                    await fetch(`${window.api_origin}/notif/mark-ack`, {
-                        method: 'POST',
-                        headers: {
-                            Authorization: `Bearer ${puter.authToken}`,
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            uid: notif_info.uid,
-                        }),
-                    });
-                },
-                click: async (notif) => {
-                    if ( notification.template === 'file-shared-with-you' ) {
-                        let item_path = `/${ notification.fields?.username}`;
-                        UIWindow({
-                            path: `/${ notification.fields?.username}`,
-                            title: path.basename(item_path),
-                            icon: await item_icon({ is_dir: true, path: item_path }),
-                            is_dir: true,
-                            app: 'explorer',
-                        });
-                    }
-                },
-            });
-        }
+        for ( const item of replayLog.admit(unreads, { replay: true }) ) showReplayed(item);
     });
 
+    // Acknowledgements also arrive when the notification feed is inactive.
     window.socket.on('notif.ack', ({ uid }) => {
-        $(`.notification[data-uid="${uid}"]`).remove();
+        void closeLocalBanner(uid);
+        replayLog.dismissed(uid);
+        toasts_for(uid).remove();
+        update_tab_notif_count_badge();
+    });
+
+    // Removed from the notification history: its toast goes too.
+    window.socket.on('notif.removed', ({ uid }) => {
+        toasts_for(uid).remove();
         update_tab_notif_count_badge();
     });
 
@@ -309,7 +396,7 @@ async function UIDesktop (options) {
         window.launch_apps.recent.unshift(app);
 
         // dedupe the array by uuid, uid, and id
-        window.launch_apps.recent = _.uniqBy(window.launch_apps.recent, 'name');
+        window.launch_apps.recent = [...new Map(window.launch_apps.recent.map(v => [v.name, v])).values()];
 
         // limit to 5
         window.launch_apps.recent = window.launch_apps.recent.slice(0, window.launch_recent_apps_count);
@@ -354,17 +441,18 @@ async function UIDesktop (options) {
         $(`.item[data-uid='${item.uid}']`).find('.item-icon-thumb').attr('src', new_icon);
         $(`.item[data-uid='${item.uid}']`).find('.item-icon-icon').attr('src', new_icon);
 
-        // Set new data-name
-        $(`.item[data-uid='${item.uid}']`).attr('data-name', html_encode(item.name));
-        $(`.window-${item.uid}`).attr('data-name', html_encode(item.name));
+        // Set new data-name. Attributes and form values are stored raw
+        // (.attr()/.val() don't parse HTML), as rename_file writes them.
+        $(`.item[data-uid='${item.uid}']`).attr('data-name', item.name);
+        $(`.window-${item.uid}`).attr('data-name', item.name);
 
         // Set new title attribute
-        $(`.item[data-uid='${item.uid}']`).attr('title', html_encode(item.name));
-        $(`.window-${options.uid}`).attr('title', html_encode(item.name));
+        $(`.item[data-uid='${item.uid}']`).attr('title', item.name);
+        $(`.window-${item.uid}`).attr('title', item.name);
 
         // Set new value for item-name-editor
-        $(`.item[data-uid='${item.uid}'] .item-name-editor`).val(html_encode(item.name));
-        $(`.item[data-uid='${item.uid}'] .item-name`).attr('title', html_encode(item.name));
+        $(`.item[data-uid='${item.uid}'] .item-name-editor`).val(item.name);
+        $(`.item[data-uid='${item.uid}'] .item-name`).attr('title', item.name);
 
         // Set new data-path
         const new_path = item.path;
@@ -382,7 +470,7 @@ async function UIDesktop (options) {
 
         // Update all elements whose paths start with old_path
         $(`[data-path^="${`${html_encode(item.old_path) }/`}"]`).each(function () {
-            const new_el_path = _.replace($(this).attr('data-path'), `${item.old_path }/`, `${new_path }/`);
+            const new_el_path = $(this).attr('data-path').replace(`${item.old_path }/`, `${new_path }/`);
             $(this).attr('data-path', new_el_path);
         });
 
@@ -415,7 +503,8 @@ async function UIDesktop (options) {
         }
 
         let dest_path = path.dirname(fsentry.path);
-        let metadata = fsentry.metadata;
+        // A JSON string on the wire; trash/restore reads its fields.
+        const metadata = parse_item_metadata(fsentry.metadata);
 
         // update all shortcut_to_path
         $(`.item[data-shortcut_to_path="${html_encode(resp.old_path)}" i]`).attr('data-shortcut_to_path', html_encode(fsentry.path));
@@ -449,8 +538,6 @@ async function UIDesktop (options) {
         }
 
         if ( dest_path === window.trash_path ) {
-            $(`.item[data-uid="${fsentry.uid}"]`).find('.item-is-shared').fadeOut(300);
-
             // if trashing dir...
             if ( fsentry.is_dir ) {
                 // remove website badge
@@ -468,8 +555,8 @@ async function UIDesktop (options) {
             $(`.item[data-uid=${fsentry.overwritten_uid}]`).removeItems();
         }
 
-        // if this is trash, get original name from item metadata
-        fsentry.name = (metadata && metadata.original_name) ? metadata.original_name : fsentry.name;
+        // Trashing renames the entry to its uid; the real name is in metadata.
+        fsentry.name = metadata.original_name ?? fsentry.name;
 
         // create new item on matching containers
         UIItem({
@@ -478,18 +565,18 @@ async function UIDesktop (options) {
             uid: fsentry.uid,
             path: fsentry.path,
             icon: await item_icon(fsentry),
-            name: (dest_path === window.trash_path) ? metadata.original_name : fsentry.name,
+            name: fsentry.name,
             is_dir: fsentry.is_dir,
             size: fsentry.size,
             type: fsentry.type,
             modified: fsentry.modified,
             is_selected: false,
-            is_shared: (dest_path === window.trash_path) ? false : fsentry.is_shared,
             is_shortcut: fsentry.is_shortcut,
             shortcut_to: fsentry.shortcut_to,
             shortcut_to_path: fsentry.shortcut_to_path,
             // has_website: $(el_item).attr('data-has_website') === '1',
-            metadata: JSON.stringify(fsentry.metadata) ?? '',
+            // Raw, as every other renderer stores it; re-encoding breaks restore.
+            metadata: fsentry.metadata ?? '',
         });
 
         if ( fsentry.parent_dirs_created && fsentry.parent_dirs_created.length > 0 ) {
@@ -512,7 +599,6 @@ async function UIDesktop (options) {
                         modified: dir.modified,
                         is_dir: true,
                         is_selected: false,
-                        is_shared: dir.is_shared,
                         has_website: false,
                     });
                 }
@@ -526,6 +612,26 @@ async function UIDesktop (options) {
     });
 
     window.socket.on('user.email_confirmed', (msg) => {
+        // don't update if this is the original client that initiated the action
+        if ( msg.original_client_socket_id === window.socket.id )
+        {
+            return;
+        }
+
+        window.refresh_user_data(window.auth_token);
+    });
+
+    window.socket.on('user.phone_verified', (msg) => {
+        // don't update if this is the original client that initiated the action
+        if ( msg.original_client_socket_id === window.socket.id )
+        {
+            return;
+        }
+
+        window.refresh_user_data(window.auth_token);
+    });
+
+    window.socket.on('user.card_verified', (msg) => {
         // don't update if this is the original client that initiated the action
         if ( msg.original_client_socket_id === window.socket.id )
         {
@@ -569,17 +675,18 @@ async function UIDesktop (options) {
         const new_icon = (item.is_dir ? window.icons['folder.svg'] : (await item_icon(item)).image);
         $(`.item[data-uid='${item.uid}']`).find('.item-icon-icon').attr('src', new_icon);
 
-        // Set new data-name
-        $(`.item[data-uid='${item.uid}']`).attr('data-name', html_encode(item.name));
-        $(`.window-${item.uid}`).attr('data-name', html_encode(item.name));
+        // Set new data-name. Attributes and form values are stored raw
+        // (.attr()/.val() don't parse HTML), as rename_file writes them.
+        $(`.item[data-uid='${item.uid}']`).attr('data-name', item.name);
+        $(`.window-${item.uid}`).attr('data-name', item.name);
 
         // Set new title attribute
-        $(`.item[data-uid='${item.uid}']`).attr('title', html_encode(item.name));
-        $(`.window-${options.uid}`).attr('title', html_encode(item.name));
+        $(`.item[data-uid='${item.uid}']`).attr('title', item.name);
+        $(`.window-${item.uid}`).attr('title', item.name);
 
         // Set new value for item-name-editor
-        $(`.item[data-uid='${item.uid}'] .item-name-editor`).val(html_encode(item.name));
-        $(`.item[data-uid='${item.uid}'] .item-name`).attr('title', html_encode(item.name));
+        $(`.item[data-uid='${item.uid}'] .item-name-editor`).val(item.name);
+        $(`.item[data-uid='${item.uid}'] .item-name`).attr('title', item.name);
 
         // Set new data-path
         const new_path = item.path;
@@ -597,7 +704,7 @@ async function UIDesktop (options) {
 
         // Update all elements whose paths start with old_path
         $(`[data-path^="${`${html_encode(item.old_path) }/`}"]`).each(function () {
-            const new_el_path = _.replace($(this).attr('data-path'), `${item.old_path }/`, `${new_path }/`);
+            const new_el_path = $(this).attr('data-path').replace(`${item.old_path }/`, `${new_path }/`);
             $(this).attr('data-path', new_el_path);
         });
 
@@ -616,7 +723,7 @@ async function UIDesktop (options) {
 
     window.socket.on('item.added', async (item) => {
         // if item is empty, don't proceed
-        if ( _.isEmpty(item) )
+        if ( !item || Object.keys(item).length === 0 )
         {
             return;
         }
@@ -637,50 +744,7 @@ async function UIDesktop (options) {
             return;
         }
 
-        // Update replaced items with matching uids
-        if ( item.overwritten_uid ) {
-            $(`.item[data-uid='${item.overwritten_uid}']`).attr({
-                'data-immutable': item.immutable,
-                'data-path': item.path,
-                'data-name': item.name,
-                'data-size': item.size,
-                'data-modified': item.modified,
-                'data-is_shared': item.is_shared,
-                'data-type': item.type,
-            });
-            // set new icon
-            const new_icon = (item.is_dir ? window.icons['folder.svg'] : (await item_icon(item)).image);
-            $(`.item[data-uid="${item.overwritten_uid}"]`).find('.item-icon > img').attr('src', new_icon);
-
-            //sort each window
-            $(`.item-container[data-path='${html_encode(item.dirpath)}' i]`).each(function () {
-                window.sort_items(this, $(this).attr('data-sort_by'), $(this).attr('data-sort_order'));
-            });
-        }
-        else {
-            UIItem({
-                appendTo: $(`.item-container[data-path='${html_encode(item.dirpath)}' i]`),
-                uid: item.uid,
-                immutable: item.immutable || item.writable === false,
-                associated_app_name: item.associated_app?.name,
-                path: item.path,
-                icon: await item_icon(item),
-                name: item.name,
-                size: item.size,
-                type: item.type,
-                modified: item.modified,
-                is_dir: item.is_dir,
-                is_shared: item.is_shared,
-                is_shortcut: item.is_shortcut,
-                shortcut_to: item.shortcut_to,
-                shortcut_to_path: item.shortcut_to_path,
-            });
-
-            //sort each window
-            $(`.item-container[data-path='${html_encode(item.dirpath)}' i]`).each(function () {
-                window.sort_items(this, $(this).attr('data-sort_by'), $(this).attr('data-sort_order'));
-            });
-        }
+        await apply_item_added_to_containers(item);
     });
 
     // Hidden file dialog
@@ -695,20 +759,16 @@ async function UIDesktop (options) {
     // Desktop
     // If desktop is not in fullpage/embedded mode, we hide it until files and directories are loaded and then fade in the UI
     // This gives a calm and smooth experience for the user
-    h += `<div class="desktop item-container disable-user-select" 
-                data-uid="${options.desktop_fsentry.uid}" 
-                data-sort_by="${!options.desktop_fsentry.sort_by ? 'name' : options.desktop_fsentry.sort_by}" 
-                data-sort_order="${!options.desktop_fsentry.sort_order ? 'asc' : options.desktop_fsentry.sort_order}" 
+    h += `<div class="desktop item-container disable-user-select"
+                data-uid="${options.desktop_fsentry?.uid ?? ''}"
+                data-sort_by="${!options.desktop_fsentry?.sort_by ? 'name' : options.desktop_fsentry.sort_by}"
+                data-sort_order="${!options.desktop_fsentry?.sort_order ? 'asc' : options.desktop_fsentry.sort_order}"
                 data-path="${html_encode(window.desktop_path)}"
             >`;
-
-    // show AI button
-    h += '<div class="btn-show-ai"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-sparkles-icon lucide-sparkles"><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"/><path d="M20 2v4"/><path d="M22 4h-4"/><circle cx="4" cy="20" r="2"/></svg></div>';
-
     h += '</div>';
 
     // Get window sidebar width
-    puter.kv.get('window_sidebar_width').then(async (val) => {
+    puter.kv.get('window_sidebar_width').catch(() => null).then(async (val) => {
         let value = parseInt(val);
         // if value is a valid number
         if ( !isNaN(value) && value > 0 ) {
@@ -718,30 +778,25 @@ async function UIDesktop (options) {
 
     // load window sidebar items from KV
     puter.kv.get('sidebar_items').then(async (val) => {
-        window.sidebar_items = val;
-    });
-
-    // Remove `?ref=...` from navbar URL
-    if ( window.url_query_params.has('ref') ) {
-        window.history.pushState(null, document.title, '/');
-    }
-
-    // update local user preferences
-    const user_preferences = {
-        show_hidden_files: JSON.parse(await puter.kv.get('user_preferences.show_hidden_files')),
-        language: await puter.kv.get('user_preferences.language'),
-        clock_visible: await puter.kv.get('user_preferences.clock_visible'),
-    };
-
-    // update default apps
-    {
-        const entries = await puter.kv.list('user_preferences.default_apps.*', true);
-        for ( const entry of entries ) {
-            user_preferences[entry.key.substring(17)] = entry.value;
+        // UIWindow parses this and reads `item.path` while building every
+        // explorer window, so a malformed value is dropped for the defaults.
+        let items = null;
+        try {
+            items = JSON.parse(val);
+        } catch { /* keep the defaults */ }
+        if ( Array.isArray(items) && items.every(item => typeof item?.path === 'string') ) {
+            window.sidebar_items = val;
         }
+    // Catch on the chain rather than the read, so a failure leaves whatever is
+    // already there instead of overwriting it with a fallback.
+    }).catch(err => console.warn('Could not load sidebar_items:', err));
 
-        window.update_user_preferences(user_preferences);
+    // Remove `?ref=...` from navbar URL, keeping the current path
+    if ( window.url_query_params.has('ref') ) {
+        window.history.pushState(null, document.title, window.location.pathname);
     }
+
+    await window.load_user_preferences();
 
     // Append to <body>
     $('body').append(h);
@@ -757,12 +812,16 @@ async function UIDesktop (options) {
         if ( window.desktop_icons_hidden ) {
             hideDesktopIcons();
         }
-    });
+    }).catch(err => console.warn('Could not load desktop_icons_hidden:', err));
 
     // ---------------------------------------------------------------
     // Taskbar
+    // In fullpage mode the desktop only hosts a single app, so there's
+    // nothing for the taskbar to do; skip building it entirely.
     // ---------------------------------------------------------------
-    UITaskbar();
+    if ( !window.is_fullpage_mode ) {
+        UITaskbar();
+    }
 
     // Update desktop dimensions after taskbar is initialized with position
     window.update_desktop_dimensions_for_taskbar();
@@ -1097,11 +1156,14 @@ async function UIDesktop (options) {
         if ( !window.url_paths[0]?.toLocaleLowerCase() === 'app' || !window.url_paths[1] ) {
             if ( !isMobile.phone && !isMobile.tablet ) {
                 setTimeout(() => {
+                    // The catch goes on the end of the chain, not on the read:
+                    // falling back to null would read as "never seen it" and
+                    // show the window to someone who has.
                     puter.kv.get('has_seen_welcome_window').then(async (val) => {
                         if ( val === null ) {
                             await UIWindowWelcome();
                         }
-                    });
+                    }).catch(err => console.warn('Could not check has_seen_welcome_window:', err));
                 }, 1000);
             }
         }
@@ -1191,7 +1253,7 @@ async function UIDesktop (options) {
     // Toolbar
     // ----------------------------------------------------
     // Has user seen the toolbar animation?
-    window.has_seen_toolbar_animation = await puter.kv.get('has_seen_toolbar_animation') ?? false;
+    window.has_seen_toolbar_animation = await puter.kv.get('has_seen_toolbar_animation').catch(() => null) ?? false;
 
     let ht = '';
     let style = '';
@@ -1207,7 +1269,7 @@ async function UIDesktop (options) {
     // logo
     ht += `<div class="toolbar-btn toolbar-puter-logo" title="Puter" style="margin-left: 10px;"><img src="${window.icons['logo-white.svg']}" draggable="false" style="display:block; width:17px; height:17px"></div>`;
 
-    // clock spacer
+    // spacer to push items to the right
     ht += '<div class="toolbar-spacer"></div>';
 
     // create account button
@@ -1215,22 +1277,7 @@ async function UIDesktop (options) {
     ht += '<svg style="width: 17px; height: 17px;" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px" width="48px" height="48px" viewBox="0 0 48 48"><g transform="translate(0, 0)"><path d="M45.521,39.04L27.527,5.134c-1.021-1.948-3.427-2.699-5.375-1.679-.717,.376-1.303,.961-1.679,1.679L2.479,39.04c-.676,1.264-.635,2.791,.108,4.017,.716,1.207,2.017,1.946,3.42,1.943H41.993c1.403,.003,2.704-.736,3.42-1.943,.743-1.226,.784-2.753,.108-4.017ZM23.032,15h1.937c.565,0,1.017,.467,1,1.031l-.438,14c-.017,.54-.459,.969-1,.969h-1.062c-.54,0-.983-.429-1-.969l-.438-14c-.018-.564,.435-1.031,1-1.031Zm.968,25c-1.657,0-3-1.343-3-3s1.343-3,3-3,3,1.343,3,3-1.343,3-3,3Z" fill="#ffbb00"></path></g></svg>';
     ht += '</div>';
 
-    // 'Show Desktop'
-    ht += `<a href="/" class="show-desktop-btn toolbar-btn antialiased hidden" target="_blank" title="${i18n('desktop_show_desktop')}">${i18n('desktop_show_desktop')} <img src="${window.icons['launch-white.svg']}" style="width: 10px; height: 10px; margin-left: 5px;"></a>`;
 
-    // refer
-    if ( window.user.referral_code ) {
-        ht += `<div class="toolbar-btn refer-btn" title="${i18n('toolbar.refer')}" style="background-image:url(${window.icons['gift.svg']});"></div>`;
-    }
-
-    // github
-    ht += `<a href="https://github.com/HeyPuter/puter" target="_blank" class="toolbar-btn" title="${i18n('toolbar.github')}" style="background-image:url(${window.icons['logo-github-white.svg']});"></a>`;
-
-    // do not show the fullscreen button on mobile devices since it's broken
-    if ( ! isMobile.phone ) {
-        // fullscreen button
-        ht += `<div class="toolbar-btn fullscreen-btn" title="${i18n('toolbar.enter_fullscreen')}" style="background-image:url(${window.icons['fullscreen.svg']})"></div>`;
-    }
 
     // qr code button -- only show if not embedded
     if ( ! window.is_embedded )
@@ -1240,9 +1287,6 @@ async function UIDesktop (options) {
 
     // search button
     ht += `<div class="toolbar-btn search-btn" title="${i18n('toolbar.search')}" style="background-image:url('${window.icons['search.svg']}')"></div>`;
-
-    //clock
-    ht += '<div id="clock" class="toolbar-clock" style="">12:00 AM Sun, Jan 01</div>';
 
     // user options menu
     ht += '<div class="toolbar-btn user-options-menu-btn profile-pic" style="display:block;">';
@@ -1265,8 +1309,6 @@ async function UIDesktop (options) {
 
     // send event
     window.dispatchEvent(new CustomEvent('toolbar:ready'));
-    // init clock visibility
-    window.change_clock_visible();
 
     // notification container
     $('body').append(`<div class="notification-container"><div class="notifications-close-all">${i18n('close_all')}</div></div>`);
@@ -1281,33 +1323,21 @@ async function UIDesktop (options) {
     window.dispatchEvent(new CustomEvent('desktop:ready'));
     globalThis.services.emit('gui:ready');
 
-    //--------------------------------------------------------
-    // Open the AI app
-    //--------------------------------------------------------
-    launch_app({
-        name: 'ai',
-        window_options: {
-            is_panel: true,
-        },
-    });
-
     //--------------------------------------------------------------------------------------
     // Determine if an app was launched from URL
     // i.e. https://puter.com/app/<app_name>
     //--------------------------------------------------------------------------------------
     if ( window.url_paths[0]?.toLocaleLowerCase() === 'app' && window.url_paths[1] ) {
-        window.app_launched_from_url = window.url_paths[1];
-        // get app metadata
-        try {
-            window.app_launched_from_url = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
-            window.is_fullpage_mode = window.app_launched_from_url.metadata?.fullpage_on_landing ?? window.is_fullpage_mode ?? false;
-
-            // show 'Show Desktop' button
-            if ( window.is_fullpage_mode ) {
-                $('.show-desktop-btn').removeClass('hidden');
+        // If app metadata was already fetched early (for fullpage detection), reuse it
+        if ( !window.app_launched_from_url?.name ) {
+            window.app_launched_from_url = window.url_paths[1];
+            // get app metadata
+            try {
+                window.app_launched_from_url = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
+                window.is_fullpage_mode = window.app_launched_from_url.metadata?.fullpage_on_landing ?? window.is_fullpage_mode ?? false;
+            } catch (e) {
+                console.error('UIDesktop app path launch error', e);
             }
-        } catch (e) {
-            console.error('UIDesktop app path launch error', e);
         }
 
         // get query params, any param that doesn't start with 'puter.' will be passed to the app
@@ -1320,16 +1350,10 @@ async function UIDesktop (options) {
         }
     }
     //--------------------------------------------------------------------------------------
-    // /settings will open settings in fullpage mode
+    // /settings redirects to /dashboard
     //--------------------------------------------------------------------------------------
     else if ( window.url_paths[0]?.toLocaleLowerCase() === 'settings' ) {
-        // open settings
-        UIWindowSettings({
-            tab: window.url_paths[1] || 'about',
-            window_options: {
-                is_fullpage: true,
-            },
-        });
+        window.open('/dashboard/#home', '_blank');
     }
     // ---------------------------------------------
     // Run apps from insta-login URL
@@ -1365,12 +1389,16 @@ async function UIDesktop (options) {
             if ( window.app_query_params && window.app_query_params.posargs ) {
                 posargs = JSON.parse(window.app_query_params.posargs);
             }
+            // `?file=<path or uid>` opens that file with the app, the same as
+            // double-clicking it would — but the link picked both, so the user
+            // is asked before the app is given the file.
             launch_app({
                 app: window.app_launched_from_url.name,
                 app_obj: window.app_launched_from_url,
                 readURL: window.url_query_params.get('readURL'),
                 maximized: window.url_query_params.get('maximized'),
                 params: window.app_query_params ?? [],
+                ...urlFileLaunchOptions(window.url_query_params.get('file')),
                 ...(posargs ? {
                     args: {
                         command_line: { args: posargs },
@@ -1404,49 +1432,6 @@ async function UIDesktop (options) {
         $('.window-menubar-global').hide();
     });
 
-    function display_ct () {
-
-        var x = new Date();
-        var ampm = x.getHours() >= 12 ? ' PM' : ' AM';
-        let hours = x.getHours() % 12;
-        hours = hours ? hours : 12;
-        hours = hours.toString().length == 1 ? 0 + hours.toString() : hours;
-
-        var minutes = x.getMinutes().toString();
-        minutes = minutes.length == 1 ? 0 + minutes : minutes;
-
-        var seconds = x.getSeconds().toString();
-        seconds = seconds.length == 1 ? 0 + seconds : seconds;
-
-        var month = x.toLocaleString('default', { month: 'short' });
-
-        var dt = x.getDate().toString();
-        dt = dt.length == 1 ? 0 + dt : dt;
-
-        var day = x.toLocaleString('default', { weekday: 'short' });
-
-        var x1 = `${day }, ${ month } ${ dt}`;
-        x1 = `${hours }:${ minutes }${ampm } ${ x1}`;
-        $('#clock').html(x1);
-    }
-    display_ct();
-    setInterval(display_ct, 1000);
-
-    // show referral notice window
-    if ( window.show_referral_notice && !window.user.email_confirmed ) {
-        puter.kv.get('shown_referral_notice').then(async (val) => {
-            if ( !val || val === 'false' || val === false ) {
-                setTimeout(() => {
-                    UIWindowClaimReferral();
-                }, 1000);
-                puter.kv.set({
-                    key: 'shown_referral_notice',
-                    value: true,
-                });
-            }
-        });
-    }
-
     window.hide_toolbar = (animate = true) => {
         // Always show toolbar on mobile and tablet devices
         if ( isMobile.phone || isMobile.tablet ) {
@@ -1476,13 +1461,13 @@ async function UIDesktop (options) {
                 width: '40px',
             });
         }
-        // animate hide toolbar-btn, toolbar-clock
+        // animate hide toolbar buttons
         if ( animate ) {
-            $('.toolbar-btn, #clock, .user-options-menu-btn').animate({
+            $('.toolbar-btn, .user-options-menu-btn').animate({
                 opacity: 0,
             }, 10);
         } else {
-            $('.toolbar-btn, #clock, .user-options-menu-btn').css({
+            $('.toolbar-btn, .user-options-menu-btn').css({
                 opacity: 0,
             });
         }
@@ -1491,7 +1476,7 @@ async function UIDesktop (options) {
             puter.kv.set({
                 key: 'has_seen_toolbar_animation',
                 value: true,
-            });
+            }).catch(err => console.warn('Could not save has_seen_toolbar_animation:', err));
 
             window.has_seen_toolbar_animation = true;
         }
@@ -1507,8 +1492,8 @@ async function UIDesktop (options) {
             top: 0,
         }, 100).css('width', 'max-content');
 
-        // animate show toolbar-btn, toolbar-clock
-        $('.toolbar-btn, #clock, .user-options-menu-btn').animate({
+        // animate show toolbar buttons
+        $('.toolbar-btn, .user-options-menu-btn').animate({
             opacity: 0.8,
         }, 50);
     };
@@ -1581,8 +1566,10 @@ async function UIDesktop (options) {
             const toolbar = $('.toolbar')[0];
             if ( toolbar ) {
                 const rect = toolbar.getBoundingClientRect();
-                const distanceFromToolbar = Math.min(Math.abs(mouseY - rect.bottom),
-                                Math.abs(mouseY - rect.top));
+                const distanceFromToolbar = Math.min(
+                    Math.abs(mouseY - rect.bottom),
+                    Math.abs(mouseY - rect.top),
+                );
 
                 // If mouse is far from toolbar, hide quicker
                 if ( distanceFromToolbar > TOOLBAR_SAFE_ZONE * 2 ) {
@@ -1793,7 +1780,7 @@ async function UIDesktop (options) {
         try {
             stat = await puter.fs.stat({ path: item_path, consistency: 'eventual' });
         } catch ( e ) {
-            window.history.replaceState(null, document.title, '/');
+            window.history.replaceState(null, document.title, '/desktop');
             UIAlert({
                 message: i18n('error_user_or_path_not_found'),
                 type: 'error',
@@ -1801,22 +1788,28 @@ async function UIDesktop (options) {
             return;
         }
 
-        // TODO: DRY everything here with open_item. Unfortunately we can't
-        //       use open_item here because it's coupled with UI logic;
-        //       it requires a UIItem element and cannot operate on a
-        //       file path on its own.
+        await open_path_target(item_path, stat);
+    }
+
+    /**
+     * Open a path as double-clicking would: the associated app for a file, an
+     * explorer window for a directory.
+     *
+     * TODO: DRY with open_item, which is coupled to a UIItem element and can't
+     *       operate on a path alone.
+     */
+    async function open_path_target (item_path, stat) {
         if ( ! stat.is_dir ) {
             if ( stat.associated_app ) {
                 launch_app({ name: stat.associated_app.name });
                 return;
             }
 
-            const ext_pref =
-                window.user_preferences[`default_apps${path.extname(item_path).toLowerCase()}`];
-
-            if ( ext_pref ) {
+            const default_app = await resolve_default_app({ uid: stat.uid, path: item_path });
+            if ( default_app ) {
                 launch_app({
-                    name: ext_pref,
+                    name: default_app.name,
+                    app_obj: default_app,
                     file_path: item_path,
                 });
                 return;
@@ -1833,8 +1826,8 @@ async function UIDesktop (options) {
                     'Authorization': `Bearer ${window.auth_token}`,
                 },
                 statusCode: {
-                    401: function () {
-                        window.logout();
+                    401: function (xhr) {
+                        window.handle401(xhr);
                     },
                 },
             });
@@ -1875,11 +1868,67 @@ async function UIDesktop (options) {
         });
     }
 
+    /** Open an item somebody shared, addressed as `/<owner>/<uuid>/<name>`. */
+    async function open_shared_item (shared_path) {
+        const stat = await resolve_shared_item(puter.fs, shared_path);
+        if ( ! stat ) {
+            UIAlert({
+                message: i18n('error_user_or_path_not_found'),
+                type: 'error',
+            });
+            return false;
+        }
+
+        // `stat` returns the path this viewer may use, which is the one to open.
+        await open_path_target(stat.path ?? shared_path, stat);
+        return true;
+    }
+
+    /**
+     * Act on a share link. A share to a person only ever reaches a real
+     * account, so for a temporary session the item is tried first — an item
+     * open to anyone with the link resolves for it — and only a miss asks
+     * for a sign-in, rather than burning the link on a "not found" as
+     * somebody who can't see it. The link stays in the address bar across
+     * the prompt because login reloads on success, which brings it back for
+     * the account that can actually open it.
+     */
+    async function handle_shared_link (shared_path) {
+        if ( window.user?.is_temp ) {
+            const stat = await resolve_shared_item(puter.fs, shared_path);
+            if ( stat ) {
+                clear_shared_param();
+                await open_path_target(stat.path ?? shared_path, stat);
+                return;
+            }
+            await UIAuthLogin({
+                reload_on_success: true,
+                page: true,
+            });
+            // Dismissed without signing in: drop the link rather than loop.
+            if ( window.user?.is_temp ) clear_shared_param();
+            return;
+        }
+        clear_shared_param();
+        await open_shared_item(shared_path);
+    }
+
+    //--------------------------------------------------------------------------------------
+    // Opening an item someone shared, on the desktop
+    // i.e. https://puter.com/desktop?shared=%2F<owner>%2F<uuid>%2F<name>
+    // (the same link at the root lands in the dashboard's Shared view instead)
+    //--------------------------------------------------------------------------------------
+    if ( window.url_query_params.has(SHARED_PATH_PARAM) ) {
+        await handle_shared_link(window.url_query_params.get(SHARED_PATH_PARAM));
+    }
+
     //--------------------------------------------------------------------------------------
     // Direct download link
-    // i.e. https://puter.com/?download=<file_url>
+    // i.e. https://puter.com/?download=<file_url> or https://puter.com/desktop?download=<file_url>
     //--------------------------------------------------------------------------------------
-    if ( window.url_paths.length === 0 && window.url_query_params.has('download') ) {
+    const is_bare_desktop_path = window.url_paths.length === 0
+        || (window.url_paths.length === 1 && window.url_paths[0]?.toLocaleLowerCase() === 'desktop');
+    if ( is_bare_desktop_path && window.url_query_params.has('download') ) {
         const url = window.url_query_params.get('download');
         let file_name = url.split('/').pop().split('?')[0];
 
@@ -2087,7 +2136,8 @@ $(document).on('contextmenu taphold', '.toolbar', function (event) {
                     window.toolbar_auto_hide_enabled = !window.toolbar_auto_hide_enabled;
 
                     // Save the preference
-                    puter.kv.set('toolbar_auto_hide_enabled', window.toolbar_auto_hide_enabled.toString());
+                    puter.kv.set('toolbar_auto_hide_enabled', window.toolbar_auto_hide_enabled.toString())
+                        .catch(err => console.warn('Could not save toolbar_auto_hide_enabled:', err));
 
                     // If auto-hide was just disabled and toolbar is currently hidden, show it
                     if ( !window.toolbar_auto_hide_enabled && $('.toolbar').hasClass('toolbar-hidden') ) {
@@ -2112,7 +2162,7 @@ $(document).on('contextmenu taphold', '.toolbar', function (event) {
 $(document).on('click', '.qr-btn', async function (e) {
     UIWindowQR({
         message_i18n_key: 'scan_qr_c2a',
-        text: `${window.gui_origin }?auth_token=${ window.auth_token}`,
+        text: `${window.gui_origin }/desktop?auth_token=${ window.auth_token}`,
     });
 });
 
@@ -2169,7 +2219,7 @@ $(document).on('click', '.user-options-menu-btn', async function (e) {
                         return;
                     }
                     // update auth data
-                    window.update_auth_data(l_user.auth_token, l_user);
+                    await window.update_auth_data(l_user.auth_token, l_user);
                     // refresh
                     location.reload();
                 },
@@ -2182,15 +2232,12 @@ $(document).on('click', '.user-options-menu-btn', async function (e) {
         items.push('-');
 
         items.push({
-            html: i18n('add_existing_account'),
+            html: i18n('add_another_account'),
             // icon: l_user.username === user.username ? '✓' : '',
             onClick: async function (val) {
-                await UIWindowLogin({
+                await UIAuthLogin({
                     reload_on_success: true,
                     send_confirmation_code: false,
-                    window_options: {
-                        has_head: true,
-                    },
                 });
             },
         });
@@ -2205,15 +2252,18 @@ $(document).on('click', '.user-options-menu-btn', async function (e) {
     // -------------------------------------------
     // Load available languages
     // -------------------------------------------
-    const supportedLanguagesItems = window.listSupportedLanguages().map(lang => {
-        return {
-            html: lang.name,
-            icon: window.locale === lang.code ? '✓' : '',
-            onClick: async function () {
-                changeLanguage(lang.code);
-            },
-        };
-    });
+    const supportedLanguagesItems = window.listSupportedLanguages()
+        .slice()
+        .sort((a, b) => a.english_name.localeCompare(b.english_name, 'en'))
+        .map(lang => {
+            return {
+                html: lang.name,
+                icon: window.locale === lang.code ? '✓' : '',
+                onClick: async function () {
+                    await changeLanguage(lang.code);
+                },
+            };
+        });
 
     UIContextMenu({
         id: 'user-options-menu',
@@ -2222,13 +2272,20 @@ $(document).on('click', '.user-options-menu-btn', async function (e) {
         items: [
             ...items,
             //--------------------------------------------------
+            // Change Language
+            //--------------------------------------------------
+            {
+                html: i18n('change_language'),
+                items: supportedLanguagesItems,
+            },
+            //--------------------------------------------------
             // Settings
             //--------------------------------------------------
             {
                 html: i18n('settings'),
                 id: 'settings',
                 onClick: async function () {
-                    UIWindowSettings();
+                    window.open('/dashboard/#home', '_blank');
                 },
             },
             //--------------------------------------------------
@@ -2303,31 +2360,6 @@ $(document).on('click', '.user-options-menu-btn', async function (e) {
     });
 });
 
-$(document).on('click', '.fullscreen-btn', async function (e) {
-    if ( ! window.is_fullscreen() ) {
-        var elem = document.documentElement;
-        if ( elem.requestFullscreen ) {
-            elem.requestFullscreen();
-        } else if ( elem.webkitRequestFullscreen ) { /* Safari */
-            elem.webkitRequestFullscreen();
-        } else if ( elem.mozRequestFullScreen ) { /* moz */
-            elem.mozRequestFullScreen();
-        } else if ( elem.msRequestFullscreen ) { /* IE11 */
-            elem.msRequestFullscreen();
-        }
-    }
-    else {
-        if ( document.exitFullscreen ) {
-            document.exitFullscreen();
-        } else if ( document.webkitExitFullscreen ) {
-            document.webkitExitFullscreen();
-        } else if ( document.mozCancelFullScreen ) {
-            document.mozCancelFullScreen();
-        } else if ( document.msExitFullscreen ) {
-            document.msExitFullscreen();
-        }
-    }
-});
 
 $(document).on('click', '.close-launch-popover', function () {
     $('.launch-popover').closest('.popover').fadeOut(200, function () {
@@ -2340,7 +2372,7 @@ $(document).on('click', '.search-btn', function () {
 });
 
 $(document).on('click', '.toolbar-puter-logo', function () {
-    UIWindowSettings();
+    window.open('/dashboard/#home', '_blank');
 });
 
 $(document).on('click', '.user-options-create-account-btn', async function (e) {
@@ -2348,10 +2380,6 @@ $(document).on('click', '.user-options-create-account-btn', async function (e) {
         send_confirmation_code: false,
         default_username: window.user.username,
     });
-});
-
-$(document).on('click', '.refer-btn', async function (e) {
-    UIWindowRefer();
 });
 
 $(document).on('click', '.start-app', async function (e) {
@@ -2392,16 +2420,12 @@ $(document).on('click', '.user-options-login-btn', async function (e) {
         });
         if ( saved )
         {
-            UIWindowLogin({ show_signup_button: false, reload_on_success: true });
+            UIAuthLogin({ show_signup_button: false, reload_on_success: true });
         }
     } else if ( alert_resp === 'login' ) {
-        UIWindowLogin({
+        UIAuthLogin({
             show_signup_button: false,
             reload_on_success: true,
-            window_options: {
-                backdrop: true,
-                close_on_backdrop_click: false,
-            },
         });
     }
 });
@@ -2449,21 +2473,6 @@ $(document).on('click', '.launch-search-clear', function (e) {
     $('.launch-search').focus();
 });
 
-document.addEventListener('fullscreenchange', (event) => {
-    // document.fullscreenElement will point to the element that
-    // is in fullscreen mode if there is one. If there isn't one,
-    // the value of the property is null.
-
-    if ( document.fullscreenElement ) {
-        $('.fullscreen-btn').css('background-image', `url(${window.icons['shrink.svg']})`);
-        $('.fullscreen-btn').attr('title', i18n('desktop_exit_full_screen'));
-        window.user_preferences.clock_visible === 'auto' && $('#clock').show();
-    } else {
-        $('.fullscreen-btn').css('background-image', `url(${window.icons['fullscreen.svg']})`);
-        $('.fullscreen-btn').attr('title', i18n('desktop_enter_full_screen'));
-        window.user_preferences.clock_visible === 'auto' && $('#clock').hide();
-    }
-});
 
 window.set_desktop_background = function (options) {
     if ( options.fit ) {
@@ -2558,8 +2567,13 @@ window.enter_fullpage_mode = (el_window) => {
 window.exit_fullpage_mode = (el_window) => {
     $('body').removeClass('fullpage-mode');
     window.taskbar_height = window.default_taskbar_height;
-    $('.taskbar').css('height', window.taskbar_height);
-    $('.taskbar').show();
+    // In fullpage mode the taskbar is never built, so create it on exit; otherwise just restore it.
+    if ( $('.taskbar').length === 0 ) {
+        UITaskbar();
+    } else {
+        $('.taskbar').css('height', window.taskbar_height);
+        $('.taskbar').show();
+    }
     refresh_item_container($('.desktop.item-container'), { fadeInItems: true });
     $(el_window).removeAttr('data-is_fullpage');
     if ( el_window ) {
@@ -2569,9 +2583,6 @@ window.exit_fullpage_mode = (el_window) => {
 
     // reset dektop height to take into account the taskbar height
     $('.desktop').css('height', `calc(100vh - ${window.taskbar_height + window.toolbar_height}px)`);
-
-    // hide the 'Show Desktop' button in toolbar
-    $('.show-desktop-btn').hide();
 
     // refresh desktop background
     window.refresh_desktop_background();
@@ -2607,11 +2618,8 @@ window.toggleDesktopIcons = function () {
     }
 
     // Save preference
-    puter.kv.set('desktop_icons_hidden', window.desktop_icons_hidden.toString());
+    puter.kv.set('desktop_icons_hidden', window.desktop_icons_hidden.toString())
+        .catch(err => console.warn('Could not save desktop_icons_hidden:', err));
 };
-
-$(document).on('click', '.btn-show-ai', function () {
-    $('.window[data-app="ai"]').makeWindowVisible();
-});
 
 export default UIDesktop;

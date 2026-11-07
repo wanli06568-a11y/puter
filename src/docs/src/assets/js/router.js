@@ -1,4 +1,6 @@
-jQuery(document).ready(function () {
+import $ from 'jquery';
+
+$(document).ready(function () {
     //History API
     if ( window.history && window.history.pushState ) {
         // Initialize state for the first page
@@ -38,10 +40,13 @@ function isExternalLink (href) {
     }
 }
 
-function isPlaygroundLink (href) {
+// The playground and recipes are standalone apps with their own bundles, not
+// docs pages — swapping .docs-content into them would produce a broken page.
+function isStandaloneAppLink (href) {
     try {
         const url = new URL(href, window.location.href);
-        return url.pathname.startsWith('/playground/');
+        return url.pathname.startsWith('/playground/')
+            || url.pathname.startsWith('/recipes/');
     } catch (e) {
         return false;
     }
@@ -52,7 +57,7 @@ $(document).on('click', 'a:not(.skip-insta-load):not([target="_blank"])', functi
     if ( e.metaKey || e.ctrlKey || e.shiftKey || e.altKey ) return;
     // special case handling
     const href = $(this).attr('href');
-    if ( isCurrentPage(href) || isExternalLink(href) || isPlaygroundLink(href) ) return;
+    if ( isCurrentPage(href) || isExternalLink(href) || isStandaloneAppLink(href) ) return;
 
     e.preventDefault();
 
@@ -91,9 +96,28 @@ $(document).on('click', 'a:not(.skip-insta-load):not([target="_blank"])', functi
         $('#toc-wrapper').html($(data).find('#toc-wrapper').html());
 
         setTimeout(() => {
-            $('body').animate({
-                scrollTop: 0,
-            }, 100);
+            // If the URL has a hash, scroll to that heading instead of the
+            // top of the page. The browser only does this natively on a full
+            // page load, so the insta-loader has to handle it here.
+            const hash = window.location.hash;
+            let target = null;
+            if ( hash.length > 1 ) {
+                const id = hash.slice(1);
+                try {
+                    // Pasted/hand-typed URLs may contain malformed
+                    // percent-encoding, which makes decodeURIComponent throw.
+                    target = document.getElementById(decodeURIComponent(id));
+                } catch ( e ) {
+                    target = document.getElementById(id);
+                }
+            }
+            if ( target ) {
+                target.scrollIntoView();
+            } else {
+                $('body').animate({
+                    scrollTop: 0,
+                }, 100);
+            }
         }, 30);
 
         //set title of page

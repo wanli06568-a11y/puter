@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const ua = {
         account: 'Обліковий запис',
         account_password: 'Перевірити пароль облікового запису',
         access_granted_to: 'Доступ надано',
-        add_existing_account: 'Додати існуючий обліковий запис',
+        add_another_account: 'Додати інший обліковий запис',
         all_fields_required: "Усі поля обов\'язкові.",
         allow: 'Дозволити',
         apply: 'Застосувати',
@@ -44,7 +44,6 @@ const ua = {
         change_password: 'Змінити Пароль',
         change_ui_colors: 'Змінити Тему Оформлення',
         change_username: "Змінити Ім\'я Користувача",
-        clock_visibility: 'Видимість годинника',
         close: 'Закрити',
         close_all_windows: 'Закрити всі Вікна',
         close_all_windows_confirm: 'Ви впевнені, що хочете закрити всі вікна?',
@@ -86,10 +85,6 @@ const ua = {
         credits: 'Титри',
         current_password: 'Поточний Пароль',
         cut: 'Вирізати',
-        clock: 'Годинник',
-        clock_visible_hide: 'Приховати - Завжди приховано',
-        clock_visible_show: 'Показати - Завжди на виду',
-        clock_visible_auto: 'Авто - За Замовчуванням, видно тільки у повноекранному режимі',
         close_all: 'Закрити все',
         created: 'Створено',
         date_modified: 'Дата зміни',

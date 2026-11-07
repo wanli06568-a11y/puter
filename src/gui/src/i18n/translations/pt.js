@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const pt = {
         account: 'Conta',
         account_password: 'Verificar a palavra-passe da conta',
         access_granted_to: 'Acesso Concedido a',
-        add_existing_account: 'Adicionar Conta Existente',
+        add_another_account: 'Adicionar Outra Conta',
         all_fields_required: 'Todos os campos são obrigatórios.',
         allow: 'Permitir',
         apply: 'Aplicar',
@@ -44,7 +44,6 @@ const pt = {
         change_password: 'Alterar Senha',
         change_ui_colors: 'Alterar Cores da Interface',
         change_username: 'Alterar Nome de Utilizador',
-        clock_visibility: 'Visibilidade do Relógio',
         close: 'Fechar',
         close_all_windows: 'Fechar Todas as Janelas',
         close_all_windows_confirm: 'Tem a certeza de que deseja fechar todas as janelas?',
@@ -86,10 +85,6 @@ const pt = {
         credits: 'Créditos',
         current_password: 'Password Atual',
         cut: 'Cortar',
-        clock: 'Relógio',
-        clock_visible_hide: 'Esconder - Sempre escondido',
-        clock_visible_show: 'Mostrar - Sempre visível',
-        clock_visible_auto: 'Auto - Por defeito, mostra apenas em modo full-screen',
         close_all: 'Fechar Todos',
         created: 'Criado',
         date_modified: 'Data alterada',

@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -55,8 +55,10 @@ window.gui = async (options) => {
     window.api_origin = options.api_origin ?? 'https://api.puter.com';
     window.max_item_name_length = options.max_item_name_length ?? 500;
     window.require_email_verification_to_publish_website = options.require_email_verification_to_publish_website ?? true;
-    window.disable_temp_users = options.disable_temp_users ?? false;
+    // window.disable_temp_users might be set somewhere else, so we need to check if it is already set and if not, use the value from the options
+    window.disable_temp_users = window.disable_temp_users || (options.disable_temp_users ?? false);
     window.co_isolation_enabled = options.co_isolation_enabled;
+    window.teams_ui = options.teams_ui ?? false;
 
     // DEV: Load the initgui.js file if we are in development mode
     if ( !window.gui_env || window.gui_env === 'dev' ) {
@@ -72,13 +74,23 @@ window.gui = async (options) => {
     // note: the order of the bundles is important
     // note: Build script will prepend `window.gui_env="prod"` to the top of the file
     else if ( window.gui_env === 'prod' ) {
-        await window.loadScript('https://js.puter.com/v2/');
+        // This stuff is now handled in the backend in PuterHomepageService
+
+        await window.loadScript(options.puterjs_bundle ?? 'https://js.puter.com/v2/');
         // Load the minified bundles
-        await window.loadCSS('/dist/bundle.min.css');
+        // await window.loadCSS('/dist/bundle.min.css');
     }
 
-    // Load Cloudflare Turnstile script
-    await window.loadScript('https://challenges.cloudflare.com/turnstile/v0/api.js', { defer: true });
+    // Load the captcha script alongside the GUI rather than ahead of it.
+    // Nothing during boot needs it — the challenge modal polls for the
+    // global and the signup form is opened long after — so awaiting it here
+    // only put a third-party round trip in front of every page load. Skipped
+    // entirely when no site key is configured, since every consumer gates on
+    // one.
+    if ( options.turnstileSiteKey ) {
+        window.loadScript('https://challenges.cloudflare.com/turnstile/v0/api.js', { defer: true })
+            .catch(error => console.debug('Captcha script unavailable:', error));
+    }
 
     // 🚀 Launch the GUI 🚀
     window.initgui(options);
@@ -152,7 +164,9 @@ window.loadCSS = async function (url) {
         document.head.appendChild(link);
     });
 };
-console.log("%c⚠️Warning⚠️\n%cPlease refrain from adding or pasting any sort of code here, as doing so could potentially compromise your account. \nYou don't get what you intended anyway, but the hacker will! \n\n%cFor further information please visit https://developer.chrome.com/blog/self-xss",
-                "color:red; font-size:2rem; display:block; margin-left:0; margin-bottom: 20px; background: black; width: 100%; margin-top:20px; font-family: 'Helvetica Neue', HelveticaNeue, Helvetica, Arial, sans-serif;",
-                "font-size:1rem; font-family: 'Helvetica Neue', HelveticaNeue, Helvetica, Arial, sans-serif;",
-                "font-size:0.9rem; font-family: 'Helvetica Neue', HelveticaNeue, Helvetica, Arial, sans-serif;");
+console.log(
+    "%c⚠️Warning⚠️\n%cPlease refrain from adding or pasting any sort of code here, as doing so could potentially compromise your account. \nYou don't get what you intended anyway, but the hacker will! \n\n%cFor further information please visit https://developer.chrome.com/blog/self-xss",
+    "color:red; font-size:2rem; display:block; margin-left:0; margin-bottom: 20px; background: black; width: 100%; margin-top:20px; font-family: 'Helvetica Neue', HelveticaNeue, Helvetica, Arial, sans-serif;",
+    "font-size:1rem; font-family: 'Helvetica Neue', HelveticaNeue, Helvetica, Arial, sans-serif;",
+    "font-size:0.9rem; font-family: 'Helvetica Neue', HelveticaNeue, Helvetica, Arial, sans-serif;",
+);

@@ -1,3 +1,4 @@
+/* global require, monaco, clarity */
 let editor;
 // on document load
 document.addEventListener('DOMContentLoaded', function () {
@@ -10,6 +11,7 @@ document.addEventListener('DOMContentLoaded', function () {
         editor = monaco.editor.create(editorElement, {
             language: 'html',
             fontFamily: 'monospace',
+            wordWrap: 'on',
             minimap: {
                 enabled: false,
             },
@@ -86,7 +88,6 @@ document.addEventListener('keydown', function (e) {
     }
 });
 
-var code = document.getElementById('code');
 var run = document.getElementById('run');
 run.addEventListener('click', function () {
     loadStringInIframe(editor.getValue());
@@ -193,6 +194,11 @@ document.addEventListener('click', function (e) {
     const sidebarItem = e.target.closest('.sidebar-item');
     if ( ! sidebarItem ) return;
 
+    // Collapse sidebar by default on mobile after clicking a link
+    if ( window.innerWidth <= 768 ) {
+        sidebarContainer.classList.add('collapsed');
+    }
+
     // Don't intercept if modifier keys are pressed
     if ( e.metaKey || e.ctrlKey || e.shiftKey || e.altKey ) return;
 
@@ -239,6 +245,13 @@ document.addEventListener('click', function (e) {
         const newTitle = doc.querySelector('title');
         if ( newTitle ) {
             document.title = newTitle.textContent;
+        }
+
+        // Update the playground page title in the header
+        const newPageTitle = doc.querySelector('.playground-page-title');
+        const currentPageTitle = document.querySelector('.playground-page-title');
+        if ( newPageTitle && currentPageTitle ) {
+            currentPageTitle.textContent = newPageTitle.textContent;
         }
 
         // Update meta description
@@ -336,7 +349,7 @@ document.addEventListener('click', function (e) {
 // Handle popstate (back/forward navigation) with reload
 window.addEventListener('popstate', function () {
     if ( window.history.state && window.history.state.reload ) {
-        window.location.href = window.location.href;
+        window.location.reload();
     }
 });
 

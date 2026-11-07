@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,9 +26,28 @@ const zhtw = {
         account: '帳戶',
         account_password: '驗證帳戶密碼',
         access_granted_to: '已授予存取權給',
-        add_existing_account: '新增現有帳戶',
+        add_app: '新增應用程式',
+        add_app_ai: '使用 AI 建立應用程式',
+        add_app_ai_desc: '描述您想要的應用程式，AI 會為您建立！',
+        add_app_browse: '尋找應用程式',
+        add_app_browse_desc: '瀏覽應用程式中心，安裝您需要的應用程式',
+        add_app_request: '提出應用程式需求',
+        add_app_request_c2a: '告訴我們您希望 Puter 提供哪種應用程式；您的需求會直接送交我們的團隊。',
+        add_app_request_desc: '告訴我們接下來該開發什麼',
+        add_app_request_failed: '無法送出您的需求，請再試一次。',
+        add_app_request_placeholder: '我希望 Puter 提供的應用程式是……',
+        add_app_request_sent: '謝謝，您的需求已送達我們的團隊。如果您的帳戶設有電子郵件，我們可能會透過該信箱與您聯絡。',
+        add_another_account: '新增其他帳戶',
+        add_to_desktop: '新增至桌面',
         all_fields_required: '所有欄位都是必填的。',
         allow: '允許',
+        app_group_default_name: '資料夾',
+        app_group_name_aria: '資料夾名稱',
+        app_group_open: '開啟',
+        app_group_remove_from_folder: '從資料夾移除',
+        app_group_rename: '重新命名',
+        app_group_tile_aria: '%%，內含 %% 個應用程式的資料夾',
+        app_group_ungroup: '解除群組',
         apply: '套用',
         ascending: '升序',
         associated_websites: '關聯的網站',
@@ -84,10 +103,6 @@ const zhtw = {
         credits: '製作群',
         current_password: '目前密碼',
         cut: '剪下',
-        clock: '時鐘',
-        clock_visible_hide: '隱藏 - 始終隱藏',
-        clock_visible_show: '顯示 - 始終可見',
-        clock_visible_auto: '自動 - 預設，僅在全螢幕模式下可見。',
         close_all: '全部關閉',
         created: '已建立',
         date_modified: '修改日期',
@@ -343,7 +358,6 @@ const zhtw = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         'change': '更改', // In English: "Change"
-        'clock_visibility': '時鐘可視性', // In English: "Clock Visibility"
         'reading': '正在讀取 %strong%', // In English: "Reading %strong%"
         'writing': '正在寫入 %strong%', // In English: "Writing %strong%"
         'unzipping': '正在解壓 %strong%', // In English: "Unzipping %strong%"

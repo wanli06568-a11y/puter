@@ -1,7 +1,7 @@
 ---
 title: puter.ui.showFontPicker()
 description: Presents a list of fonts for previewing and selecting.
-platforms: [apps]
+platforms: [ websites, apps]
 ---
 
 Presents the user with a list of fonts allowing them to preview and select a font.
@@ -17,10 +17,21 @@ puter.ui.showFontPicker(options)
 #### `defaultFont` (String)
 The default font to select when the font picker is opened.
 
+#### `options` (Object)
+An object with the following properties:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `defaultFont` | `String` | The font to select when the font picker is opened. The name is matched without regard to case. The `defaultValue` and `default` options are accepted as aliases. If more than one is given, `defaultValue` is used, then `defaultFont`, then `default`. |
+
+## Return value
+A `Promise` that resolves to an object with a `fontFamily` property holding the name of the selected font. If the user closes the picker without selecting a font, the promise resolves to `false` in a Puter app and to `null` on a website.
 
 ## Examples
 
-```html
+### Change the page font to the picked font
+
+```html;ui-show-font-picker
 <html>
 <body>
     <script src="https://js.puter.com/v2/"></script>
@@ -28,7 +39,9 @@ The default font to select when the font picker is opened.
 
     <script>
         puter.ui.showFontPicker().then((font)=>{
-            document.body.style.fontFamily = font.fontFamily;
+            if (font) {
+                document.body.style.fontFamily = font.fontFamily;
+            }
         })
     </script>
 </body>

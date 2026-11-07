@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -17,14 +17,27 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { concepts, AdvancedBase } from '@heyputer/putility';
 import TeePromise from './util/TeePromise.js';
+import AdvancedBase from './util/AdvancedBase.js';
 
-export class Service extends concepts.Service {
+const NOOP = async () => {
+};
+
+export class Service extends AdvancedBase {
     // TODO: Service todo items
     static TODO = [
         'consolidate with BaseService from backend',
     ];
+    async __on (id, args) {
+        const handler = this.__get_event_handler(id);
+
+        return await handler(id, ...args);
+    }
+    __get_event_handler (id) {
+        return this[`__on_${id}`]?.bind?.(this)
+            || this.constructor[`__on_${id}`]?.bind?.(this.constructor)
+            || NOOP;
+    }
     construct (o) {
         this.$puter = {};
         for ( const k in o ) this.$puter[k] = o[k];
@@ -149,15 +162,16 @@ export class PortalProcess extends Process {
         }
     }
 
-    send (channel, data, context) {
+    send (channel, data, { transfer = [] } = {}) {
         const target = this.references.iframe.contentWindow;
         target.postMessage({
             msg: 'messageToApp',
             appInstanceID: channel.returnAddress,
             targetAppInstanceID: this.uuid,
             contents: data,
+            transfer,
         // }, new URL(this.references.iframe.src).origin);
-        }, '*');
+        }, '*', transfer);
     }
 
     async handle_connection (connection, args) {

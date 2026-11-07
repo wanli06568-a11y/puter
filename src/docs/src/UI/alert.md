@@ -1,17 +1,20 @@
 ---
 title: puter.ui.alert()
 description: Displays an alert dialog by Puter.
-platforms: [apps]
+platforms: [ websites, apps]
 ---
 
-Displays an alert dialog by Puter. Puter improves upon the traditional browser alerts by providing more flexibility. For example, you can customize the buttons displayed.
+Displays a Puter alert dialog.
 
-`puter.ui.alert()` will block the parent window until user responds by pressing a button.
+Puter improves upon the traditional browser alerts by providing more flexibility. For example, you can customize the buttons displayed.
+
+The alert blocks the parent window until the user responds by pressing a button.
 
 ## Syntax
 ```js
 puter.ui.alert(message)
 puter.ui.alert(message, buttons)
+puter.ui.alert(message, buttons, options)
 ```
 
 ## Parameters
@@ -22,12 +25,23 @@ A string to be displayed in the alert dialog. If not set, the dialog will be emp
 #### `buttons` (optional)
 An array of objects that define the buttons to be displayed in the alert dialog. Each object must have a `label` property. The `value` property is optional. If it is not set, the `label` property will be used as the value. The `type` property is optional and can be set to `primary`, `success`, `info`, `warning`, or `danger`. If it is not set, the default type will be used.
 
+#### `options` (optional)
+A set of key/value pairs that configure the alert dialog.
 
-## Return value 
+| Option | Type | Description |
+|--------|------|-------------|
+| `type` | `String` | Visual style of the alert dialog. One of `primary`, `success`, `info`, `warning`, or `danger`. |
+| `icon` | `String` | Icon URL shown in the dialog body, used when `body_icon` is not set. |
+| `body_icon` | `String` | Icon URL shown in the dialog body. Takes precedence over `icon`. |
+
+
+## Return value
 A `Promise` that resolves to the value of the button pressed. If the `value` property of button is set it is returned, otherwise `label` property will be returned.
 
 ## Examples
-```html
+### Show an alert with three buttons
+
+```html;ui-alert
 <html>
 <body>
     <script src="https://js.puter.com/v2/"></script>

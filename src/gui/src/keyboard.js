@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -19,17 +19,18 @@
 
 import UIAlert from './UI/UIAlert.js';
 import UIWindowSearch from './UI/UIWindowSearch.js';
-import launch_app from './helpers/launch_app.js';
-import open_item from './helpers/open_item.js';
-import determine_active_container_parent from './helpers/determine_active_container_parent.js';
+import launch_app from './helpers/launchApp.js';
+import open_item from './helpers/openItem.js';
+import determine_active_container_parent from './helpers/determineActiveContainerParent.js';
 
 $(document).bind('keydown', async function (e) {
     const focused_el = document.activeElement;
     //-----------------------------------------------------------------------------
     // Search
-    // ctrl/command + f, will open UIWindowSearch
+    // ctrl/command + f, will open UIWindowSearch — but not while the dashboard
+    // is open, where ctrl/cmd + f should fall through to the browser's find.
     //-----------------------------------------------------------------------------
-    if ( (e.ctrlKey || e.metaKey) && e.which === 70 && !$(focused_el).is('input') && !$(focused_el).is('textarea') ) {
+    if ( (e.ctrlKey || e.metaKey) && e.which === 70 && !$(focused_el).is('input') && !$(focused_el).is('textarea') && $('.window-dashboard').length === 0 ) {
         e.preventDefault();
         e.stopPropagation();
         UIWindowSearch();
@@ -477,12 +478,17 @@ $(document).bind('keydown', async function (e) {
     //-----------------------------------------------------------------------
     if ( e.which === 27 ) {
         // close open context menus
+        const closedMenu = $('.context-menu').length > 0;
         $('.context-menu').remove();
 
         // close the Launch Popover if it's open
         $('.launch-popover').closest('.popover').fadeOut(200, function () {
             $('.launch-popover').closest('.popover').remove();
         });
+
+        // That Escape was the menu's; later handlers must not also act on it
+        // (clear a Files selection, close its preview).
+        if ( closedMenu ) e.stopImmediatePropagation();
     }
 });
 
@@ -541,16 +547,7 @@ $(document).bind('keydown', async function (e) {
                     const element = $selected_items[index];
                     await window.delete_item(element);
                 }
-                const trash = await puter.fs.stat({ path: window.trash_path, consistency: 'eventual' });
-                if ( window.socket ) {
-                    window.socket.emit('trash.is_empty', { is_empty: trash.is_empty });
-                }
-
-                if ( trash.is_empty ) {
-                    $('[data-app="trash"]').find('.taskbar-icon > img').attr('src', window.icons['trash.svg']);
-                    $(`.item[data-path="${html_encode(window.trash_path)}" i]`).find('.item-icon > img').attr('src', window.icons['trash.svg']);
-                    $(`.window[data-path="${html_encode(window.trash_path)}"]`).find('.window-head-icon').attr('src', window.icons['trash.svg']);
-                }
+                await window.refresh_trash_state();
             }
         }
         // regular delete?
@@ -797,15 +794,19 @@ $(document).bind('keyup keydown', async function (e) {
     if ( e.which === 13 && !$(focused_el).is('input') && !$(focused_el).is('textarea') && (Date.now() - window.last_enter_pressed_to_rename_ts) > 200
         // prevent firing twice, because this will be fired on both keyup and keydown
         && e.type === 'keydown' ) {
-        let $selected_items;
-
-        e.preventDefault();
-        e.stopPropagation();
+        // preventDefault only happens in the branch that actually handles
+        // the key: an unconditional preventDefault here would suppress the
+        // browser's native Enter activation of whatever is focused — a
+        // focused link or button (e.g. a dashboard sidebar item) must
+        // still receive its synthesized click when nothing below claims
+        // the key.
 
         // ---------------------------------------------
         // if this is a selected Launch menu item, open it
         // ---------------------------------------------
         if ( $('.launch-app-selected').length > 0 ) {
+            e.preventDefault();
+            e.stopPropagation();
             // close launch menu
             $('.launch-popover').fadeOut(200, function () {
                 launch_app({
@@ -822,6 +823,8 @@ $(document).bind('keyup keydown', async function (e) {
         // if this is a selected context menu item, open it
         // ---------------------------------------------
         else if ( $('.context-menu-active .context-menu-item-active').length > 0 && (e.which === 13) ) {
+            e.preventDefault();
+            e.stopPropagation();
             let selected_item = $('.context-menu-active .context-menu-item-active').get(0);
             $(selected_item).removeClass('context-menu-item-active');
             $(selected_item).addClass('context-menu-item-active-blurred');
@@ -838,19 +841,21 @@ $(document).bind('keyup keydown', async function (e) {
         // if this is a selected item, open it
         // ---------------------------------------------
         else if ( window.active_item_container ) {
-            $selected_items = $(window.active_item_container).find('.item-selected');
+            const $selected_items = $(window.active_item_container).find('.item-selected');
             if ( $selected_items.length > 0 ) {
+                e.preventDefault();
+                e.stopPropagation();
                 $selected_items.each(function () {
                     open_item({
                         item: this,
                         new_window: e.metaKey || e.ctrlKey,
                     });
                 });
+                return false;
             }
-            return false;
         }
-
-        return false;
+        // Nothing claimed the key — fall through so the browser's default
+        // Enter behavior still runs on the focused element.
     }
     //----------------------------------------------
     // Paste
@@ -870,8 +875,22 @@ $(document).bind('keyup keydown', async function (e) {
         if ( parent_container ) {
             target_el = parent_container;
             target_path = $(parent_container).attr('data-path');
+            // No path means this container isn't a filesystem view this
+            // handler can paste into — the dashboard's Files tab is one such
+            // (it has its own paste handler); pasting here anyway would
+            // double-move the clipboard, and reading .startsWith off the
+            // undefined path used to throw on every paste in dashboard mode.
+            if ( ! target_path )
+            {
+                return;
+            }
             // don't allow pasting in Trash
             if ( (target_path === window.trash_path || target_path.startsWith(`${window.trash_path }/`)) && window.clipboard_op !== 'move' )
+            {
+                return;
+            }
+            // ... or into the Shared view — a query, not a directory
+            if ( target_path === window.shared_path )
             {
                 return;
             }
@@ -891,7 +910,11 @@ $(document).bind('keyup keydown', async function (e) {
     // Undo
     // ctrl/command + z, will undo last action
     //-----------------------------------------------------------------------------
-    if ( (e.ctrlKey || e.metaKey) && e.which === 90 ) {
+    // Not in a text field, whose own undo is what the user means: the last
+    // file action could be an upload, which Undo deletes outright. Once per
+    // press: releasing Z with Ctrl/Cmd still held would undo a second action.
+    if ( (e.ctrlKey || e.metaKey) && e.which === 90 && e.type === 'keydown'
+        && ! $(focused_el).is('input, textarea, [contenteditable]') ) {
         window.undo_last_action();
         return false;
     }

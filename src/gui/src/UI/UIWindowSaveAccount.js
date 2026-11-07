@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -156,12 +156,14 @@ async function UIWindowSaveAccount (options) {
                     'Authorization': `Bearer ${window.auth_token}`,
                 },
                 success: async function (data) {
+                    // /save_account promotes the current session's user in place
+                    // and does not rotate the token, so keep the one we have.
+                    await window.update_auth_data(data.token ?? window.auth_token, data.user);
+                    // After the update, so listeners read the saved user.
                     window.dispatchEvent(new CustomEvent('account-saved', { detail: { data: data } }));
 
-                    window.update_auth_data(data.token, data.user);
-
                     //close this window
-                    if ( data.user.email_confirmation_required ) {
+                    if ( data.user.requires_email_confirmation && !data.user.email_confirmed ) {
                         let is_verified = await UIWindowEmailConfirmationRequired({
                             stay_on_top: true,
                             has_head: true,
@@ -178,7 +180,13 @@ async function UIWindowSaveAccount (options) {
                     $(el_window).find('input').prop('disabled', false);
                 },
                 error: function (err) {
-                    $(el_window).find('.signup-error-msg').html(html_encode(err.responseText));
+                    const errorText = err.responseText || '';
+                    let msg = errorText;
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        msg = errorJson.message || errorJson.error || errorText;
+                    } catch (_) { /* not JSON, use responseText */ }
+                    $(el_window).find('.signup-error-msg').html(html_encode(msg));
                     $(el_window).find('.signup-error-msg').fadeIn();
                     // re-enable 'Create Account' button
                     $(el_window).find('.signup-btn').prop('disabled', false);

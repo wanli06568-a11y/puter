@@ -25,6 +25,7 @@ import uglifyjs from 'uglify-js';
 import { lib_paths, css_paths, js_paths } from './src/static-assets.js';
 import { fileURLToPath } from 'url';
 import BaseConfig from './webpack/BaseConfig.cjs';
+import { copyPdfThumbnailAssets } from './tools/copyPdfThumbnailAssets.js';
 
 // Polyfill __dirname, which doesn't exist in modules mode
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -59,6 +60,7 @@ async function build (options) {
         fs.rmSync(path.join(__dirname, 'dist'), { recursive: true });
     }
     fs.mkdirSync(path.join(__dirname, 'dist'));
+    await copyPdfThumbnailAssets(path.join(__dirname, 'dist'));
 
     // -----------------------------------------------
     // Concat/merge the JS libraries and save them to ./dist/libs.js
@@ -152,18 +154,13 @@ async function build (options) {
         },
     };
     console.log('webpack opts', webpack_opts);
-    await webpack(webpack_opts, (err, stats) => {
-        if ( err ) {
-            throw err;
-            // console.error(err);
-            // return;
-        }
-        //if(options?.verbose)
-        console.log(stats.toString());
-        // write to ./dist/bundle.min.js
-        // fs.writeFileSync(path.join(__dirname, 'dist', 'bundle.min.js'), fs.readFileSync(path.join(__dirname, 'dist', 'main.js')));
-        // remove ./dist/main.js
-        // fs.unlinkSync(path.join(__dirname, 'dist', 'main.js'));
+    await new Promise((resolve, reject) => {
+        webpack(webpack_opts, (err, stats) => {
+            if ( err ) return reject(err);
+            console.log(stats.toString());
+            if ( stats.hasErrors() ) return reject(new Error('webpack build failed'));
+            resolve();
+        });
     });
 
     // Copy index.js to dist/gui.js
@@ -179,6 +176,7 @@ async function build (options) {
         'manifest.json',
         'favicon.ico',
         'security.txt',
+        'sw.js',
     ];
 
     const recursive_copy = (src, dest) => {
@@ -209,6 +207,8 @@ async function build (options) {
  * @param {Object} options - The configuration options for the GUI.
  * @param {string} options.env - The environment in which the GUI is running (e.g., "dev" or "prod").
  * @param {string} options.api_origin - The origin of the API server.
+ * @param {string} options.gui_origin - The origin the GUI is served from.
+ * @param {string} options.app_domain - The domain apps and hosted sites live under (e.g., "puter.com").
  * @param {string} options.title - The title of the GUI.
  * @param {string} options.company - The name of the company or organization.
  * @param {string} options.description - The description of the GUI.
@@ -247,10 +247,14 @@ function generateDevHtml (options) {
     // facebook domain verification
     h += '<meta name="facebook-domain-verification" content="e29w3hjbnnnypf4kzk2cewcdaxym1y" />';
     // canonical url
-    h += `<link rel="canonical" href="${options.origin}">`;
+    h += `<link rel="canonical" href="${options.origin ?? options.gui_origin}">`;
 
+    // PROD: bundled stylesheet
+    if ( options.env === 'prod' ) {
+        h += '<link rel="stylesheet" href="/dist/bundle.min.css">';
+    }
     // DEV: load every CSS file individually
-    if ( options.env === 'dev' ) {
+    else if ( options.env === 'dev' ) {
         for ( let i = 0; i < css_paths.length; i++ ) {
             h += `<link rel="stylesheet" href="${css_paths[i]}">`;
         }
@@ -293,6 +297,26 @@ function generateDevHtml (options) {
 
     // preload images when applicable
     h += '<link rel="preload" as="image" href="./images/wallpaper.webp">';
+
+    // service-script hook: initgui resolves this promise during boot, so the
+    // shim must exist before the bundle runs (same shim the backend injects).
+    h += `
+    <script>
+        if ( ! window.service_script ) {
+            window.service_script_api_promise = (() => {
+                let resolve, reject;
+                const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+                promise.resolve = resolve;
+                promise.reject = reject;
+                return promise;
+            })();
+            window.service_script = async fn => {
+                try { await fn(await window.service_script_api_promise); }
+                catch (e) { console.error('service_script(ERROR)', e); }
+            };
+        }
+    </script>`;
+
     h += '</head>';
 
     h += '<body>';
@@ -336,9 +360,12 @@ function generateDevHtml (options) {
         h += '</script>';
     }
 
-    // PROD: gui.js
+    // PROD: the self-contained webpack bundle (includes the gui() bootstrap).
+    // `window.gui_env` must be set before gui() runs — it selects which
+    // puter.js build gets loaded.
     if ( options.env === 'prod' ) {
-        h += '<script src="/dist/gui.js"></script>';
+        h += '<script>window.gui_env = "prod";</script>';
+        h += '<script src="/dist/bundle.min.js"></script>';
     }
     // DEV: load every JS file individually
     else {
@@ -352,10 +379,21 @@ function generateDevHtml (options) {
     // ----------------------------------------
     // Initialize GUI with config options
     // ----------------------------------------
+    const guiParams = {
+        env: options.env,
+        api_origin: options.api_origin,
+        gui_origin: options.gui_origin,
+        app_origin: options.gui_origin,
+        app_domain: options.app_domain,
+        title: options.title,
+        max_item_name_length: options.max_item_name_length,
+        require_email_verification_to_publish_website: options.require_email_verification_to_publish_website,
+    };
+    const guiParamsJson = JSON.stringify(guiParams).replace(/</g, '\\u003c');
     h += `
         <script type="text/javascript">
         window.addEventListener('load', function() {`;
-    h += 'gui()';
+    h += `gui(${guiParamsJson})`;
     h += `});
         </script>`;
 

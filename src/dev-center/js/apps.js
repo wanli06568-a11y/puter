@@ -191,6 +191,9 @@ async function create_app (title, source_path = null, items = null) {
         maximizeOnStart: false,
         background: false,
         dedupeName: true,
+        // New apps accept user feedback by default; developers can turn this
+        // off in the app's settings (the "User Feedback" toggle).
+        feedbackEnabled: true,
         metadata: {
             window_resizable: true,
             fullpage_on_landing: true,
@@ -510,6 +513,12 @@ function generate_edit_app_section (app) {
 
                 <h3 style="font-size: 23px; border-bottom: 1px solid #EEE; margin-top: 50px; margin-bottom: 0px;">Misc</h3>
                 <div style="margin-top:30px;">
+                    <input type="checkbox" id="edit-app-user-feedback" name="edit-app-user-feedback" value="true" ${app.feedback_enabled ? 'checked' : ''}>
+                    <label for="edit-app-user-feedback" style="display: inline;">User Feedback</label>
+                    <p>When enabled, users can send you feedback about this app from within Puter. Feedback is delivered to your account's email address.</p>
+                </div>
+
+                <div style="margin-top:30px;">
                     <input type="checkbox" id="edit-app-locked" name="edit-app-locked" value="true" ${app.metadata?.locked ? 'checked' : ''}>
                     <label for="edit-app-locked" style="display: inline;">Delete Protection${lock_svg}</label>
                     <p>When enabled, the app cannot be deleted. This is useful for preventing accidental deletion of important apps.</p>
@@ -545,6 +554,7 @@ function generate_edit_app_section (app) {
                 <div class="analytics-card" id="analytics-users">
                     <h3 style="margin-top:0;">Users</h3>
                     <div class="count" style="font-size: 35px;"></div>
+                    <div class="view-app-users-btn" style="margin-top:10px; cursor:pointer; color:var(--primary-color, #3f51b5); font-size:13px;">View Users</div>
                 </div>
                 <div class="analytics-card" id="analytics-opens">
                     <h3 style="margin-top:0;">Opens</h3>
@@ -585,6 +595,7 @@ function trackOriginalValues () {
             locked: $('#edit-app-locked').is(':checked'),
             fullPageOnLanding: $('#edit-app-fullpage-on-landing').is(':checked'),
             setTitleToFile: $('#edit-app-set-title-to-file').is(':checked'),
+            userFeedback: $('#edit-app-user-feedback').is(':checked'),
         },
     };
 }
@@ -625,7 +636,8 @@ function hasChanges () {
         $('#edit-app-hide-titlebar').is(':checked') !== originalValues.checkboxes.hideTitleBar ||
         $('#edit-app-locked').is(':checked') !== originalValues.checkboxes.locked ||
         $('#edit-app-fullpage-on-landing').is(':checked') !== originalValues.checkboxes.fullPageOnLanding ||
-        $('#edit-app-set-title-to-file').is(':checked') !== originalValues.checkboxes.setTitleToFile
+        $('#edit-app-set-title-to-file').is(':checked') !== originalValues.checkboxes.setTitleToFile ||
+        $('#edit-app-user-feedback').is(':checked') !== originalValues.checkboxes.userFeedback
     );
 }
 
@@ -673,6 +685,7 @@ function resetToOriginalValues () {
     $('#edit-app-locked').prop('checked', originalValues.checkboxes.locked);
     $('#edit-app-fullpage-on-landing').prop('checked', originalValues.checkboxes.fullPageOnLanding);
     $('#edit-app-set-title-to-file').prop('checked', originalValues.checkboxes.setTitleToFile);
+    $('#edit-app-user-feedback').prop('checked', originalValues.checkboxes.userFeedback);
 
     if ( originalValues.icon ) {
         $('#edit-app-icon').css('background-image', `url(${originalValues.icon})`);
@@ -908,6 +921,7 @@ async function edit_app_section (cur_app_name, tab = 'deploy') {
                             {
                                 rootItems = `${children[0].name}, ${children[1].name}, and ${children.length - 2} more item${children.length - 2 > 1 ? 's' : ''}`;
                             }
+                            rootItems = html_encode(rootItems);
 
                             $('.drop-area').removeClass('drop-area-hover');
                             $('.drop-area').addClass('drop-area-ready-to-deploy');
@@ -1283,6 +1297,7 @@ async function saveEditedApp (mode) {
         description: description,
         maximizeOnStart: $('#edit-app-maximize-on-start').is(':checked'),
         background: $('#edit-app-background').is(':checked'),
+        feedbackEnabled: $('#edit-app-user-feedback').is(':checked'),
         metadata: {
             fullpage_on_landing: $('#edit-app-fullpage-on-landing').is(':checked'),
             social_image: socialImageUrl,
@@ -1377,7 +1392,7 @@ $(document).on('click', '.delete-app-settings', async function (e) {
     const app_data = await puter.apps.get(app_name, { icon_size: 16 });
 
     if ( app_data.metadata?.locked ) {
-        puter.ui.alert(`<strong>${app_data.title}</strong> is locked and cannot be deleted.`, [
+        puter.ui.alert(`<strong>${html_encode(app_data.title)}</strong> is locked and cannot be deleted.`, [
             {
                 label: 'Ok',
             },
@@ -1567,7 +1582,7 @@ function generate_app_card (app) {
       background-position: center;
       background-repeat: no-repeat;
       background-size: 92%;
-      background-image: url(${app.icon === null ? './img/app.svg' : app.icon});
+      background-image: url(${html_encode(app.icon === null ? './img/app.svg' : app.icon)});
       width: 60px;
       height: 60px;
       margin-right: 10px;
@@ -1879,14 +1894,13 @@ window.deploy = async function (app, items) {
         console.log(err);
     }
 
-    // --------------------------------------------------------------------
-    // Delete existing hostnames attached to this app directory if they exist
-    // --------------------------------------------------------------------
-    if ( current_app_dir?.subdomains.length > 0 ) {
-        for ( let subdomain of current_app_dir?.subdomains ) {
+    // Old hostnames are deleted only once the app points at the new one, so a
+    // deploy that dies midway never leaves the app on an unregistered name.
+    const deleteOldHostnames = () => {
+        for ( let subdomain of current_app_dir?.subdomains ?? [] ) {
             puter.hosting.delete(subdomain.subdomain);
         }
-    }
+    };
 
     // --------------------------------------------------------------------
     // Delete existing app directory
@@ -1957,7 +1971,7 @@ window.deploy = async function (app, items) {
         // --------------------------------------------------------------------
         puter.hosting.create(hostname, appdata_dir.path).then(async (res) => {
             // TODO this endpoint needs to be able to update only the specified fields
-            puter.apps.update(currently_editing_app.name, {
+            await puter.apps.update(currently_editing_app.name, {
                 indexURL: `${protocol}://${hostname}.${static_hosting_domain}`,
                 title: currently_editing_app.title,
                 name: currently_editing_app.name,
@@ -1967,6 +1981,7 @@ window.deploy = async function (app, items) {
                 background: currently_editing_app.background,
                 filetypeAssociations: currently_editing_app.filetype_associations,
             });
+            deleteOldHostnames();
             // set the 'Index URL' field for the 'Settings' tab
             $('#edit-app-index-url').val(`${protocol}://${hostname}.${static_hosting_domain}`);
             // show success message
@@ -2005,7 +2020,7 @@ window.deploy = async function (app, items) {
         // --------------------------------------------------------------------
         puter.hosting.create(hostname, appdata_dir.path).then(async (res) => {
             // TODO this endpoint needs to be able to update only the specified fields
-            puter.apps.update(currently_editing_app.name, {
+            await puter.apps.update(currently_editing_app.name, {
                 indexURL: `${protocol}://${hostname}.${static_hosting_domain}`,
                 title: currently_editing_app.title,
                 name: currently_editing_app.name,
@@ -2015,6 +2030,7 @@ window.deploy = async function (app, items) {
                 background: currently_editing_app.background,
                 filetypeAssociations: currently_editing_app.filetype_associations,
             });
+            deleteOldHostnames();
             // set the 'Index URL' field for the 'Settings' tab
             $('#edit-app-index-url').val(`${protocol}://${hostname}.${static_hosting_domain}`);
             // show success message
@@ -2048,7 +2064,7 @@ window.deploy = async function (app, items) {
             // ----------------------------------------
             puter.hosting.create(hostname, appdata_dir.path).then(async (res) => {
                 // TODO this endpoint needs to be able to update only the specified fields
-                puter.apps.update(currently_editing_app.name, {
+                await puter.apps.update(currently_editing_app.name, {
                     indexURL: `${protocol}://${hostname}.${static_hosting_domain}`,
                     title: currently_editing_app.title,
                     name: currently_editing_app.name,
@@ -2058,6 +2074,7 @@ window.deploy = async function (app, items) {
                     background: currently_editing_app.background,
                     filetypeAssociations: currently_editing_app.filetype_associations,
                 });
+                deleteOldHostnames();
                 // set the 'Index URL' field for the 'Settings' tab
                 $('#edit-app-index-url').val(`${protocol}://${hostname}.${static_hosting_domain}`);
                 // show success message
@@ -2456,7 +2473,7 @@ $(document).on('click', '.delete-apps-btn', async function (e) {
 
             if ( app_data.metadata?.locked ) {
                 if ( apps.length === 1 ) {
-                    puter.ui.alert(`<strong>${app_data.title}</strong> is locked and cannot be deleted.`, [
+                    puter.ui.alert(`<strong>${html_encode(app_data.title)}</strong> is locked and cannot be deleted.`, [
                         {
                             label: 'Ok',
                         },
@@ -2467,7 +2484,7 @@ $(document).on('click', '.delete-apps-btn', async function (e) {
                     break;
                 }
 
-                let resp = await puter.ui.alert(`<strong>${app_data.title}</strong> is locked and cannot be deleted.`, [
+                let resp = await puter.ui.alert(`<strong>${html_encode(app_data.title)}</strong> is locked and cannot be deleted.`, [
                     {
                         label: 'Skip and Continue',
                         value: 'Continue',
@@ -3030,6 +3047,82 @@ async function render_analytics (period) {
 
     puter.ui.hideSpinner();
 }
+// ── App Users modal ──────────────────────────────────────────────
+let app_users_state = null; // { app, offset, pageSize, done }
+
+async function open_app_users_modal (app) {
+    app_users_state = { app, offset: 0, pageSize: 50, done: false };
+    $('.app-users-modal-app-name').text(app.title || app.name);
+    $('#app-users-table > tbody').empty();
+    $('.app-users-empty-notice').hide();
+    $('.app-users-load-more-btn').hide();
+    $('.app-users-modal').get(0).showModal();
+    await load_more_app_users();
+}
+
+function render_app_user_row (user) {
+    const emailCell = Object.prototype.hasOwnProperty.call(user, 'user_email')
+        ? html_encode(user.user_email)
+        : '<span style="color:#aaa;">Not shared</span>';
+    return `<tr>
+        <td>${html_encode(user.user)}</td>
+        <td>${emailCell}</td>
+    </tr>`;
+}
+
+async function load_more_app_users () {
+    if ( !app_users_state || app_users_state.done ) return;
+
+    $('.app-users-loading-notice').show();
+    $('.app-users-load-more-btn').hide();
+
+    try {
+        const app = await puter.apps.get(app_users_state.app.name);
+        const users = await app.getUsers({
+            limit: app_users_state.pageSize,
+            offset: app_users_state.offset,
+        });
+
+        if ( !users || users.length === 0 ) {
+            app_users_state.done = true;
+            if ( app_users_state.offset === 0 ) {
+                $('.app-users-empty-notice').show();
+            }
+            return;
+        }
+
+        users.forEach(user => {
+            $('#app-users-table > tbody').append(render_app_user_row(user));
+        });
+
+        app_users_state.offset += users.length;
+        if ( users.length < app_users_state.pageSize ) {
+            app_users_state.done = true;
+        } else {
+            $('.app-users-load-more-btn').show();
+        }
+    } catch (e) {
+        console.error('Failed to load app users', e);
+        $('.app-users-empty-notice').text('Failed to load users.').show();
+    } finally {
+        $('.app-users-loading-notice').hide();
+    }
+}
+
+$(document).on('click', '.view-app-users-btn', async function (e) {
+    if ( !currently_editing_app ) return;
+    await open_app_users_modal(currently_editing_app);
+});
+
+$(document).on('click', '.app-users-load-more-btn', async function (e) {
+    await load_more_app_users();
+});
+
+$(document).on('click', '.app-users-cancel', function (e) {
+    $('.app-users-modal').get(0).close();
+    app_users_state = null;
+});
+// added the logic to open the analytics section when clicking on the stats cell in the app card
 
 $(document).on('click', '.stats-cell', function (e) {
     edit_app_section($(this).attr('data-app-name'), 'analytics');
@@ -3065,7 +3158,7 @@ function app_context_menu (app_name, app_title, app_uid) {
                                         overwrite: false,
                                         appUID: app_uid,
                                     }).then(async (uploaded) => {
-                        puter.ui.alert(`<strong>${app_title}</strong> shortcut has been added to your desktop.`, [
+                        puter.ui.alert(`<strong>${html_encode(app_title)}</strong> shortcut has been added to your desktop.`, [
                             {
                                 label: 'Ok',
                                 type: 'primary',
@@ -3105,7 +3198,7 @@ async function attempt_delete_app (app_name, app_title, app_uid) {
     const app_data = await puter.apps.get(app_name, { icon_size: 16 });
 
     if ( app_data.metadata?.locked ) {
-        puter.ui.alert(`<strong>${app_data.title}</strong> is locked and cannot be deleted.`, [
+        puter.ui.alert(`<strong>${html_encode(app_data.title)}</strong> is locked and cannot be deleted.`, [
             {
                 label: 'Ok',
             },

@@ -4,7 +4,9 @@ description: Get information on a subdomain hosted on Puter.
 platforms: [websites, apps, nodejs, workers]
 ---
 
-Returns a subdomain. If the subdomain does not exist, the promise will be rejected with an error.
+Returns a subdomain.
+
+If the subdomain does not exist, the promise will be rejected with an error.
 
 ## Syntax
 
@@ -17,11 +19,15 @@ puter.hosting.get(subdomain)
 A string containing the name of the subdomain you want to retrieve.
 
 ## Return value
-A `Promise` that will resolve to a [`Subdomain`](/Objects/subdomain/) object when the subdomain has been retrieved. If a subdomain with the given name does not exist, the promise will be rejected with an error.
+A `Promise` that will resolve to a [`Subdomain`](/Objects/subdomain/) object when the subdomain has been retrieved.
+
+## Errors
+
+If a subdomain with the given name does not exist, the promise will be rejected with an error.
 
 ## Examples
 
-<strong class="example-title">Get a subdomain</strong>
+### Get a subdomain
 
 ```html;hosting-get
 <html>
@@ -31,7 +37,7 @@ A `Promise` that will resolve to a [`Subdomain`](/Objects/subdomain/) object whe
         (async () => {
             // (1) Create a random website
             let subdomain = puter.randName();
-            const site = await puter.hosting.create(subdomain)
+            const site = await puter.hosting.create(subdomain, '.')
             puter.print(`Website hosted at: ${site.subdomain}.puter.site (This is an empty website with no files)<br>`);
 
             // (2) Retrieve the website using get()

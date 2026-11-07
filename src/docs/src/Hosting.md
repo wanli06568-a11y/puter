@@ -3,9 +3,9 @@ title: Hosting
 description: Deploy and manage websites on Puter.
 ---
 
-The Puter.js Hosting API enables you to deploy and manage websites on Puter's infrastructure programmatically.
+The Puter.js Hosting API enables you to host files on the internet and manage your hosting programmatically.
 
-The API provides comprehensive hosting management features including creating, retrieving, listing, updating, and deleting deployments. With these capabilities, you can build powerful applications, such as website builders, static site generators, or deployment tools that require programmatic control over hosting infrastructure.
+The API provides comprehensive hosting management features including creating, retrieving, listing, updating, and deleting hostings. It is mainly used to expose files to the internet, where users can get their content from a public URL and additionally with these capabilities, you can host many applications, such as website builders, static site generators, or deployment tools that require programmatic control over hosting infrastructure.
 
 ## Features
 
@@ -63,9 +63,9 @@ The API provides comprehensive hosting management features including creating, r
             let site_3 = puter.randName();
 
             // (2) Create 3 empty websites with the subdomains we generated
-            await puter.hosting.create(site_1);
-            await puter.hosting.create(site_2);
-            await puter.hosting.create(site_3);
+            await puter.hosting.create(site_1, '.');
+            await puter.hosting.create(site_2, '.');
+            await puter.hosting.create(site_3, '.');
 
             // (3) Get all subdomains
             let sites = await puter.hosting.list();
@@ -97,11 +97,11 @@ The API provides comprehensive hosting management features including creating, r
         (async () => {
             // (1) Create a random website
             let subdomain = puter.randName();
-            const site = await puter.hosting.create(subdomain)
+            const site = await puter.hosting.create(subdomain, '.')
             puter.print(`Website hosted at: ${site.subdomain}.puter.site (This is an empty website with no files)<br>`);
 
             // (2) Delete the website using delete()
-            const site2 = await puter.hosting.delete(site.subdomain);
+            await puter.hosting.delete(site.subdomain);
             puter.print('Website deleted<br>');
 
             // (3) Try to retrieve the website (should fail)
@@ -131,7 +131,7 @@ The API provides comprehensive hosting management features including creating, r
         (async () => {
             // (1) Create a random website
             let subdomain = puter.randName();
-            const site = await puter.hosting.create(subdomain)
+            const site = await puter.hosting.create(subdomain, '.')
             puter.print(`Website hosted at: ${site.subdomain}.puter.site<br>`);
 
             // (2) Create a random directory
@@ -144,7 +144,7 @@ The API provides comprehensive hosting management features including creating, r
             puter.print(`Changed subdomain's root directory to "${dir.path}"<br>`);
 
             // (4) Delete the app (cleanup)
-            await puter.hosting.delete(updatedSite.subdomain)
+            await puter.hosting.delete(subdomain)
         })();
     </script>
 </body>
@@ -165,7 +165,7 @@ The API provides comprehensive hosting management features including creating, r
         (async () => {
             // (1) Create a random website
             let subdomain = puter.randName();
-            const site = await puter.hosting.create(subdomain)
+            const site = await puter.hosting.create(subdomain, '.')
             puter.print(`Website hosted at: ${site.subdomain}.puter.site (This is an empty website with no files)<br>`);
 
             // (2) Retrieve the website using get()
@@ -188,9 +188,10 @@ These hosting features are supported out of the box when using Puter.js:
 
 - **[`puter.hosting.create()`](/Hosting/create/)** - Create a new hosting deployment
 - **[`puter.hosting.list()`](/Hosting/list/)** - List all hosting deployments
-- **[`puter.hosting.delete()`](/Hosting/delete/)** - Delete a hosting deployment
-- **[`puter.hosting.update()`](/Hosting/update/)** - Update hosting settings
 - **[`puter.hosting.get()`](/Hosting/get/)** - Get information about a specific deployment
+- **[`puter.hosting.update()`](/Hosting/update/)** - Update hosting settings
+- **[`puter.hosting.delete()`](/Hosting/delete/)** - Delete a hosting deployment
+- **[`puter.hosting.attach()`](/Hosting/attach/)** - Let the user connect their own domain to a website
 
 ## Examples
 

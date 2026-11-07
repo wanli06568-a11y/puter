@@ -1,10 +1,12 @@
 ---
 title: puter.fs.getReadURL()
-description: Generate a temporary URL to read a file in Puter file system.
+description: Generate a temporary URL that lets anyone read one file from the user's own Puter file system.
 platforms: [websites, apps, nodejs, workers]
 ---
 
 Generates a URL that can be used to read a file.
+
+To stop it from working before it expires, revoke it with [`revokeReadURL()`](/FS/revokeReadURL/).
 
 ## Syntax
 
@@ -19,15 +21,17 @@ puter.fs.getReadURL(path, expiresIn)
 
 The path to the file to read.
 
-#### `expiresIn` (Number) (Optional)
+#### `expiresIn` (String | Number) (Optional)
 
-The number of seconds until the URL expires. If not provided, the URL will expire in 24 hours.
+How long the URL stays valid, in [jsonwebtoken](https://github.com/auth0/node-jsonwebtoken#usage) duration format: a string like `'24h'`, `'30d'`, or `'1h'` (units: `s`, `m`, `h`, `d`, `w`, `y`), or a number of seconds. If not provided, defaults to `'24h'`.
 
 ## Return value
 
 A promise that resolves to a URL string that can be used to read the file.
 
-## Example
+## Examples
+
+### Get a read URL for a file
 
 ```javascript
 const url = await puter.fs.getReadURL("~/myfile.txt");

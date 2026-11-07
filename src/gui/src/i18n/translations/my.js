@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -33,7 +33,7 @@ const my = {
         account: 'Akaun',
         account_password: 'Sahkan Kata Laluan Akaun',
         access_granted_to: 'Akses Diberikan Kepada',
-        add_existing_account: 'Tambah Akaun Sedia Ada',
+        add_another_account: 'Tambah Akaun Lain',
         all_fields_required: 'Semua medan diperlukan.',
         allow: 'Benarkan',
         apply: 'Tetapkan',
@@ -51,7 +51,6 @@ const my = {
         change_password: 'Tukar Kata Laluan',
         change_ui_colors: 'Tukar Warna UI',
         change_username: 'Tukar Nama Pengguna',
-        clock_visibility: 'Keterlihatan Jam',
         close: 'Tutup',
         close_all_windows: 'Tutup Semua Tetingkap',
         close_all_windows_confirm: 'Adakah anda yakin mahu menutup semua tetingkap?',
@@ -105,10 +104,6 @@ const my = {
         credits: 'Kredit',
         current_password: 'Kata Laluan Terkini',
         cut: 'Potong',
-        clock: 'Jam',
-        clock_visible_hide: 'Sorok - Sentiasa tersembunyi',
-        clock_visible_show: 'Tunjuk - Sentiasa dilihat',
-        clock_visible_auto: 'Auto - Default, dilihat dalam mod skrin penuh sahaja.',
         close_all: 'Tutup Semua',
         created: 'Dibuat',
         date_modified: 'Tarikh diubah suai',

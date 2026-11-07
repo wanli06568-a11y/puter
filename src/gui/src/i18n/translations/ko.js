@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const ko = {
         account: '계정',
         account_password: '계정 비밀번호 확인',
         access_granted_to: '접근 권한',
-        add_existing_account: '기존 계정 추가',
+        add_another_account: '다른 계정 추가',
         all_fields_required: '모든 항목을 입력하세요.',
         allow: '허용',
         apply: '적용',
@@ -93,11 +93,6 @@ const ko = {
         credits: '크레딧',
         current_password: '현재 비밀번호',
         cut: '잘라내기',
-        clock: '시계',
-        clock_visibility: '시계 표시 설정',
-        clock_visible_hide: '숨기기 - 항상 숨김',
-        clock_visible_show: '표시 - 항상 표시',
-        clock_visible_auto: '자동 - 기본값, 전체 화면 모드에서만 표시',
         close_all: '전부 닫기',
         created: '생성일',
         date_modified: '수정일',

@@ -9,6 +9,7 @@ Sets the X position of the window.
 ## Syntax
 ```js
 puter.ui.setWindowX(x)
+puter.ui.setWindowX(x, window_id)
 ```
 
 ## Parameters
@@ -16,8 +17,13 @@ puter.ui.setWindowX(x)
 #### `x` (Float) (Required)
 The new x position for this window.
 
+#### `window_id` (optional)
+Targets a specific window other than the app's main window. Accepts either a window id string or a window handle returned by [`puter.ui.createWindow()`](/UI/createWindow/) (an object with an `id` property). When omitted, the app's main window is used.
+
 
 ## Examples
+
+### Set the window's horizontal position
 
 ```html
 <html>

@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -23,18 +23,26 @@ import UIAlert from './UIAlert.js';
 function UIWindowEmailConfirmationRequired (options) {
     return new Promise(async (resolve) => {
         options = options ?? {};
+        options.window_options = options.window_options ?? {};
         let final_code = '';
         let is_checking_code = false;
 
         const submit_btn_txt = 'Confirm Email';
 
         let h = '';
-        h += '<div class="qr-code-window-close-btn generic-close-window-button"> &times; </div>';
-        h += '<div style="-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; color: #3e5362;">';
+        if(options.show_close_button !== false) {
+            h += '<div class="qr-code-window-close-btn generic-close-window-button"> &times; </div>';
+        }
+        h += '<div style="-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; color: #3e5362; max-width: 350px; margin: 0 auto;">';
         h += `<img src="${html_encode(window.icons['mail.svg'])}" style="display:block; margin:10px auto 10px;">`;
         h += `<h3 style="text-align:center; font-weight: 500; font-size: 20px;">${i18n('confirm_your_email_address')}</h3>`;
         h += '<form>';
-        h += `<p style="text-align:center; padding: 0 20px;">To continue, please enter the 6-digit confirmation code sent to <strong style="font-weight: 500;">${window.user.email}</strong></p>`;
+        // Opens at boot before the profile has loaded, and an address we do not
+        // have yet is no reason to fail to ask for the code.
+        const sent_to = window.user?.email
+            ? `${i18n('email_code_sent_to')} <strong style="font-weight: 500;">${html_encode(window.user.email)}</strong>`
+            : i18n('email_code_sent_to_your_address');
+        h += `<p style="text-align:center; padding: 0 20px;">${sent_to}</p>`;
         h += '<div class="error"></div>';
         h += `  <fieldset name="number-code" style="border: none; padding:0;" data-number-code-form>
                 <input class="digit-input" type="number" min='0' max='9' name='number-code-0' data-number-code-input='0' required />
@@ -73,8 +81,10 @@ function UIWindowEmailConfirmationRequired (options) {
             allow_native_ctxmenu: true,
             allow_user_select: true,
             backdrop: true,
+            close_on_backdrop_click: false,
             width: 390,
             dominant: true,
+            ...options.window_options,
             onAppend: function (el_window) {
                 $(el_window).find('.digit-input').first().focus();
             },
@@ -125,9 +135,9 @@ function UIWindowEmailConfirmationRequired (options) {
                         'Authorization': `Bearer ${window.auth_token}`,
                     },
                     statusCode: {
-                        401: function () {
-                            window.logout();
-                        },
+                        401: function (xhr) {
+                        window.handle401(xhr);
+                    },
                     },
                     success: function (res) {
                         if ( res.email_confirmed ) {
@@ -171,8 +181,8 @@ function UIWindowEmailConfirmationRequired (options) {
                     'Authorization': `Bearer ${window.auth_token}`,
                 },
                 statusCode: {
-                    401: function () {
-                        window.logout();
+                    401: function (xhr) {
+                        window.handle401(xhr);
                     },
                 },
                 success: async function (res) {

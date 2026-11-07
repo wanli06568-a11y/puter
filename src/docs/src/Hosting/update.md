@@ -4,13 +4,12 @@ description: Update a subdomain to point to a new directory.
 platforms: [websites, apps, nodejs, workers]
 ---
 
-Updates a subdomain to point to a new directory. If directory is not specified, the subdomain will be disconnected from its directory.
+Updates a subdomain to point to a new directory.
 
 ## Syntax
 
 ```js
 puter.hosting.update(subdomain, dirPath)
-puter.hosting.update(subdomain)
 ```
 
 ## Parameters
@@ -19,17 +18,21 @@ puter.hosting.update(subdomain)
 
 A string containing the name of the subdomain you want to update.
 
-#### `dirPath` (String) (optional)
+#### `dirPath` (String) (required)
 
-A string containing the path to the directory you want to serve. If not specified, the subdomain will be disconnected from its directory.
+A string containing the path to the directory you want to serve.
 
 ## Return value
 
-A `Promise` that will resolve to a [`Subdomain`](/Objects/subdomain/) object when the subdomain has been updated. If a subdomain with the given name does not exist, the promise will be rejected with an error. If the path does not exist, the promise will be rejected with an error.
+A `Promise` that will resolve to a [`Subdomain`](/Objects/subdomain/) object when the subdomain has been updated.
+
+## Errors
+
+If a subdomain with the given name does not exist, the promise will be rejected with an error. If the path does not exist, the promise will be rejected with an error.
 
 ## Examples
 
-<strong class="example-title">Update a subdomain to point to a new directory</strong>
+### Update a subdomain to point to a new directory
 
 ```html;hosting-update
 <html>
@@ -39,7 +42,7 @@ A `Promise` that will resolve to a [`Subdomain`](/Objects/subdomain/) object whe
         (async () => {
             // (1) Create a random website
             let subdomain = puter.randName();
-            const site = await puter.hosting.create(subdomain)
+            const site = await puter.hosting.create(subdomain, '.')
             puter.print(`Website hosted at: ${site.subdomain}.puter.site<br>`);
 
             // (2) Create a random directory
@@ -52,7 +55,7 @@ A `Promise` that will resolve to a [`Subdomain`](/Objects/subdomain/) object whe
             puter.print(`Changed subdomain's root directory to "${dir.path}"<br>`);
 
             // (4) Delete the app (cleanup)
-            await puter.hosting.delete(updatedSite.subdomain)
+            await puter.hosting.delete(subdomain)
         })();
     </script>
 </body>

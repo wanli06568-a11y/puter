@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const bn = {
         account: 'অ্যাকাউন্ট',
         account_password: 'অ্যাকাউন্ট পাসওয়ার্ড যাচাই করুন',
         access_granted_to: 'অ্যাক্সেস দেওয়া হয়েছে',
-        add_existing_account: 'বিদ্যমান অ্যাকাউন্ট যোগ করুন',
+        add_another_account: 'অন্য অ্যাকাউন্ট যোগ করুন',
         all_fields_required: 'সমস্ত ফিল্ড পূরন করুন.',
         allow: 'অনুমতি দিন',
         apply: 'প্রয়োগ করুন',
@@ -84,10 +84,6 @@ const bn = {
         credits: 'ক্রেডিট',
         current_password: 'বর্তমান পাসওয়ার্ড',
         cut: 'কাটুন',
-        clock: 'ঘড়ি',
-        clock_visible_hide: 'ঘড়ি লুকানো',
-        clock_visible_show: 'ঘড়ি দৃশ্যমান',
-        clock_visible_auto: 'ঘড়ি দৃশ্যমান অটো',
         close_all: 'সমস্ত বন্ধ করুন',
         created: 'তৈরি করা হয়েছে',
         date_modified: 'তারিখ পরিবর্তন',
@@ -346,7 +342,6 @@ const bn = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         'change': 'পরিবর্তন করুন',
-        'clock_visibility': 'ঘড়ির দৃশ্যমানতা',
         'password_recovery_token_invalid': 'এই পাসওয়ার্ড পুনরুদ্ধার টোকেনটি আর সঠিক নয়।',
         'password_recovery_unknown_error': 'একটি অজানা ত্রুটি ঘটেছে। অনুগ্রহ করে পরে আবার চেষ্টা করুন।',
         'password_required': 'পাসওয়ার্ড প্রয়োজন।',

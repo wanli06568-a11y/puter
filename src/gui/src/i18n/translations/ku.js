@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const ku = {
         account: 'هەژمار',
         account_password: 'وشەی تێپەڕی هەژمارەکەت پشتڕاست بکەوە',
         access_granted_to: 'ڕێگەپێدان درا بۆ',
-        add_existing_account: 'زیادکردنی هەژماری هەبوو',
+        add_another_account: 'زیادکردنی هەژمارێکی تر',
         all_fields_required: 'هەموو بوارەکان پێویستە.',
         allow: 'ڕێگەدان',
         apply: 'بەکارهێنان',
@@ -91,11 +91,6 @@ const ku = {
         credits: 'بڕگەکان',
         current_password: 'وشەی تێپەڕی ئێستا',
         cut: 'برین',
-        clock: 'کاژێر',
-        clock_visible_hide: 'شاردنەوە - هەمیشە شاردراوە',
-        clock_visible_show: 'پیشان - هەمیشە پیشاندراوە',
-        clock_visible_auto:
-      'ئۆتۆ - بنەڕەت، تەنها پیشاندراوە لە دۆخەکانی شاشەی تەواو.',
         close_all: 'داخستنەوەی هەموو',
         created: 'دروستکراو',
         date_modified: 'بەرواری گۆڕاوە',
@@ -371,7 +366,6 @@ const ku = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         'change': 'بیگۆڕە', // In English: "Change"
-        'clock_visibility': 'بینینی کاتژمێر', // In English: "Clock Visibility"
         'reading': 'خوێندنەوە', // In English: "Reading %strong%"
         'writing': 'دەنوسێ', // In English: "Writing %strong%"
         'unzipping': 'كردنەوەی فایلی زیپ', // In English: "Unzipping %strong%"

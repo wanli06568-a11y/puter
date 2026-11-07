@@ -4,7 +4,7 @@ description: Create a raw TCP socket directly in the browser.
 platforms: [websites, apps]
 ---
 
-The Socket API lets you create a raw TCP socket which can be used directly in the browser.
+Creates a raw TCP socket that can be used directly in the browser.
 
 ## Syntax
 
@@ -84,11 +84,11 @@ Fired when the socket encounters an error. The close event is fired shortly afte
 ##### Parameters
 
 - `callback` (Function) The callback to fire when an error occurs.
-  - `reason` (`string`) A user readable error reason.
+  - `error` (`Error`) An `Error` object describing what went wrong. The human-readable reason is available on `error.message`.
 
 ## Examples
 
-<strong class="example-title">Connect to a server and print the response</strong>
+### Connect to a server and print the response
 
 ```html;net-basic
 <html>
@@ -103,8 +103,8 @@ Fired when the socket encounters an error. The close event is fired shortly afte
     socket.on("data", (data) => {
         puter.print(decoder.decode(data), { code: true });
     })
-    socket.on("error", (reason) => {
-        puter.print("Socket errored with the following reason: ", reason);
+    socket.on("error", (error) => {
+        puter.print("Socket errored with the following reason: ", error.message);
     })
     socket.on("close", (hadError)=> {
         puter.print("Socket closed. Was there an error? ", hadError);

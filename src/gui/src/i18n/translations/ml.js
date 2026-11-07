@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const ml = {
         account: 'അക്കൗണ്ട്',
         account_password: 'അക്കൗണ്ട് പാസ്‌വേഡ് പരിശോധിക്കുക',
         access_granted_to: 'പ്രവേശനം അനുവദിച്ചിരിക്കുന്നത്',
-        add_existing_account: 'നിലവിലുള്ള അക്കൗണ്ട് ചേർക്കുക',
+        add_another_account: 'മറ്റൊരു അക്കൗണ്ട് ചേർക്കുക',
         all_fields_required: 'എല്ലാ ഫീൽഡുകളും ആവശ്യമാണ്.',
         allow: 'അനുവദിക്കുക',
         apply: 'പ്രയോഗിക്കുക',
@@ -45,7 +45,6 @@ const ml = {
         change_password: 'പാസ്‌വേഡ് മാറ്റുക',
         change_ui_colors: 'UI നിറങ്ങൾ മാറ്റുക',
         change_username: 'ഉപയോക്തൃനാമം മാറ്റുക',
-        clock_visibility: 'ക്ലോക്ക് ദൃശ്യത',
         close: 'അടയ്ക്കുക',
         close_all_windows: 'എല്ലാ വിൻഡോകളും അടയ്ക്കുക',
         close_all_windows_confirm: 'എല്ലാ വിൻഡോകളും അടയ്ക്കണമെന്ന് തീർച്ചയാണോ?',
@@ -86,10 +85,6 @@ const ml = {
         credits: 'ക്രെഡിറ്റുകൾ',
         current_password: 'നിലവിലെ പാസ്‌വേഡ്',
         cut: 'മുറിക്കുക',
-        clock: 'ക്ലോക്ക്',
-        clock_visible_hide: 'മറയ്ക്കുക - എപ്പോഴും മറഞ്ഞിരിക്കും',
-        clock_visible_show: 'കാണിക്കുക - എപ്പോഴും ദൃശ്യമായിരിക്കും',
-        clock_visible_auto: 'സ്വയം - സ്ഥിരസ്ഥിതി, പൂർണ്ണ സ്ക്രീൻ മോഡിൽ മാത്രം ദൃശ്യമാകും.',
         close_all: 'എല്ലാം അടയ്ക്കുക',
         created: 'സൃഷ്ടിച്ചത്',
         date_modified: 'മാറ്റം വരുത്തിയ തീയതി',

@@ -1,7 +1,7 @@
 ---
 title: puter.ui.showColorPicker()
 description: Presents a color picker dialog for selecting a color.
-platforms: [apps]
+platforms: [ websites, apps]
 ---
 
 Presents the user with a color picker dialog allowing them to select a color.
@@ -15,7 +15,9 @@ puter.ui.showColorPicker(options)
 
 ## Examples
 
-```html
+### Change the background to the picked color
+
+```html;ui-show-color-picker
 <html>
 <body>
     <script src="https://js.puter.com/v2/"></script>

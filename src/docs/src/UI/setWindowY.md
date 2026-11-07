@@ -4,11 +4,12 @@ description: Sets the y position of the window.
 platforms: [apps]
 ---
 
-Sets the y position of the window.
+Sets the Y position of the window.
 
 ## Syntax
 ```js
 puter.ui.setWindowY(y)
+puter.ui.setWindowY(y, window_id)
 ```
 
 ## Parameters
@@ -16,7 +17,12 @@ puter.ui.setWindowY(y)
 #### `y` (Float) (Required)
 The new y position for this window.
 
+#### `window_id` (optional)
+Targets a specific window other than the app's main window. Accepts either a window id string or a window handle returned by [`puter.ui.createWindow()`](/UI/createWindow/) (an object with an `id` property). When omitted, the app's main window is used.
+
 ## Examples
+
+### Set the window's vertical position
 
 ```html
 <html>

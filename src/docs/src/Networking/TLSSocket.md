@@ -4,7 +4,9 @@ description: Create a TLS protected TCP socket connection directly in the browse
 platforms: [websites, apps]
 ---
 
-The TLS Socket API lets you create a TLS protected TCP socket connection which can be used directly in the browser. The interface is exactly the same as the normal <a href="/Networking/Socket/">`puter.net.Socket`</a> but connections are encrypted instead of being in plain text.
+Creates a TLS-protected TCP socket connection that can be used directly in the browser.
+
+The interface is exactly the same as the normal <a href="/Networking/Socket/">`puter.net.Socket`</a> but connections are encrypted instead of being in plain text.
 
 ## Syntax
 
@@ -84,13 +86,13 @@ Fired when the socket encounters an error. The close event is fired shortly afte
 ##### Parameters
 
 - `callback` (Function) The callback to fire when an error occurs.
-  - `reason` (`string`) A user readable error reason.
+  - `error` (`Error`) An `Error` object describing what went wrong. The human-readable reason is available on `error.message`.
 
 The encryption is done by [rustls-wasm](https://github.com/MercuryWorkshop/rustls-wasm/).
 
 ## Examples
 
-<strong class="example-title">Connect to a server with TLS and print the response</strong>
+### Connect to a server with TLS and print the response
 
 ```html;net-tls
 <html>
@@ -105,8 +107,8 @@ The encryption is done by [rustls-wasm](https://github.com/MercuryWorkshop/rustl
     socket.on("tlsdata", (data) => {
         puter.print(decoder.decode(data), { code: true });
     })
-    socket.on("error", (reason) => {
-        puter.print("Socket errored with the following reason: ", reason);
+    socket.on("error", (error) => {
+        puter.print("Socket errored with the following reason: ", error.message);
     })
     socket.on("tlsclose", (hadError)=> {
         puter.print("Socket closed. Was there an error? ", hadError);

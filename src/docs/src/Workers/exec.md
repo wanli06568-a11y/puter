@@ -1,6 +1,6 @@
 ---
 title: puter.workers.exec()
-description: Execute workers as an authenticated user.
+description: Call a worker as the calling user, while the worker's code acts on the worker owner's shared KV and storage.
 platforms: [websites, apps, nodejs]
 ---
 
@@ -18,21 +18,21 @@ puter.workers.exec(workerURL, options)
 
 ## Parameters
 
-#### `workerURL` (String)(Required)
+#### `workerURL` (String | URL | Request)(Required)
 
-The URL of the worker to execute.
+The worker to execute. Accepts the same input as the Fetch API's first argument: a URL string, a [`URL`](https://developer.mozilla.org/en-US/docs/Web/API/URL) object, or a [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request) object. When a `Request` object is provided, its options (method, headers, body, etc.) are used and the `options` argument can be omitted.
 
 #### `options` (Object)
 
 A standard [RequestInit](https://developer.mozilla.org/en-US/docs/Web/API/RequestInit) object
 
-## Return Value
+## Return value
 
 A `Promise` that resolves to a `Response` object (similar to the Fetch API).
 
 ## Examples
 
-<strong class="example-title">Execute a worker</strong>
+### Execute a worker
 
 ```html
 <html>

@@ -4,7 +4,9 @@ description: Listens to broadcast events from Puter.
 platforms: [apps]
 ---
 
-Listen to broadcast events from Puter. If the broadcast was received before attaching the handler, then the handler is called immediately with the most recent value.
+Listens for broadcast events from Puter.
+
+If the broadcast was received before you attached the handler, the handler is called immediately with the most recent value.
 
 
 ## Syntax
@@ -45,7 +47,19 @@ Sent on app startup, and whenever the user's desktop theme on Puter is changed. 
 }
 ```
 
+#### `connection`
+Sent when another app requests a connection to your app. The value passed to `handler` is:
+```js
+{
+    conn,    // (AppConnection) Connection to the app that initiated the request
+    accept,  // (Function) Call accept(value) to accept the connection; `value` is sent back to the requester
+    reject,  // (Function) Call reject(value) to reject the connection; `value` is sent back to the requester
+}
+```
+
 ## Examples
+
+### Listen for language changes
 
 ```html
 <html>

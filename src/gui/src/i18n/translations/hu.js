@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const hu = {
         account: 'Fiók',
         account_password: 'Fiók jelszó megerősítése',
         access_granted_to: 'Hozzáférés engedélyezve',
-        add_existing_account: 'Meglévő fiók hozzáadása',
+        add_another_account: 'Másik fiók hozzáadása',
         all_fields_required: 'Minden mező kitöltése kötelező.',
         allow: 'Engedélyez',
         apply: 'Alkalmaz',
@@ -84,10 +84,6 @@ const hu = {
         credits: 'Kreditek',
         current_password: 'Jelenlegi jelszó',
         cut: 'Kivágás',
-        clock: 'Óra',
-        clock_visible_hide: 'Elrejt - Mindig rejtett',
-        clock_visible_show: 'Megjelenít - Mindig látható',
-        clock_visible_auto: 'Automatikus - Alapértelmezett, csak teljes képernyős módban látható.',
         close_all: 'Összes bezárása',
         created: 'Létrehozva',
         date_modified: 'Módosítás dátuma',
@@ -335,7 +331,6 @@ const hu = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         'change': 'Módosítás', // In English: "Change"
-        'clock_visibility': 'Óra Megjelenítése', // In English: "Clock Visibility"
         'reading': 'Olvasás %strong%', // In English: "Reading %strong%"
         'writing': 'Írás %strong%', // In English: "Writing %strong%"
         'unzipping': 'Kibontás %strong%', // In English: "Unzipping %strong%"

@@ -1,6 +1,6 @@
 ---
 title: puter.fs.read()
-description: Read data from files in Puter file system.
+description: Read data from files in the user's own Puter file system.
 platforms: [websites, apps, nodejs, workers]
 ---
 
@@ -18,18 +18,18 @@ puter.fs.read(options)
 
 #### `path` (String) (required)
 
-Path of the file to read.
-If `path` is not absolute, it will be resolved relative to the app's root directory.
+Path of the file to read, or its UID.
+If `path` is not absolute, it will be resolved relative to the app's root directory. A relative name that looks like a UID is read as one; prefix it with `./` to address a file by that name.
 
 #### `options` (Object) (optional)
 
 An object with the following properties:
 
-- `path` (String) - Path to the file to read. Required when passing options as the only argument.
-- `offset` (Number) (optional)
-The offset to start reading from.
-- `byte_count` (Number) (required if `offset` is provided)
-The number of bytes to read from the offset.
+| Option | Type | Description |
+|--------|------|-------------|
+| `path` | `String` | Path to the file to read. Required when passing options as the only argument. |
+| `offset` | `Number` | The offset to start reading from. |
+| `byte_count` | `Number` | The number of bytes to read from the offset. When omitted with `offset`, reads through the end of the file. |
 
 ## Return value
 
@@ -37,7 +37,7 @@ A `Promise` that will resolve to a `Blob` object containing the contents of the 
 
 ## Examples
 
-<strong class="example-title">Read a file</strong>
+### Read a file
 
 ```html;fs-read
 <html>

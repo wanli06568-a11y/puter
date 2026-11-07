@@ -7,16 +7,46 @@ platforms: [websites, apps]
 Presents the user with a file picker dialog allowing them to specify where and with what name to save a file.
 
 ## Syntax
+
 ```js
 puter.ui.showSaveFilePicker()
-puter.ui.showSaveFilePicker(data, defaultFileName)
+puter.ui.showSaveFilePicker(content, suggestedName)
+puter.ui.showSaveFilePicker(content, suggestedName, type)
 ```
 
 ## Parameters
-#### `defaultFileName` (String)
-The default file name to use.
+
+#### `content` (Optional)
+
+The data to write to the chosen file. The expected value depends on `type`:
+- When `type` is omitted, `content` is the file data to write.
+- When `type` is `'url'`, `content` is a URL (string or `URL`) whose contents are saved.
+- When `type` is `'move'` or `'copy'`, `content` is the source path of an existing file to move or copy.
+
+#### `suggestedName` (String) (Optional)
+
+The default file name to pre-fill in the dialog.
+
+#### `type` (String) (Optional)
+
+How `content` should be interpreted. One of `'url'`, `'move'`, or `'copy'`. If omitted and `content` is a `URL` object, it is auto-detected as `'url'`.
+
+## Return value
+
+A `Promise` that resolves to an [`FSItem`](/Objects/fsitem) describing the saved file. If the user cancels, the promise stays pending.
+
+The returned promise also has an `undefinedOnCancel` property. It holds a second promise that resolves to the same result, or to `undefined` if the user cancels:
+
+```js
+const file = await puter.ui.showSaveFilePicker('Hello world!', 'hello.txt').undefinedOnCancel;
+if (file === undefined) {
+    // the user closed the picker without saving
+}
+```
 
 ## Examples
+
+### Save a file to a picked location
 
 ```html
 <html>

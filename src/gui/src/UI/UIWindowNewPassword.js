@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -19,8 +19,8 @@
 
 import UIWindow from './UIWindow.js';
 import UIAlert from './UIAlert.js';
-import UIWindowLogin from './UIWindowLogin.js';
-import check_password_strength from '../helpers/check_password_strength.js';
+import UIAuthLogin from './Auth/UIAuthLogin.js';
+import check_password_strength from '../helpers/checkPasswordStrength.js';
 
 async function UIWindowNewPassword (options) {
     return new Promise(async (resolve) => {
@@ -183,15 +183,19 @@ async function UIWindowNewPassword (options) {
                             close_on_backdrop_click: false,
                         },
                     });
-                    await UIWindowLogin({
+                    await UIAuthLogin({
                         reload_on_success: true,
-                        window_options: {
-                            has_head: false,
-                        },
+                        dismissable: false,
                     });
                 },
                 error: function (err) {
-                    $(el_window).find('.form-error-msg').html(html_encode(err.responseText));
+                    const errorText = err.responseText || '';
+                    let msg = errorText;
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        msg = errorJson.message || errorJson.error || errorText;
+                    } catch (_) { /* not JSON, use responseText */ }
+                    $(el_window).find('.form-error-msg').html(html_encode(msg));
                     $(el_window).find('.form-error-msg').fadeIn();
                 },
             });

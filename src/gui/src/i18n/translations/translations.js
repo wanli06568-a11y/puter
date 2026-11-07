@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -21,6 +21,7 @@ import ar from './ar.js';
 import bg from './bg.js';
 import bn from './bn.js';
 import br from './br.js';
+import cs from './cs.js';
 import da from './da.js';
 import de from './de.js';
 import emoji from './emoji.js';
@@ -28,6 +29,7 @@ import en from './en.js';
 import es from './es.js';
 import fa from './fa.js';
 import fi from './fi.js';
+import fil from './fil.js';
 import fr from './fr.js';
 import he from './he.js';
 import hi from './hi.js';
@@ -63,6 +65,7 @@ export default {
     bg,
     bn,
     br,
+    cs,
     da,
     de,
     emoji,
@@ -70,6 +73,7 @@ export default {
     es,
     fa,
     fi,
+    fil,
     fr,
     he,
     hi,

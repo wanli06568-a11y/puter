@@ -22,14 +22,14 @@ You can use AI models from various providers to perform tasks such as chat, text
 
 <div class="example-content" data-section="ai-chat" style="display:block;">
 
-#### Chat with GPT-5 nano
+#### Chat with GPT-6 Luna
 
 ```html;ai-chatgpt
 <html>
 <body>
     <script src="https://js.puter.com/v2/"></script>
     <script>
-        puter.ai.chat(`What is life?`, { model: "gpt-5-nano" }).then(puter.print);
+        puter.ai.chat(`What is life?`, { model: "gpt-6-luna" }).then(puter.print);
     </script>
 </body>
 </html>
@@ -40,6 +40,8 @@ You can use AI models from various providers to perform tasks such as chat, text
 <div class="example-content" data-section="text-to-image">
 
 #### Generate an image of a cat using AI
+
+Choose a model and compare provider rates in the [AI model directory](https://developer.puter.com/ai/models/).
 
 ```html;ai-txt2img
 <html>
@@ -126,7 +128,7 @@ You can use AI models from various providers to perform tasks such as chat, text
 
 <div class="example-content" data-section="text-to-video">
 
-#### Generate a sample Sora clip
+#### Generate a sample clip (test mode)
 
 ```html;ai-txt2vid
 <html>
@@ -169,7 +171,7 @@ You can use AI models from various providers to perform tasks such as chat, text
 
 <div class="example-content" data-section="speech-to-text">
 
-#### Transcribe or translate audio recordings into text
+#### Transcribe audio recordings into text
 
 ```html;ai-speech2txt
 <html>
@@ -192,25 +194,30 @@ You can use AI models from various providers to perform tasks such as chat, text
 These AI features are supported out of the box when using Puter.js:
 
 - **[`puter.ai.chat()`](/AI/chat/)** - Chat with AI models like Claude, GPT, and others
-- **[`puter.ai.listModels()`](/AI/listModels/)** - List available AI chat models (and providers) that Puter currently exposes.
 - **[`puter.ai.txt2img()`](/AI/txt2img/)** - Generate images from text descriptions
-- **[`puter.ai.img2txt()`](/AI/img2txt/)** - Extract text from images (OCR)
 - **[`puter.ai.txt2speech()`](/AI/txt2speech/)** - Convert text to speech
+- **[`puter.ai.speech2txt()`](/AI/speech2txt/)** - Transcribe audio recordings into text
+- **[`puter.ai.img2txt()`](/AI/img2txt/)** - Extract text from images (OCR)
+- **[`puter.ai.txt2vid()`](/AI/txt2vid/)** - Generate short video clips from text or a reference image with Wan, Seedance, Veo, Kling, MiniMax H3 and other models, or edit a video you supply with Gemini Omni, FLUX 3 or Kling Omni
 - **[`puter.ai.speech2speech()`](/AI/speech2speech/)** - Convert speech in one voice to another voice
-- **[`puter.ai.txt2vid()`](/AI/txt2vid/)** - Generate short videos with OpenAI Sora models
-- **[`puter.ai.speech2txt()`](/AI/speech2txt/)** - Transcribe or translate audio recordings into text
+- **[`puter.ai.convo()`](/AI/convo/)** - Prepare a beta realtime conversation with optional text, microphone, playback, and interruption helpers
+- **[Realtime WebSocket API](/AI/realtime/)** - Connect directly without puter.js. This API is in beta and may change abruptly.
+- **[`puter.ai.listModels()`](/AI/listModels/)** - List available AI chat models (and providers) that Puter currently exposes.
+- **[`puter.ai.listModelProviders()`](/AI/listModelProviders/)** - List the AI providers that Puter currently exposes.
+- **[`puter.ai.txt2speech.listEngines()`](/AI/txt2speech.listEngines/)** - List available TTS engines/models
+- **[`puter.ai.txt2speech.listVoices()`](/AI/txt2speech.listVoices/)** - List available TTS voices
 
 ## Examples
 
 You can see various Puter.js AI features in action from the following examples:
 
 - AI Chat
-  - [Chat with GPT-5 nano](/playground/ai-chatgpt/)
+  - [Chat with GPT-6 Luna](/playground/ai-chatgpt/)
   - [Image Analysis](/playground/ai-gpt-vision/)
   - [Stream the response](/playground/ai-chat-stream/)
   - [Function Calling](/playground/ai-function-calling/)
   - [AI Resume Analyzer (File handling)](/playground/ai-resume-analyzer/)
-  - [Chat with OpenAI o3-mini](/playground/ai-chat-openai-o3-mini/)
+  - [Chat with OpenAI GPT-6 Luna](/playground/ai-chat-openai-gpt-6-luna/)
   - [Chat with Claude Sonnet](/playground/ai-chat-claude/)
   - [Chat with DeepSeek](/playground/ai-chat-deepseek/)
   - [Chat with Gemini](/playground/ai-chat-gemini/)
@@ -226,14 +233,22 @@ You can see various Puter.js AI features in action from the following examples:
   - [Text to Speech with options](/playground/ai-txt2speech-options/)
   - [Text to Speech with engines](/playground/ai-txt2speech-engines/)
   - [Text to Speech with OpenAI voices](/playground/ai-txt2speech-openai/)
+  - [Text to Speech with Gemini voices](/playground/ai-txt2speech-gemini/)
+  - [List TTS Engines](/playground/ai-txt2speech-list-engines/)
+  - [List TTS Voices](/playground/ai-txt2speech-list-voices/)
   - [Transcribe audio with `speech2txt`](/AI/speech2txt/)
 - Text to Video
-  - [Generate a sample Sora clip](/AI/txt2vid/)
+  - [Generate a sample clip (test mode)](/playground/ai-txt2vid/)
+  - [Text to Video with options](/playground/ai-txt2vid-options/)
+  - [Text to Video with Google Veo on Together AI](/playground/ai-txt2vid-veo/)
+  - [Animate a photo (image-to-video)](/playground/ai-txt2vid-image-to-video/)
+  - [Save the clip to the Puter filesystem](/playground/ai-txt2vid-save/)
+  - [Show progress and handle errors](/playground/ai-txt2vid-errors/)
 - Speech to Speech
   - [Convert speech in one voice to another voice](/playground/ai-speech2speech-url/)
   - [Convert speech in one voice to another voice with a recording stored as a file](/playground/ai-speech2speech-file/)
 - Speech to Text
-  - [Transcribe or translate audio recordings into text](/playground/ai-speech2txt/)
+  - [Transcribe audio recordings into text](/playground/ai-speech2txt/)
 
 ## Tutorials
 

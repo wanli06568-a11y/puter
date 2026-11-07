@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const ro = {
         account: 'Cont',
         account_password: 'Verifică parola contului',
         access_granted_to: 'Acces acordat pentru',
-        add_existing_account: 'Adaugă cont existent',
+        add_another_account: 'Adaugă alt cont',
         all_fields_required: 'Toate câmpurile sunt necesare.',
         allow: 'Permite',
         apply: 'Aplică',
@@ -85,10 +85,6 @@ const ro = {
         credits: 'Credite',
         current_password: 'Parola Curentă',
         cut: 'Decupează',
-        clock: 'Ora',
-        clock_visible_hide: 'Ascunde - Întotdeauna ascuns',
-        clock_visible_show: 'Afișează - Întotdeauna vizibil',
-        clock_visible_auto: 'Automat - Mod implicit, vizibil doar în modul ecran complet.',
         close_all: 'Închide toate',
         created: 'Creat',
         date_modified: 'Dată modificare',
@@ -341,7 +337,6 @@ const ro = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         change: 'Schimbǎ',
-        clock_visibility: 'Vizibilitatea Ceasului',
         reading: 'Citire %strong%',
         writing: 'Scriere %strong%',
         unzipping: 'Dezarhivare %strong%',

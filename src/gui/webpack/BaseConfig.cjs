@@ -19,6 +19,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const webpack = require('webpack');
 const EmitPlugin = require('./EmitPlugin.cjs');
 
 module.exports = async (options = {}) => {
@@ -26,15 +27,36 @@ module.exports = async (options = {}) => {
 
     extension_directories.push(path.join(__dirname, '../src/extensions'));
 
+    // Out-of-tree extension directories (e.g. proprietary extensions kept in
+    // a separate repository).
+    const externalDirs = [];
     if ( process.env.PUTER_GUI_EXTENSION_PATHS ) {
         const paths = process.env.PUTER_GUI_EXTENSION_PATHS.split(';');
-        extension_directories.push(...paths);
+        externalDirs.push(...paths.filter(Boolean).map(p => path.resolve(p)));
+        extension_directories.push(...externalDirs);
     }
+
+    // Imports in out-of-tree extensions resolve as if the extension lived in
+    // src/extensions — so `../UI/UIAlert.js` reaches GUI internals the same
+    // way it does in-tree — while files that exist next to the extension
+    // (its own libs) still win.
+    const srcDir = path.join(__dirname, '../src');
+    const resolvesTo = (p) => fs.existsSync(p) || fs.existsSync(`${p}.js`);
+    const remapExternalImport = (resource) => {
+        const issuerDir = resource.context;
+        const root = externalDirs.find(dir =>
+            issuerDir === dir || issuerDir.startsWith(dir + path.sep));
+        if ( ! root ) return;
+        if ( resolvesTo(path.resolve(issuerDir, resource.request)) ) return;
+        const virtualDir = path.join(srcDir, 'extensions', path.relative(root, issuerDir));
+        const target = path.resolve(virtualDir, resource.request);
+        if ( resolvesTo(target) ) resource.request = target;
+    };
 
     const entries = [];
 
     for ( const extensionsDir of extension_directories ) {
-        // console.log(`Reading extensions from ${extensionsDir}`);
+        if ( ! fs.existsSync(extensionsDir) ) continue;
         // Read and process extension entries from the extensions directory
         const readdir_entries = fs.readdirSync(extensionsDir, { withFileTypes: true });
         for ( const entry of readdir_entries ) {
@@ -57,23 +79,41 @@ module.exports = async (options = {}) => {
     }
 
     const config = {};
-    config.entry = [
-        './src/init_sync.js',
-        './src/init_async.js',
-        './src/initgui.js',
-        './src/helpers.js',
-        './src/IPC.js',
-        './src/globals.js',
-        './src/i18n/i18n.js',
-        './src/keyboard.js',
-        './src/index.js',
-        ...entries,
-    ];
+    config.entry = {
+        bundle: [
+            './src/init_sync.js',
+            './src/init_async.js',
+            './src/initgui.js',
+            './src/helpers.js',
+            './src/IPC.js',
+            './src/globals.js',
+            './src/i18n/i18n.js',
+            './src/keyboard.js',
+            './src/index.js',
+            ...entries,
+        ],
+        'apps-embed': './src/appsEmbed.js',
+    };
     config.output = {
         path: path.resolve(__dirname, '../dist'),
-        filename: 'bundle.min.js',
+        filename: '[name].min.js',
+    };
+    config.module = {
+        rules: [{ test: /jquery-3\.6\.1\.min\.js$/, type: 'javascript/auto' }],
+    };
+    config.resolve = {
+        modules: [
+            'node_modules',
+            // Hoisted workspace deps: bare imports in out-of-tree extensions
+            // can't reach this repo's node_modules by walking up from their
+            // own location.
+            path.join(__dirname, '../../../node_modules'),
+        ],
     };
     config.plugins = [
+        ...(externalDirs.length
+            ? [new webpack.NormalModuleReplacementPlugin(/^\.\.?\//, remapExternalImport)]
+            : []),
         await EmitPlugin({
             options,
             dir: path.join(__dirname, '../src/icons'),

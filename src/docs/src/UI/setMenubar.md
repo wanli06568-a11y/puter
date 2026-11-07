@@ -1,10 +1,12 @@
 ---
 title: puter.ui.setMenubar()
 description: Creates a menubar in the UI.
-platforms: [apps]
+platforms: [ websites, apps]
 ---
 
-Creates a menubar in the UI. The menubar is a horizontal bar at the top of the window that contains menus.
+Creates a menubar in the UI.
+
+The menubar is a horizontal bar at the top of the window that contains menus.
 
 ## Syntax
 
@@ -14,25 +16,28 @@ puter.ui.setMenubar(options)
 
 ## Parameters
 
-#### `options.items` (Array)
+#### `options` (Object)
 
-An array of menu items. Each item can be a menu or a menu item. Each menu item can have a label, an action, and a submenu.
+| Option | Type | Description |
+|--------|------|-------------|
+| `items` | `Array` | An array of menu items. Each item can be a menu or a menu item. Each menu item can have a label, an action, and a submenu. An item can also be the string `'-'`, which indicates a separator (renders as a horizontal divider between groups of items). The properties of each item are listed below the table. |
+| `theme` | `String` | Forces the menubar's color theme, either `'dark'` or `'light'`. When unset, the menubar follows the system color-scheme preference. Only applies when running standalone (`puter.env === 'web'`). Inside the Puter desktop, the menubar is rendered by the desktop, which uses its own theme. |
 
-#### `options.items.label` (String)
+Each menu item in `items` can have these properties:
 
-The label of the menu item.
-
-#### `options.items.action` (Function)
-
-A function to execute when the menu item is clicked.
-
-#### `options.items.items` (Array)
-
-An array of submenu items.
+- `label` (String): The label of the menu item.
+- `action` (Function): A function to execute when the menu item is clicked.
+- `items` (Array): An array of submenu items.
+- `disabled` (Boolean): Indicates whether the menu item is disabled. Disabled items are visible but cannot be clicked.
+- `checked` (Boolean): If `true`, renders a checkmark next to the menu item. Use for toggleable options.
+- `icon` (String): URL or data URI of an icon shown next to the menu item label.
+- `icon_active` (String): URL or data URI of an icon shown when the menu item is hovered or active. Falls back to `icon` if not provided.
 
 ## Examples
 
-```html
+### Add a menubar with a File menu
+
+```html;ui-set-menubar
 <html>
 <body>
     <script src="https://js.puter.com/v2/"></script>

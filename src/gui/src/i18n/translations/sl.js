@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const sl = {
         account: 'Račun',
         account_password: 'Potrdite geslo računa',
         access_granted_to: 'Dostop odobren za',
-        add_existing_account: 'Dodaj obstoječi račun',
+        add_another_account: 'Dodaj drug račun',
         all_fields_required: 'Vsa polja so obvezna.',
         allow: 'Dovoli',
         apply: 'Uporabi',
@@ -45,7 +45,6 @@ const sl = {
         change_password: 'Spremeni geslo',
         change_ui_colors: 'Spremeni barve vmesnika',
         change_username: 'Spremeni uporabniško ime',
-        clock_visibility: 'Vidnost ure',
         close: 'Zapri',
         close_all_windows: 'Zapri vsa okna',
         close_all_windows_confirm: 'Ali ste prepričani, da želite zapreti vsa okna?',
@@ -89,10 +88,6 @@ const sl = {
         credits: 'Zasluge',
         current_password: 'Trenutno geslo',
         cut: 'Izreži',
-        clock: 'Ura',
-        clock_visible_hide: 'Skrij - Vedno skrito',
-        clock_visible_show: 'Prikaži - Vedno vidno',
-        clock_visible_auto: 'Samodejno – privzeto, vidno samo v celozaslonskem načinu.',
         close_all: 'Zapri vse',
         created: 'Ustvarjeno',
         date_modified: 'Datum spremembe',

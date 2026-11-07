@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const ru = {
         account: 'Учетная запись',
         account_password: 'Подтвердите пароль',
         access_granted_to: 'Доступ предоставлен',
-        add_existing_account: 'Добавить существующую Учетную запись',
+        add_another_account: 'Добавить другую учетную запись',
         all_fields_required: 'Все поля обязательны для заполнения.',
         allow: 'Разрешить',
         apply: 'Применить',
@@ -93,11 +93,6 @@ const ru = {
         credits: 'Авторы',
         current_password: 'Текущий пароль',
         cut: 'Вырезать',
-        clock: 'Часы',
-        clock_visible_hide: 'Скрыть - Всегда скрыто',
-        clock_visible_show: 'Показать - Всегда на виду',
-        clock_visible_auto:
-      'Авто - По Умолчанию, видно только в полноэкранном режиме.',
         close_all: 'Закрыть все',
         created: 'Создано',
         date_modified: 'Дата изменения',
@@ -380,7 +375,6 @@ const ru = {
         login2fa_recovery_back: 'Назад',
         login2fa_recovery_placeholder: 'XXXXXXXX',
         change: 'Изменить',
-        clock_visibility: 'Видимость часов',
         confirm_your_email_address: 'Подтвердить электронную почту',
         reading: 'Чтение %strong%',
         writing: 'Запись %strong%',

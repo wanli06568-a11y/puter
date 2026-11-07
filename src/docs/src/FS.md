@@ -1,6 +1,6 @@
 ---
 title: FS
-description: Store and manage data in the cloud with Puter.js file system API.
+description: Store and manage data in the user's own cloud drive with Puter.js file system API.
 ---
 
 The Cloud Storage API lets you store and manage data in the cloud.
@@ -8,6 +8,8 @@ The Cloud Storage API lets you store and manage data in the cloud.
 It comes with a comprehensive but familiar file system operations including write, read, delete, move, and copy for files, plus powerful directory management features like creating directories, listing contents, and much more.
 
 With Puter.js, you don't need to worry about setting up storage infrastructure such as configuring buckets, managing CDNs, or ensuring availability, since everything is handled for you. Additionally, with the [User-Pays Model](/user-pays-model/), you don't have to worry about storage or bandwidth costs, as users of your application cover their own usage.
+
+<div class="info"><strong>Need to share data across users?</strong> Each user's files live in their own account, so one user can't read another's by default. To hand specific items to specific people, use <a href="/FS/share/"><code>puter.fs.share()</code></a>. To keep centralized files that every user reads from and writes to, use a <a href="/Workers/">Serverless Worker</a> — its code can act on the worker owner's resources, giving all users one shared backend.</div>
 
 ## Features
 
@@ -296,14 +298,23 @@ These cloud storage features are supported out of the box when using Puter.js:
 
 - **[`puter.fs.write()`](/FS/write/)** - Write data to a file
 - **[`puter.fs.read()`](/FS/read/)** - Read data from a file
-- **[`puter.fs.mkdir()`](/FS/mkdir/)** - Create a directory
-- **[`puter.fs.readdir()`](/FS/readdir/)** - List contents of a directory
-- **[`puter.fs.rename()`](/FS/rename/)** - Rename a file or directory
-- **[`puter.fs.copy()`](/FS/copy/)** - Copy a file or directory
-- **[`puter.fs.move()`](/FS/move/)** - Move a file or directory
-- **[`puter.fs.stat()`](/FS/stat/)** - Get information about a file or directory
-- **[`puter.fs.delete()`](/FS/delete/)** - Delete a file or directory
 - **[`puter.fs.upload()`](/FS/upload/)** - Upload a file from the local system
+- **[`puter.fs.readdir()`](/FS/readdir/)** - List contents of a directory
+- **[`puter.fs.mkdir()`](/FS/mkdir/)** - Create a directory
+- **[`puter.fs.delete()`](/FS/delete/)** - Delete a file or directory
+- **[`puter.fs.stat()`](/FS/stat/)** - Get information about a file or directory
+- **[`puter.fs.rename()`](/FS/rename/)** - Rename a file or directory
+- **[`puter.fs.move()`](/FS/move/)** - Move a file or directory
+- **[`puter.fs.copy()`](/FS/copy/)** - Copy a file or directory
+- **[`puter.fs.getReadURL()`](/FS/getReadURL/)** - Generate a URL that can be used to read a file
+- **[`puter.fs.revokeReadURL()`](/FS/revokeReadURL/)** - Revoke a URL created by `getReadURL()`
+- **[`puter.fs.share()`](/FS/share/)** - Give another user access to a file or directory
+- **[`puter.fs.unshare()`](/FS/unshare/)** - Withdraw a user's access
+- **[`puter.fs.listShared()`](/FS/listShared/)** - List what others have shared with you
+- **[`puter.fs.listSharedByMe()`](/FS/listSharedByMe/)** - List everything you have shared out
+- **[`puter.fs.getShares()`](/FS/getShares/)** - List who has access to an item
+- **[`puter.fs.getShareLink()`](/FS/getShareLink/)** - Build a link that opens a file in an app
+- **[`puter.fs.space()`](/FS/space/)** - Get the user's storage capacity and usage
 
 ## Examples
 

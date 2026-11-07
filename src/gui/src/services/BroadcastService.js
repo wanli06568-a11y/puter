@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -42,6 +42,20 @@ export class BroadcastService extends Service {
         if ( sendToNewAppInstances ) {
             this.#broadcastsToSendToNewAppInstances.set(name, data);
         }
+    }
+
+    // Send a 'broadcast' message to the SDK app in one window, at its origin.
+    sendBroadcastToWindow (el_window, name, data) {
+        const iframe = $(el_window).find('.window-app-iframe[data-appUsesSDK=true]').get(0);
+        if ( ! iframe?.contentWindow ) return false;
+        let origin;
+        try {
+            origin = new URL(iframe.src).origin;
+        } catch ( e ) {
+            return false;
+        }
+        iframe.contentWindow.postMessage({ msg: 'broadcast', name, data }, origin);
+        return true;
     }
 
     // Send all saved broadcast messages to the given app instance.

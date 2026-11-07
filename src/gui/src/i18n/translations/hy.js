@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
@@ -26,7 +26,7 @@ const hy = {
         account: 'Հաշիվ',
         account_password: 'Հաստատել հաշվի գաղտնաբառը',
         access_granted_to: 'Մուտքը տրված է՝',
-        add_existing_account: 'Ավելացնել առկա հաշիվ',
+        add_another_account: 'Ավելացնել այլ հաշիվ',
         all_fields_required: 'Բոլոր դաշտերը պարտադիր են',
         allow: 'Թույլատրել',
         apply: 'Կիրառել',
@@ -92,11 +92,6 @@ const hy = {
         credits: 'Կրեդիտներ',
         current_password: 'Ընթացիկ գաղտնաբառ',
         cut: 'Կտրել',
-        clock: 'Ժամացույց',
-        clock_visible_hide: 'Թաքցնել - Միշտ թաքնված',
-        clock_visible_show: 'Ցուցադրել - Միշտ տեսանելի',
-        clock_visible_auto:
-      'Ավտոմատ - լռելյայն, տեսանելի միայն ամբողջական էկրանային ռեժիմում:',
         close_all: 'Փակել բոլորը',
         created: 'Ստեղծված',
         date_modified: 'Փոփոխման ամսաթիվ',
@@ -380,7 +375,6 @@ const hy = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         change: 'Փոփոխել',
-        clock_visibility: 'Ժամացույցի տեսանելիություն',
         reading: 'Ընթերցում',
         writing: 'Գրում',
         unzipping: 'Արխիվը բացել',

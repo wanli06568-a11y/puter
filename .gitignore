@@ -22,6 +22,11 @@ dist/
 .env
 !.env.example
 
+# Per-developer / deployment config override. `config.default.json` ships in
+# the repo and is the authoritative source; `config.json` (if present) wins
+# at runtime for the local machine only.
+config.json
+
 # this is for jetbrain IDEs
 .idea/
 /puter
@@ -38,12 +43,6 @@ src/emulator/release/
 
 # JS language server, ref: https://code.visualstudio.com/docs/languages/jsconfig
 jsconfig.json
-
-# ======================================================================
-# node js
-# ======================================================================
-# the exact tree installed in the node_modules folder
-package-lock.json
 
 # ======================================================================
 # playwright test (currently only test the file-system)
@@ -67,5 +66,13 @@ AGENTS.md
 
 
 coverage/
+.vitest-reports/
 *.log
 undefined
+servers.json
+config.*.json
+
+volatile/
+
+# Local build override
+docker-compose.override.yml
