@@ -32,7 +32,7 @@ import { NodeHttpHandler } from '@smithy/node-http-handler';
 import type { FauxqsServer } from 'fauxqs';
 import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
-import { Agent as HttpsAgent } from 'node:https';
+import type { AgentOptions } from 'node:https';
 import path from 'node:path';
 import type { IConfig } from '../../types';
 import { nativeImport } from '../../util/nativeImport.js';
@@ -48,6 +48,30 @@ const LEGACY_STORAGE_BUCKET = 'puter-local';
 // credentials five minutes before expiry.
 const PRESIGN_MAX_LIFETIME_MS = 60 * 60 * 1000;
 const SDK_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+
+/**
+ * How long a pooled connection may sit unused before it is closed. S3 hangs up
+ * on a connection idle for about 6 s without announcing it, and a request sent
+ * as that happens fails with `socket hang up`, so ours must close first.
+ */
+export const S3_IDLE_SOCKET_TIMEOUT_MS = 4000;
+
+const AGENT_OPTIONS: AgentOptions = {
+    maxSockets: 500,
+    keepAlive: true,
+    keepAliveMsecs: 1000,
+    // Only limits idle pooled sockets: a request in flight runs on the
+    // handler's own socket timeout.
+    timeout: S3_IDLE_SOCKET_TIMEOUT_MS,
+};
+
+/** One connection pool per client; plain-HTTP endpoints get the same limits. */
+const createRequestHandler = () =>
+    new NodeHttpHandler({
+        socketTimeout: 5000,
+        httpAgent: AGENT_OPTIONS,
+        httpsAgent: AGENT_OPTIONS,
+    });
 
 type CredentialChain = ReturnType<typeof fromNodeProviderChain>;
 
@@ -88,7 +112,6 @@ export class S3Client extends PuterClient {
     private awsConfig: Partial<S3ClientConfig> = {};
     private presignAwsConfig: Partial<S3ClientConfig> | null = null;
     private fauxqsServer: FauxqsServer | null = null;
-    private useProviderChain = false;
 
     /** Maximum size for a single PutObject call before switching to multipart. */
     maxSingleUploadSize = FAUXQS_SAFE_PUT_OBJECT_LIMIT_BYTES;
@@ -119,7 +142,6 @@ export class S3Client extends PuterClient {
             } = s3Conf.s3Config;
 
             if (useCredentialChain) {
-                this.useProviderChain = true;
                 this.awsConfig = {
                     credentials: withPresignHeadroom(fromNodeProviderChain()),
                 };
@@ -235,15 +257,11 @@ export class S3Client extends PuterClient {
 
         const client = new AwsS3Client({
             region,
+            // Rows without a stored region are read with the server's own, so
+            // retry where S3's 301 says the bucket actually lives.
+            followRegionRedirects: true,
             requestStreamBufferSize: 32 * 1024,
-            requestHandler: new NodeHttpHandler({
-                socketTimeout: 5000,
-                httpsAgent: new HttpsAgent({
-                    maxSockets: 500,
-                    keepAlive: true,
-                    keepAliveMsecs: 1000,
-                }),
-            }),
+            requestHandler: createRequestHandler(),
             ...this.awsConfig,
         });
 
@@ -269,14 +287,7 @@ export class S3Client extends PuterClient {
         const client = new AwsS3Client({
             region,
             requestStreamBufferSize: 32 * 1024,
-            requestHandler: new NodeHttpHandler({
-                socketTimeout: 5000,
-                httpsAgent: new HttpsAgent({
-                    maxSockets: 500,
-                    keepAlive: true,
-                    keepAliveMsecs: 1000,
-                }),
-            }),
+            requestHandler: createRequestHandler(),
             ...this.presignAwsConfig,
         });
 

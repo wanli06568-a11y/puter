@@ -1,21 +1,23 @@
 import { extension } from '@heyputer/backend/src/extensions';
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Request } from 'express';
+import type { Readable } from 'node:stream';
 import {
     MAX_MESSAGE_BYTES,
+    type SenderAuthOutcome,
     isPuterEmailAddress,
     isTempUser,
     puterEmailUsername,
+    refusalReasonText,
+    stampSenderAuth,
     storeInboxMessage,
 } from '@heyputer/backend/src/services/email/mailbox.js';
-
-// copied form peer secrets checker
-const COMPARE_KEY = randomBytes(32);
-const secretsEqual = (a: string, b: string): boolean =>
-    timingSafeEqual(
-        createHmac('sha256', COMPARE_KEY).update(a).digest(),
-        createHmac('sha256', COMPARE_KEY).update(b).digest(),
-    );
+import {
+    MAX_HEADER_BYTES,
+    headBlockOf,
+    readHeadBlock,
+    replaceHead,
+} from '@heyputer/backend/src/services/email/rawMessage.js';
+import { secretsEqual } from '@heyputer/backend/src/util/secureCompare.js';
 
 const USER_EMAIL_CONFIG = (extension.config as Record<string, unknown>)
     .userEmail as { secret?: string; feedbackAddresses?: unknown } | undefined;
@@ -74,11 +76,15 @@ if (!INGRESS_SECRET) {
             // leaves the connection reusable. `close` is for bodies we do not
             // want to read at all: an unauthenticated caller's, or one whose
             // declared length is missing or over the cap.
-            const refuse = (status: number, how: 'drain' | 'close') => {
+            const refuse = (
+                status: number,
+                how: 'drain' | 'close',
+                body?: string,
+            ) => {
                 res.once('finish', () =>
                     how === 'drain' ? req.resume() : req.destroy(),
                 );
-                res.status(status).end();
+                res.status(status).end(body);
             };
 
             const presented = req.query.SECRET;
@@ -147,14 +153,78 @@ if (!INGRESS_SECRET) {
                 return;
             }
 
+            let head: Buffer;
+            if (Buffer.isBuffer(content)) {
+                head = headBlockOf(content);
+                if (head.length > MAX_HEADER_BYTES) {
+                    refuse(413, 'drain');
+                    return;
+                }
+            } else {
+                const block = await readHeadBlock(req, MAX_HEADER_BYTES);
+                if (!block) {
+                    refuse(413, 'close');
+                    return;
+                }
+                head = block.head;
+                // A message that is all header block was read whole.
+                if (block.spent) content = head;
+            }
+
+            let reading: Promise<Buffer> | null = Buffer.isBuffer(content)
+                ? Promise.resolve(content)
+                : null;
+            const check = {
+                to,
+                envelopeFrom:
+                    typeof req.query.mailfrom === 'string' && req.query.mailfrom
+                        ? req.query.mailfrom
+                        : null,
+                head,
+                size: Buffer.isBuffer(content) ? content.length : size,
+                readMessage: () => (reading ??= readBody(req)),
+                allow: true,
+                message: null as string | null,
+                senderAuth: null as SenderAuthOutcome | null,
+            };
+            const meta: { listener_failed?: boolean } = {};
+            // A listener that throws is no opinion: what it set is undone and
+            // the message is filed.
+            await extension
+                .import('client')
+                .event.emitAndWait('email.ingress.validate', check, meta, {
+                    revertOnFailure: ['allow', 'message', 'senderAuth'],
+                });
+            if (meta.listener_failed) {
+                console.warn(
+                    '[useremailrx] an email.ingress.validate listener failed; filing the message without its check',
+                );
+            }
+            if (check.allow === false) {
+                refuse(422, 'drain', refusalReasonText(check.message));
+                return;
+            }
+
+            // The sender check's header is ours alone: any copy the sender
+            // wrote goes, whether or not a check ran.
+            const newHead = stampSenderAuth(head, check.senderAuth);
+
+            const whole = reading ? await reading : null;
+            let stored: Buffer | Request | Readable = whole ?? req;
+            let storedSize = check.size;
+            if (newHead !== head) {
+                stored = whole
+                    ? Buffer.concat([newHead, whole.subarray(head.length)])
+                    : replaceHead(req, head.length, newHead);
+                storedSize = check.size - head.length + newHead.length;
+            }
+
             await storeInboxMessage(services.fs, user, {
                 subject: req.query.subject,
-                content,
-                size: Buffer.isBuffer(content) ? content.length : size,
+                content: stored,
+                size: storedSize,
             });
 
-            const { SECRET: _secret, ..._loggableQuery } = req.query;
-            // console.log('got email: ', puterUser, loggableQuery, size);
             res.end();
         },
     );

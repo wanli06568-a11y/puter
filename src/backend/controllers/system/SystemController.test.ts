@@ -547,6 +547,7 @@ describe('SystemController POST /contactUs — attachments', () => {
 
             expect(sendRaw).toHaveBeenCalledTimes(1);
             const sent = sendRaw.mock.calls[0][0] as {
+                stream: string;
                 text: string;
                 attachments: Array<{
                     filename: string;
@@ -555,6 +556,7 @@ describe('SystemController POST /contactUs — attachments', () => {
                     contentDisposition: string;
                 }>;
             };
+            expect(sent.stream).toBe('notify');
             expect(sent.attachments).toHaveLength(1);
             expect(sent.attachments[0].filename).toBe('payload.png');
             expect(sent.attachments[0].contentType).toBe('image/png');
@@ -716,6 +718,26 @@ describe('SystemController GET /lsmod', () => {
             expect(Object.keys(iface.implementors).length).toBeGreaterThan(0);
         }
     });
+
+    it('marks the default each interface resolves to on /drivers/call', async () => {
+        const { res, captured } = makeRes();
+        await callRoute('get', '/lsmod', makeReq({}), res);
+        const { interfaces } = captured.body as {
+            interfaces: Record<
+                string,
+                { implementors: Record<string, { isDefault: boolean }> }
+            >;
+        };
+        const drivers = server.controllers.drivers as unknown as {
+            getDefault(iface: string): string | undefined;
+        };
+        for (const [name, iface] of Object.entries(interfaces)) {
+            const defaults = Object.entries(iface.implementors)
+                .filter(([, impl]) => impl.isDefault)
+                .map(([driverName]) => driverName);
+            expect(defaults).toEqual([drivers.getDefault(name)]);
+        }
+    });
 });
 
 // ── rate-limit scopes ───────────────────────────────────────────────
@@ -761,22 +783,5 @@ describe('SystemController public route rate limits', () => {
         expect(rateLimitOf('/healthcheck').limit).toBe(30_000);
         expect(rateLimitOf('/version').limit).toBe(6_000);
         expect(rateLimitOf('/whoarewe').limit).toBe(6_000);
-    });
-});
-
-// ── lifecycle ───────────────────────────────────────────────────────
-
-describe('SystemController.onServerPrepareShutdown', () => {
-    it('flips the global drain flag', () => {
-        // Reset before the call so the assertion is meaningful even
-        // when earlier code in the same process already tripped it.
-        (
-            globalThis as unknown as { __puter_draining?: boolean }
-        ).__puter_draining = false;
-        server.controllers.system.onServerPrepareShutdown();
-        expect(
-            (globalThis as unknown as { __puter_draining?: boolean })
-                .__puter_draining,
-        ).toBe(true);
     });
 });

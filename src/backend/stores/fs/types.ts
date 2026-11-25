@@ -57,7 +57,10 @@ export interface NormalizedEntryWrite {
     index: number;
     input: FSEntryCreateInput;
     userId: number;
+    /** The path as requested; existing entries are looked up by it. */
     targetPath: string;
+    /** The path written: the parent's stored spelling plus `fileName`. */
+    storedPath: string;
     parentPath: string;
     fileName: string;
     metadataJson: string | null;
@@ -84,4 +87,11 @@ export interface ReadEntriesByPathsOptions {
      * Only for paths this backend wrote, which always store one.
      */
     lineage?: boolean;
+    /**
+     * Also return an entry whose name matches only under the database collation
+     * (`entryNamesMatch` says it is a different name), in the requested folder
+     * only. For checks that a name is free: the unique key folds those names
+     * together too.
+     */
+    foldedNames?: boolean;
 }

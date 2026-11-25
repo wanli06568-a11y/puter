@@ -18,7 +18,7 @@
  */
 
 import item_icon from '../../helpers/itemIcon.js';
-import UIAlert from '../UIAlert.js';
+import UIDashboardDialog from './UIDashboardDialog.js';
 import forget_parent_listing from '../../helpers/forgetParentListing.js';
 import { isOverlayOnTop } from './dashboardOverlay.js';
 import { formatRelativeTime } from '../../i18n/formatTime.js';
@@ -291,10 +291,24 @@ export default function UIItemPropertiesModal ({ name, path: item_path, uid, $co
                 const $link = $(this);
                 if ( $link.prop('disabled') ) return;
                 $link.prop('disabled', true);
-                puter.hosting.update($link.attr('data-subdomain'), null).then(() => {
+                const subdomain = $link.attr('data-subdomain');
+                puter.hosting.update(subdomain, null).then(() => {
                     const $entry = $link.closest('.item-props-website-entry');
                     const $row = $entry.closest('.item-props-row');
                     $entry.remove();
+                    // Rows inside the folder carry addresses under the site:
+                    // work them out again without it (another site may still
+                    // serve them).
+                    if ( Array.isArray(window.sites) ) {
+                        window.sites = window.sites.filter((site) => site.subdomain !== subdomain);
+                    }
+                    $('.item').each(function () {
+                        const path = this.dataset.path ?? '';
+                        if ( ! path.startsWith(`${item_path}/`) ) return;
+                        const url = window.determine_website_url?.(path) || '';
+                        $(this).attr('data-website_url', url)
+                            .find('.item-has-website-url-badge').css('display', url ? 'block' : 'none');
+                    });
                     // The focused button just left the DOM; keep focus in the dialog.
                     el_modal.focus({ preventScroll: true });
                     if ( $row.find('.item-props-website-entry').length > 0 ) return;
@@ -312,7 +326,12 @@ export default function UIItemPropertiesModal ({ name, path: item_path, uid, $co
                     window.update_sites_cache?.();
                 }).catch((err) => {
                     $link.prop('disabled', false);
-                    UIAlert(err?.message || i18n('error_unknown_cause', [], false));
+                    UIDashboardDialog({
+                        message: err?.message ? html_encode(err.message) : i18n('error_unknown_cause'),
+                        tone: 'error',
+                        $container: $root,
+                        returnFocusTo: $link.get(0),
+                    });
                 });
             });
         },

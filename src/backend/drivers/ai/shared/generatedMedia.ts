@@ -1,0 +1,196 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { posix as pathPosix } from 'node:path';
+import { Readable } from 'node:stream';
+import type { Actor } from '../../../core/actor.js';
+import { HttpError } from '../../../core/http/HttpError.js';
+import type { ACLService } from '../../../services/acl/ACLService.js';
+import type { FSService } from '../../../services/fs/FSService.js';
+import type { FSEntry } from '../../../stores/fs/FSEntry.js';
+import {
+    expandTildePath,
+    normalizeAbsolutePath,
+} from '../../../services/fs/resolveNode.js';
+import { secureFetch } from '../../../util/secureHttp.js';
+import { dataUriBytes, parseDataUri } from '../../util/dataUri.js';
+import { readBoundedBody } from '../../util/fileInput.js';
+import { isUpstreamTimeoutError } from '../../util/upstreamErrors.js';
+
+/**
+ * Bounds on downloading a provider-minted result URL for `puter_output_path`.
+ * The cap sits above the largest source video any provider accepts.
+ */
+const MAX_GENERATED_MEDIA_BYTES = 256 * 1024 * 1024;
+const GENERATED_MEDIA_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Where a generation's `puter_output_path` lands, checked before any credits
+ * are spent: an absolute path (`~` expanded) whose parent the actor can write.
+ */
+export async function resolveOutputPath(
+    services: { acl: ACLService; fs: FSService },
+    actor: Actor,
+    outputPath: string,
+): Promise<string> {
+    const username = actor.user?.username;
+    if (!actor.user?.id || !username) {
+        throw new HttpError(400, 'User ID required for puter_output_path', {
+            legacyCode: 'bad_request',
+        });
+    }
+    const resolved = normalizeAbsolutePath(
+        expandTildePath(outputPath, username),
+    );
+    const parentPath = pathPosix.dirname(resolved);
+    if (resolved === '/' || parentPath === '/') {
+        throw new HttpError(400, 'Cannot write to root path', {
+            legacyCode: 'cannot_write_to_root',
+        });
+    }
+
+    let ancestors: Promise<Array<{ uid: string; path: string }>> | null = null;
+    const canWrite = await services.acl.check(
+        actor,
+        {
+            path: parentPath,
+            resolveAncestors() {
+                ancestors ??= services.fs.getAncestorChain(parentPath);
+                return ancestors;
+            },
+        },
+        'write',
+    );
+    if (!canWrite) {
+        throw new HttpError(403, 'Write access denied for destination', {
+            legacyCode: 'access_denied',
+        });
+    }
+    return resolved;
+}
+
+/**
+ * Writes a generated image or video (a data URI, or a provider-minted URL) to
+ * `path` in the actor's filesystem. Write access is checked again first, since
+ * a share or grant can be revoked while the job runs; without it nothing is
+ * written and false is returned, leaving the (already billed) result to the
+ * caller.
+ */
+export async function saveGeneratedMediaToFS(
+    fsService: FSService,
+    actor: Actor,
+    result: unknown,
+    path: string,
+    media: { noun: 'image' | 'video'; defaultType: string },
+): Promise<boolean> {
+    if (typeof result !== 'string') {
+        throw new HttpError(
+            500,
+            `Unsupported ${media.noun} result format for puter_output_path`,
+            { legacyCode: 'internal_error' },
+        );
+    }
+
+    let buffer: Buffer;
+    let contentType: string;
+    const dataUri = parseDataUri(result, media.defaultType);
+    if (dataUri) {
+        buffer = dataUriBytes(dataUri);
+        contentType = dataUri.mimeType;
+    } else {
+        // Provider-minted URL, but fetched with the same SSRF guards as the
+        // input paths: it reaches an unauthenticated GET whose body lands in
+        // the user's filesystem. skipProxy because generated media is ours to
+        // download directly, not user input to screen.
+        ({ buffer, contentType } = await downloadGeneratedMedia(result, media));
+    }
+
+    if (!(await canStillWrite(fsService, actor, pathPosix.dirname(path)))) {
+        return false;
+    }
+    await fsService.write(actor.user!.id!, {
+        fileMetadata: {
+            path,
+            size: buffer.length,
+            contentType,
+            overwrite: true,
+            createMissingParents: true,
+        },
+        fileContent: Readable.from(buffer),
+    });
+    return true;
+}
+
+async function downloadGeneratedMedia(
+    url: string,
+    media: { noun: 'image' | 'video'; defaultType: string },
+): Promise<{ buffer: Buffer; contentType: string }> {
+    try {
+        const response = await secureFetch(url, {
+            skipProxy: true,
+            signal: AbortSignal.timeout(GENERATED_MEDIA_TIMEOUT_MS),
+        });
+        if (!response.ok) {
+            await response.body?.cancel();
+            throw new HttpError(
+                502,
+                `Failed to fetch generated ${media.noun} for FS write: ${response.status}`,
+                { legacyCode: 'internal_error' },
+            );
+        }
+        const buffer = await readBoundedBody(
+            response,
+            MAX_GENERATED_MEDIA_BYTES,
+            (maxBytes) =>
+                new HttpError(
+                    502,
+                    `Generated ${media.noun} exceeds ${maxBytes} bytes`,
+                    { legacyCode: 'internal_error' },
+                ),
+        );
+        return {
+            buffer,
+            contentType:
+                response.headers.get('content-type') ?? media.defaultType,
+        };
+    } catch (err) {
+        if (isUpstreamTimeoutError(err)) {
+            throw new HttpError(
+                504,
+                `Timed out fetching generated ${media.noun} for FS write`,
+                { legacyCode: 'upstream_timeout' },
+            );
+        }
+        throw err;
+    }
+}
+
+async function canStillWrite(
+    fsService: FSService,
+    actor: Actor,
+    parentPath: string,
+): Promise<boolean> {
+    try {
+        await fsService.checkFSAccess({ path: parentPath } as FSEntry, actor);
+        return true;
+    } catch (err) {
+        if (err instanceof HttpError && err.statusCode < 500) return false;
+        throw err;
+    }
+}

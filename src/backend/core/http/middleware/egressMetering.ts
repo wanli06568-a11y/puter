@@ -27,7 +27,9 @@ import {
     STORAGE_OP_USAGE_TYPES,
 } from '../../../services/metering/costs.js';
 import type { UsageInput } from '../../../services/metering/types';
+import { activeSubdomain } from '../../../util/subdomains';
 import '../expressAugmentation';
+import { onResponseClose } from '../onResponseClose';
 
 /**
  * Subset of the metering service this middleware needs. Metering is optional
@@ -107,8 +109,7 @@ const isMeteredHost = (req: Request): boolean => {
     // An explicit billing target is the opt-in for hosts that aren't metered
     // by default, so honour it whatever the subdomain says.
     if (req.egressActor) return true;
-    const subdomain = req.subdomains?.[req.subdomains.length - 1];
-    return !!subdomain && METERED_SUBDOMAINS.has(subdomain);
+    return METERED_SUBDOMAINS.has(activeSubdomain(req));
 };
 
 const storageOpUsages = (req: Request): UsageInput[] => {
@@ -195,7 +196,7 @@ export const createEgressMeteringMiddleware = (
         // 'close' rather than 'finish': it fires for a response that completed
         // AND for one whose connection died mid-stream, and an aborted download
         // still sent whatever it sent.
-        res.once('close', () => {
+        onResponseClose(res, () => {
             try {
                 if (!isMeteredHost(req)) return;
                 const actor = resolveEgressActor(req);

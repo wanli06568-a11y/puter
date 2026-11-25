@@ -226,7 +226,7 @@ describe('SuggestedAppsService hosted-backing guard', () => {
         // A store failure must not be read as "backing is fine" — an
         // unverifiable app is withheld rather than handed to the launcher.
         const spy = vi
-            .spyOn(server.stores.subdomain, 'getBySubdomain')
+            .spyOn(server.stores.subdomain, 'getBySubdomains')
             .mockRejectedValue(new Error('db down'));
         try {
             const suggested = await suggestFor(ext);
@@ -371,6 +371,17 @@ describe('SuggestedAppsService hosted-backing guard', () => {
         expect(names).toContain(name);
     });
 
+    it('offers viewer as the only built-in opener for images', async () => {
+        // An app named `draw` opens images only if it registers the
+        // extension like any other app.
+        const { userId } = await makeUser();
+        await pointBuiltinAt('viewer', userId, 'https://viewer.example.com/');
+        await pointBuiltinAt('draw', userId, 'https://draw.example.com/');
+
+        const names = (await suggestFor('tiff')).map((a) => a.name);
+        expect(names).toEqual(['viewer']);
+    });
+
     it('does not hit the subdomain store for non-hosted index_urls', async () => {
         // Built-ins and apps on a developer's own domain aren't on a
         // hosting domain, so the guard short-circuits on the URL alone.
@@ -384,13 +395,62 @@ describe('SuggestedAppsService hosted-backing guard', () => {
             ext,
         });
 
-        const spy = vi.spyOn(server.stores.subdomain, 'getBySubdomain');
+        const spy = vi.spyOn(server.stores.subdomain, 'getBySubdomains');
         try {
             const suggested = await suggestFor(ext);
             expect(suggested.find((a) => a.name === name)).toBeDefined();
             expect(spy).not.toHaveBeenCalled();
         } finally {
             spy.mockRestore();
+        }
+    });
+});
+
+describe('SuggestedAppsService lookups', () => {
+    it('checks every hosted candidate in one subdomain lookup', async () => {
+        const { userId } = await makeUser();
+        const ext = uniqueName('ext11').replace(/-/g, '');
+        const names: string[] = [];
+        for (let i = 0; i < 3; i++) {
+            const sub = uniqueName(`batch${i}`);
+            await server.stores.subdomain.create({ userId, subdomain: sub });
+            names.push(
+                await makeOpenerApp({ userId, indexUrl: hostedUrl(sub), ext }),
+            );
+        }
+
+        const batch = vi.spyOn(server.stores.subdomain, 'getBySubdomains');
+        try {
+            const suggested = await suggestFor(ext);
+            for (const name of names) {
+                expect(suggested.find((a) => a.name === name)).toBeDefined();
+            }
+            expect(batch).toHaveBeenCalledTimes(1);
+        } finally {
+            batch.mockRestore();
+        }
+    });
+
+    it('keeps the per-extension cache bounded', async () => {
+        const service = server.services.suggestedApps as unknown as {
+            getSuggestedAppsForEntries: (
+                entries: Array<{ name: string }>,
+            ) => Promise<unknown>;
+        };
+        await service.getSuggestedAppsForEntries(
+            Array.from({ length: 1100 }, (_, i) => ({ name: `f.x${i}` })),
+        );
+        // The first extension was evicted, so it is looked up again; the
+        // last one is still cached.
+        const byFiletype = vi.spyOn(server.stores.app, 'getAppsByFiletype');
+        try {
+            await service.getSuggestedAppsForEntries([{ name: 'f.x0' }]);
+            await service.getSuggestedAppsForEntries([{ name: 'f.x1099' }]);
+            expect(byFiletype.mock.calls.map(([ext]) => ext)).toEqual([
+                'x0',
+            ]);
+        } finally {
+            byFiletype.mockRestore();
         }
     });
 });

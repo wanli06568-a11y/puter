@@ -23,6 +23,7 @@ import item_icon from './itemIcon.js';
 import list_all_shared from './listAllShared.js';
 import parse_item_metadata from './parseItemMetadata.js';
 import { remember_shared_roots } from './sharedAccess.js';
+import { getFolderView } from './folderViewPrefs.js';
 
 const refresh_item_container = function (el_item_container, options) {
     // start a transaction
@@ -72,9 +73,13 @@ const refresh_item_container = function (el_item_container, options) {
         }
 
         // show the loading spinner
+        $(loading_spinner).find('.explorer-loading-spinner-msg').text(`${i18n('loading')}...`);
         $(loading_spinner).show();
         setTimeout(function () {
-            $(loading_spinner).find('.explorer-loading-spinner-msg').html('Taking a little longer than usual. Please wait...');
+            // only a load that is still running has taken long
+            if ( is_current() && $(loading_spinner).is(':visible') ) {
+                $(loading_spinner).find('.explorer-loading-spinner-msg').text(i18n('taking_longer_than_usual'));
+            }
         }, 3000);
     }, 1000);
 
@@ -98,43 +103,48 @@ const refresh_item_container = function (el_item_container, options) {
             return;
         }
         if ( el_window ) {
+            // the class is how a deleted folder's windows are found, and a window opened by path starts without it
+            $(el_window).removeClass(`window-${$(el_window).attr('data-uid')}`).addClass(`window-${fsentry.id}`);
             $(el_window).attr('data-uid', fsentry.id);
-            $(el_window).attr('data-sort_by', fsentry.sort_by ?? 'name');
-            $(el_window).attr('data-sort_order', fsentry.sort_order ?? 'asc');
-            $(el_window).attr('data-layout', fsentry.layout ?? 'icons');
             // data-name
-            $(el_window).attr('data-name', html_encode(fsentry.name));
+            $(el_window).attr('data-name', fsentry.name);
             // data-path
-            $(el_window).attr('data-path', html_encode(container_path));
+            $(el_window).attr('data-path', container_path);
             $(el_window).find('.window-navbar-path-input').val(container_path);
             $(el_window).find('.window-navbar-path-input').attr('data-path', container_path);
         }
-        $(el_item_container).attr('data-sort_by', fsentry.sort_by ?? 'name');
-        $(el_item_container).attr('data-sort_order', fsentry.sort_order ?? 'asc');
-        // update layout
-        if ( el_window && el_window.length > 0 )
-        {
-            window.update_window_layout(el_window, fsentry.layout);
-        }
-        //
-        if ( fsentry.layout === 'details' ) {
-            window.update_details_layout_sort_visuals(el_window, fsentry.sort_by, fsentry.sort_order);
-        }
+        return getFolderView(fsentry).then(view => {
+            if ( ! is_current() ) {
+                return;
+            }
+            // Items may already be in, placed by the sort the container had before.
+            const resort = $(el_item_container).attr('data-sort_by') !== view.sort_by
+                || $(el_item_container).attr('data-sort_order') !== view.sort_order;
+            $(el_item_container).attr('data-sort_by', view.sort_by);
+            $(el_item_container).attr('data-sort_order', view.sort_order);
+            if ( el_window && el_window.length > 0 ) {
+                $(el_window).attr('data-sort_by', view.sort_by);
+                $(el_window).attr('data-sort_order', view.sort_order);
+                window.update_window_layout(el_window, view.layout);
+                if ( view.layout === 'details' ) {
+                    window.update_details_layout_sort_visuals(el_window, view.sort_by, view.sort_order);
+                }
+            }
+            if ( resort ) {
+                window.sort_items(el_item_container, view.sort_by, view.sort_order);
+            }
+        });
+    }).catch(() => {
+        // The listing request below reports the failure to the user.
     });
-
-    // is_directoryPicker
-    let is_directoryPicker = $(el_window).attr('data-is_directoryPicker');
-    is_directoryPicker = (is_directoryPicker === 'true' || is_directoryPicker === '1') ? true : false;
 
     // allowed_file_types
     let allowed_file_types = $(el_window).attr('data-allowed_file_types');
 
-    // is_directoryPicker
-    let is_openFileDialog = $(el_window).attr('data-is_openFileDialog');
-    is_openFileDialog = (is_openFileDialog === 'true' || is_openFileDialog === '1') ? true : false;
-
     // remove all existing items
     $(el_item_container).find('.item').removeItems();
+    // removing the last row shows the empty message, which is wrong while the folder is loading
+    $(empty_message).hide();
 
     // get items with subdomains/workers included to avoid per-item stat calls
     const entries_promise = is_shared_view
@@ -159,6 +169,7 @@ const refresh_item_container = function (el_item_container, options) {
             shared_by: share.issuer,
             owner: share.owner,
             holder_team: share.holderTeam,
+            also_team_share: share.alsoHeldByTeam,
             metadata: '',
         })))
         : puter.fs.readdir({ path: container_path, consistency: options.consistency ?? 'eventual' });
@@ -205,12 +216,6 @@ const refresh_item_container = function (el_item_container, options) {
                     const fsentry = fsentries[index];
                     let is_disabled = false;
 
-                    // disable files if this is a showDirectoryPicker() window
-                    if ( is_directoryPicker && !fsentry.is_dir )
-                    {
-                        is_disabled = true;
-                    }
-
                     // if this item is not allowed because of filetype restrictions, disable it
                     if ( ! window.check_fsentry_against_allowed_file_types_string(fsentry, allowed_file_types) )
                     {
@@ -235,7 +240,6 @@ const refresh_item_container = function (el_item_container, options) {
                     if ( item_path !== window.trash_path && item_path !== window.appdata_path ) {
                     // if this is trash, get original name from item metadata
                         fsentry.name = metadata.original_name ?? fsentry.name;
-                        const position = window.desktop_item_positions[fsentry.uid] ?? undefined;
                         UIItem({
                             appendTo: el_item_container,
                             uid: fsentry.uid,
@@ -245,7 +249,6 @@ const refresh_item_container = function (el_item_container, options) {
                             icon: await item_icon(fsentry),
                             name: fsentry.name,
                             is_dir: fsentry.is_dir,
-                            multiselectable: !is_openFileDialog,
                             has_website: fsentry.has_website,
                             metadata: fsentry.metadata,
                             is_shortcut: fsentry.is_shortcut,
@@ -258,42 +261,17 @@ const refresh_item_container = function (el_item_container, options) {
                             suggested_apps: fsentry.suggested_apps,
                             disabled: is_disabled,
                             visible: visible,
-                            position: position,
                             shared_with_me: fsentry.shared_with_me,
                             share_mode: fsentry.share_mode,
                             shared_by: fsentry.shared_by,
                             is_shared: fsentry.is_shared,
                             is_team_share: !!fsentry.holder_team,
+                            is_also_team_share: fsentry.also_team_share === true,
                             owner: fsentry.owner?.username ?? fsentry.owner,
                         });
                     }
                 }
 
-                // if this is desktop, add Trash
-                if ( $(el_item_container).hasClass('desktop') ) {
-                    try {
-                        const trash = await puter.fs.stat({ path: window.trash_path, consistency: options.consistency ?? 'eventual' });
-                        if ( ! is_current() ) {
-                            return;
-                        }
-                        UIItem({
-                            appendTo: el_item_container,
-                            uid: trash.id,
-                            immutable: trash.immutable,
-                            path: window.trash_path,
-                            icon: { image: (trash.is_empty ? window.icons['trash.svg'] : window.icons['trash-full.svg']), type: 'icon' },
-                            name: trash.name,
-                            is_dir: trash.is_dir,
-                            sort_by: trash.sort_by,
-                            type: trash.type,
-                            is_trash: true,
-                            sortable: false,
-                        });
-                        window.sort_items(el_item_container, $(el_item_container).attr('data-sort_by'), $(el_item_container).attr('data-sort_order'));
-                    } catch (e) {
-                    // Ignored
-                    }
-                }
                 // sort items
                 window.sort_items(
                     el_item_container,
@@ -349,6 +327,11 @@ const refresh_item_container = function (el_item_container, options) {
         // show error message
         $(error_message).html(`Failed to load directory${ html_encode((e && e.message ? `: ${ e.message}` : ''))}`);
         $(error_message).show();
+
+        // the previous folder's items are gone, so its count must not linger
+        if ( el_window ) {
+            window.update_explorer_footer_item_count(el_window);
+        }
 
         // Call onComplete callback even in error case, since the "loading" is technically complete
         if ( options.onComplete && typeof options.onComplete === 'function' ) {

@@ -18,11 +18,12 @@
  */
 
 import axios from 'axios';
+import { isRedisUnavailable } from '../../clients/redis/commandTimeout.js';
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Agent as HttpsAgent } from 'node:https';
 import { IBroadcastPeerConfig } from '../../types.js';
-import { settleWithin } from '../../util/concurrency.js';
-import { FINAL_FLUSH_TIMEOUT_MS } from '../../util/gracefulShutdown.js';
+import { finalFlush } from '../../util/gracefulShutdown.js';
+import { nowSeconds } from '../../util/time.js';
 import { PuterService } from '../types.js';
 
 // -- Wire types ------------------------------------------------------
@@ -115,6 +116,8 @@ export class BroadcastService extends PuterService {
     #peersByKey: Record<string, IBroadcastPeerConfig> = {};
     /** Subset of peers with `webhook: true`, used for outbound fan-out. */
     #webhookPeers: IBroadcastPeerConfig[] = [];
+    /** Ids of `#webhookPeers`, read per delivery, so built once with them. */
+    #addressablePeers: string[] = [];
     /** Identifier used to tell what server a redis fan-out is coming from. */
     #redisSourceId: string = `${this.config.serverId}:${randomUUID()}`;
 
@@ -158,6 +161,7 @@ export class BroadcastService extends PuterService {
         timeout: PEER_SOCKET_IDLE_MS,
     });
     #redisSub: ReturnType<typeof this.clients.redis.duplicate> | null = null;
+    #publishFailingFast = false;
 
     // -- Lifecycle ---------------------------------------------------
 
@@ -191,18 +195,10 @@ export class BroadcastService extends PuterService {
             clearTimeout(this.#outboundFlushTimer);
             this.#outboundFlushTimer = null;
         }
-        const deadline = Date.now() + FINAL_FLUSH_TIMEOUT_MS;
-        const drain = async () => {
-            try {
-                await this.#outboundFlush;
-                if (Date.now() < deadline) await this.#flushOutboundEvents();
-            } catch (err) {
-                console.warn('[broadcast] final flush failed', err);
-            }
-        };
-        if (!(await settleWithin(drain(), FINAL_FLUSH_TIMEOUT_MS))) {
-            console.warn('[broadcast] final flush timed out');
-        }
+        await finalFlush('broadcast', async (deadline) => {
+            await this.#outboundFlush;
+            if (Date.now() < deadline) await this.#flushOutboundEvents();
+        });
     }
 
     // -- Public API used by BroadcastController ----------------------
@@ -254,9 +250,7 @@ export class BroadcastService extends PuterService {
 
     /** Peers this node may address directly, by id. */
     get addressablePeers(): string[] {
-        return this.#webhookPeers
-            .map((peer) => this.#resolvePeerIdOf(peer))
-            .filter((id): id is string => id !== null);
+        return this.#addressablePeers;
     }
 
     /**
@@ -375,22 +369,52 @@ export class BroadcastService extends PuterService {
     #pubsubFanout(key: string, data: unknown, meta: object): void {
         const safeMeta = this.#normalizeMeta(meta);
         if (safeMeta.from_fanout) return;
-        this.clients.redis.publish(
-            'pubsub',
-            JSON.stringify({
-                key,
-                data,
-                meta: safeMeta,
-                source: this.#redisSourceId,
-            }),
-        );
+        this.clients.redis
+            .publish(
+                'pubsub',
+                JSON.stringify({
+                    key,
+                    data,
+                    meta: safeMeta,
+                    source: this.#redisSourceId,
+                }),
+            )
+            .then(
+                () => {
+                    this.#publishFailingFast = false;
+                },
+                (err: unknown) => {
+                    // One warning per stretch of failing fast.
+                    if (isRedisUnavailable(err)) {
+                        if (this.#publishFailingFast) return;
+                        this.#publishFailingFast = true;
+                    }
+                    console.warn('[broadcast] pubsub publish failed', err);
+                },
+            );
+    }
+
+    #subscribePubsub(attempt: number): void {
+        const sub = this.#redisSub;
+        if (!sub) return;
+        sub.subscribe('pubsub').catch((err: unknown) => {
+            if (this.#redisSub !== sub) return;
+            const delayMs = Math.min(1000 * 2 ** attempt, 30_000);
+            console.warn(
+                `[broadcast] pubsub subscribe failed, retrying in ${delayMs}ms`,
+                err,
+            );
+            setTimeout(() => {
+                if (this.#redisSub === sub) this.#subscribePubsub(attempt + 1);
+            }, delayMs).unref();
+        });
     }
 
     // outer.pubsub.* events will be broadcast to other clusters through webhooks
     // pubsub.* will only fan-out to same-cluster nodes.
     #subscribeRedisOutbound(): void {
         this.#redisSub = this.clients.redis.duplicate();
-        this.#redisSub.subscribe('pubsub');
+        this.#subscribePubsub(0);
         this.#redisSub.on('message', (channel: string, message: string) => {
             if (channel !== 'pubsub') return;
             const parsed = JSON.parse(message);
@@ -619,7 +643,7 @@ export class BroadcastService extends PuterService {
         // can't emit colliding nonces that the receiver would reject.
         const nextNonce = await this.#nextOutgoingNonce(peerId);
 
-        const timestamp = Math.floor(Date.now() / 1000);
+        const timestamp = nowSeconds();
         const payloadToSign = `${timestamp}.${nextNonce}.${rawBody}`;
         const signature = createHmac('sha256', mySecret)
             .update(payloadToSign)
@@ -769,7 +793,7 @@ export class BroadcastService extends PuterService {
                 status: 400,
                 message: 'Invalid X-Broadcast-Timestamp',
             };
-        const nowSec = Math.floor(Date.now() / 1000);
+        const nowSec = nowSeconds();
         const window = this.#webhookReplayWindowSeconds;
         // 60s of forward tolerance for clock skew; the rest is replay-
         // window backstop.
@@ -879,6 +903,7 @@ export class BroadcastService extends PuterService {
             };
             if (peerCfg.webhook) {
                 this.#webhookPeers.push({ ...peerCfg, peerId });
+                this.#addressablePeers.push(peerId);
             } else {
                 console.warn(
                     '[broadcast] non-webhook peer ignored (websocket transport disabled in v2)',

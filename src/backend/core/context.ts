@@ -69,11 +69,11 @@ export interface KnownContextFields {
      */
     abortSignal: AbortSignal;
     /**
-     * Keeps the call's concurrency slot until `work` settles (set by
-     * DriverController when the method is capped), for work that outlives the
-     * response.
+     * Keeps the request's concurrency slot until `work` settles, for work that
+     * outlives the response. Set by DriverController for a capped method and by
+     * the route concurrency gate.
      */
-    keepDriverSlot: (work: Promise<unknown>) => void;
+    keepConcurrencySlot: (work: Promise<unknown>) => void;
     /**
      * Aborts the chat driver's upstream request. A client disconnect doesn't
      * fire it: the upstream bills a request it has accepted either way, so the
@@ -102,7 +102,7 @@ const KNOWN_KEY_FLAGS: Record<keyof KnownContextFields, true> = {
     requestId: true,
     driverName: true,
     abortSignal: true,
-    keepDriverSlot: true,
+    keepConcurrencySlot: true,
     upstreamSignal: true,
     strictUpstreamErrors: true,
     platformWrite: true,
@@ -142,14 +142,11 @@ export class Context {
      * `unknown`. Returns `undefined` when called outside a request scope or
      * when the key hasn't been set.
      */
-    /** Get the entire context store (no-arg form). */
-    static get(): ContextStore | undefined;
     static get<K extends keyof KnownContextFields>(
         key: K,
     ): KnownContextFields[K] | undefined;
     static get(key: string): unknown;
-    static get(key?: string): unknown {
-        if (key === undefined) return als.getStore();
+    static get(key: string): unknown {
         const store = als.getStore();
         if (!store) return undefined;
         if (KNOWN_KEYS.has(key)) {

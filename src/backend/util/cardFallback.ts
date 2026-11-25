@@ -41,6 +41,10 @@ import { BoundedTtlMap } from './boundedTtlMap';
 export const SEND_PHONE_RATE_LIMIT = 10;
 export const SEND_PHONE_RATE_WINDOW_MS = 60 * 60_000;
 
+/** Codes sent to a number on file, per account and day. */
+export const PHONE_ON_FILE_SENDS_PER_DAY = 2;
+export const PHONE_ON_FILE_SEND_WINDOW_MS = 24 * 60 * 60_000;
+
 /**
  * How long the fallback stays open once it opens. Deliberately much longer than
  * the attempt counter's window: the counter exists to detect exhaustion, and
@@ -60,8 +64,22 @@ export const cardFallbackFlagKey = (userId: number): string =>
 /** The user fields the rule reads. */
 export interface PhoneGatedUser {
     id?: number | null;
+    phone?: string | null;
+    card_fingerprint?: string | null;
     requires_phone_verification?: boolean | number | null;
+    requires_card_verification?: boolean | number | null;
 }
+
+/**
+ * Whether a card can stand in for this account's phone gate at all. A number on
+ * file is stood in for only by the card on file. Without one, an account that
+ * owes or has verified a card owes its phone as well.
+ */
+export const canCardReplacePhone = (user: PhoneGatedUser): boolean => {
+    if (!user.requires_phone_verification) return false;
+    if (user.phone) return Boolean(user.card_fingerprint);
+    return !user.requires_card_verification && !user.card_fingerprint;
+};
 
 /** Reads one system-KV key; resolves whatever was stored (or null/undefined). */
 export type ReadKvFlag = (key: string) => Promise<unknown>;
@@ -97,6 +115,8 @@ export interface CardFallbackDeps {
      * installed.
      */
     probeCardVerification: () => Promise<boolean | null>;
+    /** An extension's answer for `enabled` in place of config; null when none. */
+    probeEnabledOverride: () => Promise<boolean | null>;
 }
 
 /** The clients that answer {@link CardFallbackDeps}. */
@@ -122,6 +142,15 @@ export function cardFallbackDepsFrom(
                 {},
             );
             return status.enabled;
+        },
+        probeEnabledOverride: async () => {
+            const policy: { enabled: boolean | null } = { enabled: null };
+            await clients.event?.emitAndWait(
+                'puter.card-fallback.policy',
+                policy,
+                {},
+            );
+            return policy.enabled;
         },
     };
 }
@@ -173,11 +202,19 @@ export async function isCardVerificationEnabled(
  * both halves actually work, off otherwise. Without that conjunction the offer
  * could show up on a deployment with no card gate behind it, where taking it
  * strands the user on a dialog that can only fail.
+ *
+ * An extension answering `puter.card-fallback.policy` wins over config.
  */
 export async function isCardFallbackEnabled(
     config: Pick<IConfig, 'phone_verification_card_fallback'>,
     deps: CardFallbackDeps,
 ): Promise<boolean> {
+    try {
+        const override = await deps.probeEnabledOverride();
+        if (typeof override === 'boolean') return override;
+    } catch (e) {
+        console.warn('[card-verification] fallback policy probe failed:', e);
+    }
     const configured = config.phone_verification_card_fallback?.enabled;
     if (typeof configured === 'boolean') return configured;
     if (!deps.smsConfigured()) return false;
@@ -199,7 +236,7 @@ export async function isCardFallbackEligible(
     readFlag: ReadKvFlag,
     deps: CardFallbackDeps,
 ): Promise<boolean> {
-    if (!user.requires_phone_verification) return false;
+    if (!canCardReplacePhone(user)) return false;
     if (typeof user.id !== 'number') return false;
     if (!(await isCardFallbackEnabled(config, deps))) return false;
     try {

@@ -29,6 +29,7 @@ const { activeAuthFlow } = await import('./authFlow.js');
 const { default: UIAuthSignup, signupRedirectUrl } = await import('./UIAuthSignup.js');
 const { default: UIAuthAccountPicker } = await import('./UIAuthAccountPicker.js');
 const { default: UIAuthRecoverPassword } = await import('./UIAuthRecoverPassword.js');
+const { default: UIAuthLogin } = await import('./UIAuthLogin.js');
 
 const providers = (body) => {
     globalThis.fetch = vi.fn(async () => reply(200, body));
@@ -110,7 +111,12 @@ describe('signup when only OIDC signups are open', () => {
         globalThis.fetch = vi.fn(() => new Promise((resolve) => {
             answer = resolve;
         }));
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
         void UIAuthSignup();
+        // A slow lookup gives up the wait and shows the form.
+        vi.advanceTimersByTime(1500);
+        vi.useRealTimers();
+        expect($('.signup-form').prop('hidden')).toBe(false);
         $('[name="username"]').val('started');
         answer(reply(200, { providers: ['google'] }));
         await vi.waitFor(() => expect($('.oidc-google-btn')).toHaveLength(1));
@@ -118,7 +124,57 @@ describe('signup when only OIDC signups are open', () => {
     });
 });
 
+describe('signup while the providers are looked up', () => {
+    /** Lets promise callbacks run, but no timer, so nothing a paint could show in between. */
+    const settlePromises = async () => {
+        for ( let i = 0; i < 10; i++ ) await Promise.resolve();
+    };
+
+    it('keeps the email form hidden until the providers are known', async () => {
+        let answer;
+        globalThis.fetch = vi.fn(() => new Promise((resolve) => {
+            answer = resolve;
+        }));
+        void UIAuthSignup();
+        expect($('.signup-form').prop('hidden')).toBe(true);
+        answer(reply(200, { providers: ['google'] }));
+        await vi.waitFor(() => expect($('.oidc-google-btn')).toHaveLength(1));
+        expect($('.signup-form').prop('hidden')).toBe(true);
+        expect($('.signup-with-email-wrapper').prop('hidden')).toBe(false);
+    });
+
+    it('shows the email form when no providers are offered', async () => {
+        void UIAuthSignup();
+        await vi.waitFor(() => expect($('.signup-form').prop('hidden')).toBe(false));
+        expect($('.signup-with-email-wrapper').prop('hidden')).toBe(true);
+    });
+
+    it('shows a prefilled email form straight away', () => {
+        globalThis.fetch = vi.fn(() => new Promise(() => {}));
+        void UIAuthSignup({ email: 'someone@example.com' });
+        expect($('.signup-form').prop('hidden')).toBe(false);
+    });
+
+    it('reuses the login screen\'s lookup, drawing the providers before any paint', async () => {
+        providers({ providers: ['google'], signupOidcOnly: false });
+        void UIAuthLogin({ reload_on_success: false });
+        await vi.waitFor(() => expect(screen().find('.oidc-google-btn')).toHaveLength(1));
+        screen().find('.auth-to-signup').trigger('click');
+        await settlePromises();
+        expect(screen().attr('data-screen')).toBe('signup');
+        expect(screen().find('.oidc-google-btn')).toHaveLength(1);
+        expect(screen().find('.signup-with-email-wrapper').prop('hidden')).toBe(false);
+        expect(fetch).toHaveBeenCalledOnce();
+    });
+});
+
 describe('signup form', () => {
+    beforeEach(() => {
+        window.update_auth_data = vi.fn(async (token) => {
+            window.auth_token = token;
+        });
+    });
+
     it.each([
         [{}, 'username_required', 'username'],
         [{ username: 'a' }, 'email_required', 'email'],
@@ -252,6 +308,63 @@ describe('signup form', () => {
         for ( const gate of [gates.email, gates.phone, gates.card] ) {
             expect(gate.mock.calls[0][0].window_options).toEqual(window_options);
         }
+    });
+
+    describe('while the account checks are up', () => {
+        const signUp = async (options = { reload_on_success: false }) => {
+            const calls = captureAjax();
+            const result = UIAuthSignup(options);
+            fillForm();
+            $('.signup-form').trigger('submit');
+            await vi.waitFor(() => expect(calls).toHaveLength(1));
+            calls[0].success({ token: 't', user: { requires_phone_verification: true } });
+            return { calls, result };
+        };
+
+        it('keeps the signup open, out of sight, so another sign-in prompt waits on it', async () => {
+            let clearPhone;
+            gates.phone.mockImplementation(() => new Promise((resolve) => {
+                clearPhone = resolve;
+            }));
+            const { result } = await signUp();
+            await vi.waitFor(() => expect(gates.phone).toHaveBeenCalled());
+            expect($('.auth-dialog-overlay').is(':visible')).toBe(false);
+
+            const second = UIAuthLogin({ reload_on_success: false });
+            expect($('.auth-dialog')).toHaveLength(1);
+
+            clearPhone(true);
+            await expect(result).resolves.toBe(true);
+            await expect(second).resolves.toBe(true);
+        });
+
+        it('does not finish signing up when the page moved to another account', async () => {
+            gates.phone.mockImplementation(async () => {
+                window.auth_token = 'another-account';
+                return true;
+            });
+            const { result } = await signUp();
+            await expect(result).resolves.toBe(false);
+        });
+
+        it('does not reload into the landing when the page moved to another account', async () => {
+            const original = window.location;
+            const navigate = { replace: vi.fn(), reload: vi.fn() };
+            delete window.location;
+            window.location = { href: 'https://puter.test/start', origin: 'https://puter.test', pathname: '/start', search: '', hash: '', ...navigate };
+            try {
+                gates.phone.mockImplementation(async () => {
+                    window.auth_token = 'another-account';
+                    return true;
+                });
+                const { result } = await signUp({ reload_on_success: true });
+                await expect(result).resolves.toBe(false);
+                expect(navigate.replace).not.toHaveBeenCalled();
+                expect(navigate.reload).not.toHaveBeenCalled();
+            } finally {
+                window.location = original;
+            }
+        });
     });
 
     it('keeps an app landing after a signup that reloads', () => {

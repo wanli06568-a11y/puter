@@ -1365,6 +1365,7 @@ describe('WebDAVController verbs', () => {
                 callback();
             },
         });
+        sink.on('error', () => {});
         sink.on('finish', () => {
             captured.ended = true;
         });
@@ -1817,6 +1818,21 @@ describe('WebDAVController verbs', () => {
             expect(xml).toContain('<D:resourcetype></D:resourcetype>');
             expect(xml).toContain(
                 '<D:getcontenttype>text/markdown</D:getcontenttype>',
+            );
+        });
+
+        it('reports the content type of any registered extension', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/report.docx`;
+            await putFile(actor, path, 'hello');
+
+            const captured = await dispatch({
+                method: 'PROPFIND',
+                path,
+                actor,
+            });
+            expect(captured.body as string).toContain(
+                '<D:getcontenttype>application/vnd.openxmlformats-officedocument.wordprocessingml.document</D:getcontenttype>',
             );
         });
 

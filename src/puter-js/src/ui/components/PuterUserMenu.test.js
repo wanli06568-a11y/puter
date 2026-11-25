@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 // @vitest-environment-options {"url": "https://notes.puter.com/sheet"}
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import PuterUserMenu, { canFrameAppBrowser } from './PuterUserMenu.js';
+import PuterUserMenu from './PuterUserMenu.js';
 
-const USER = { username: 'jelveh', uuid: '0b1c9a52-3f0e-4c7a-9a65-2f6d1e8b7c40' };
+const USER = { username: 'jelveh', uuid: '0b1c9a52-3f0e-4c7a-9a65-2f6d1e8b7c40', email: 'jelveh@example.com' };
 const OTHER = { username: 'sam', uuid: '7d2e4f10-8a3b-4c5d-9e6f-0a1b2c3d4e5f' };
 const TEMP = { username: 'quiet_otter_42', uuid: '5c4b3a29-1807-4f6e-9d5c-4b3a29180716', is_temp: true };
 const PICTURE = 'data:image/png;base64,iVBORw0KGgo=';
@@ -13,6 +13,7 @@ const TRIGGER_RECT = { left: 800, right: 836, top: 10, bottom: 46, width: 36, he
 /** The SDK instance the component reads, holding one signed-in state at a time. */
 const fakePuter = ({ token = null, user = null, picture = null } = {}) => {
     const listeners = new Set();
+    const upgradeListeners = new Set();
     let currentPicture = picture;
     const sdk = {
         env: 'web',
@@ -23,6 +24,15 @@ const fakePuter = ({ token = null, user = null, picture = null } = {}) => {
         onAuthStateChanged: (listener) => {
             listeners.add(listener);
             return () => listeners.delete(listener);
+        },
+        ui: {
+            showFeedbackDialog: vi.fn(() => new Promise(() => {})),
+            showTopUp_: vi.fn(() => new Promise(() => {})),
+            showUpgrade_: vi.fn(() => new Promise(() => {})),
+            onUpgraded_: (listener) => {
+                upgradeListeners.add(listener);
+                return () => upgradeListeners.delete(listener);
+            },
         },
         auth: {
             getProfilePicture: vi.fn(async () => currentPicture),
@@ -37,7 +47,12 @@ const fakePuter = ({ token = null, user = null, picture = null } = {}) => {
             for ( const listener of listeners ) listener();
             sdk.whoamiCache_ = Promise.resolve(nextUser);
         },
-        listenerCount: () => listeners.size,
+        // What the SDK does when an upgrade framed on the page reports a plan.
+        upgrade (account) {
+            account.subscribed = true;
+            for ( const listener of upgradeListeners ) listener();
+        },
+        listenerCount: () => listeners.size + upgradeListeners.size,
     };
     return sdk;
 };
@@ -74,24 +89,6 @@ afterEach(() => {
     document.body.innerHTML = '';
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
-});
-
-describe('canFrameAppBrowser', () => {
-    it.each([
-        ['https://notes.puter.com/a', 'https://puter.com', true],
-        ['https://NOTES.puter.com./a', 'https://puter.com', true],
-        ['http://notes.puter.localhost:4100/', 'http://puter.localhost:4100', true],
-        ['https://puter.com/', 'https://puter.com', false],
-        ['https://a.b.puter.com/', 'https://puter.com', false],
-        ['https://notputer.com/', 'https://puter.com', false],
-        ['https://notes.puter.com.evil.com/', 'https://puter.com', false],
-        ['http://notes.puter.com/', 'https://puter.com', false],
-        ['https://notes.puter.com:8443/', 'https://puter.com', false],
-        ['https://notes.puter.site/', 'https://puter.com', false],
-        [undefined, 'https://puter.com', false],
-    ])('%s under %s is %s', (page, gui, expected) => {
-        expect(canFrameAppBrowser(page, gui)).toBe(expected);
-    });
 });
 
 describe('<puter-user-menu>', () => {
@@ -182,13 +179,370 @@ describe('<puter-user-menu>', () => {
         part(el, '.avatar').click();
         expect(shown(el, '.menu')).toBe(true);
         expect(part(el, '.avatar').getAttribute('aria-expanded')).toBe('true');
-        expect(part(el, '.menu-user').textContent).toBe('jelveh');
+        expect(part(el, '.menu-username').textContent).toBe('jelveh');
+        expect(part(el, '.menu-email').textContent).toBe(USER.email);
+        expect(shown(el, '.menu-email')).toBe(true);
+        expect(part(el, '.menu-avatar').textContent).toBe('J');
 
         part(el, '.apps-button').click();
         expect(shown(el, '.menu')).toBe(false);
         expect(appsOpen(el)).toBe(true);
         expect(part(el, '.apps-button').getAttribute('aria-expanded')).toBe('true');
         expect(frameOf(el).src).toBe(`https://puter.com/embed/apps#user=${USER.uuid}`);
+    });
+
+    it('links to the account, its usage and Puter, each in a new tab', async () => {
+        vi.stubGlobal('puter', fakePuter({ token: 'app-token', user: USER }));
+        const el = await mount();
+        part(el, '.avatar').click();
+        expect(el.shadowRoot.activeElement).toBe(part(el, '.manage-account'));
+        const links = [...el.shadowRoot.querySelectorAll('.menu a.menu-item')].map(link => ({
+            label: link.textContent,
+            href: link.href,
+            target: link.target,
+            rel: link.rel,
+        }));
+        expect(links).toEqual([
+            { label: 'Manage account', href: 'https://puter.com/dashboard/#account', target: '_blank', rel: 'noopener' },
+            { label: 'Usage', href: 'https://puter.com/dashboard/#usage', target: '_blank', rel: 'noopener' },
+            { label: 'Open Puter', href: 'https://puter.com/', target: '_blank', rel: 'noopener' },
+        ]);
+
+        part(el, '.usage').dispatchEvent(new MouseEvent('click', { cancelable: true }));
+        expect(shown(el, '.menu')).toBe(false);
+    });
+
+    it('hides the email line when the account has none to show', async () => {
+        vi.stubGlobal('puter', fakePuter({ token: 'app-token', user: OTHER }));
+        const el = await mount();
+        part(el, '.avatar').click();
+        expect(part(el, '.menu-username').textContent).toBe('sam');
+        expect(shown(el, '.menu-email')).toBe(false);
+    });
+
+    it('shows the profile picture in the menu header too', async () => {
+        vi.stubGlobal('puter', fakePuter({ token: 'app-token', user: USER, picture: PICTURE }));
+        const el = await mount();
+        expect(part(el, '.menu-avatar img').getAttribute('src')).toBe(PICTURE);
+        expect(part(el, '.menu-avatar').textContent).toBe('J');
+    });
+
+    it('opens the feedback dialog from the menu', async () => {
+        const sdk = fakePuter({ token: 'app-token', user: USER });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        part(el, '.avatar').click();
+        part(el, '.feedback').click();
+        expect(sdk.ui.showFeedbackDialog).toHaveBeenCalledTimes(1);
+        expect(shown(el, '.menu')).toBe(false);
+    });
+
+    it('leaves the Upgrade button out when the page sets hide-upgrade', async () => {
+        vi.stubGlobal('puter', fakePuter({ token: 'app-token', user: USER }));
+        const el = await mount({ 'hide-upgrade': '' });
+        expect(shown(el, '.avatar')).toBe(true);
+        expect(shown(el, '.upgrade-button')).toBe(false);
+    });
+
+    it('shows the Upgrade button beside the Apps button and opens the upgrade from it', async () => {
+        const sdk = fakePuter({ token: 'app-token', user: USER });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        expect(shown(el, '.upgrade-button')).toBe(true);
+        expect(part(el, '.upgrade-button').textContent).toBe('Upgrade');
+        expect(part(el, '.upgrade-button').nextElementSibling).toBe(part(el, '.apps-button'));
+
+        part(el, '.apps-button').click();
+        part(el, '.upgrade-button').click();
+        expect(sdk.ui.showUpgrade_).toHaveBeenCalledTimes(1);
+        expect(appsOpen(el)).toBe(false);
+    });
+
+    it('opens the upgrade once for a double-click', async () => {
+        const sdk = fakePuter({ token: 'app-token', user: USER });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        const button = part(el, '.upgrade-button');
+        button.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
+        button.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 2 }));
+        expect(sdk.ui.showUpgrade_).toHaveBeenCalledTimes(1);
+
+        // Enter or Space, and a later single click, each open it.
+        button.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 0 }));
+        button.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
+        expect(sdk.ui.showUpgrade_).toHaveBeenCalledTimes(3);
+    });
+
+    it.each([
+        ['signed out', {}],
+        ['on a temporary account', { token: 'temp-token', user: TEMP }],
+    ])('shows the Upgrade button beside Sign in %s', async (_label, state) => {
+        vi.stubGlobal('puter', fakePuter(state));
+        const el = await mount();
+        expect(shown(el, '.sign-in')).toBe(true);
+        expect(shown(el, '.upgrade-button')).toBe(true);
+        expect(part(el, '.upgrade-button').textContent).toBe('Upgrade');
+    });
+
+    it('signs in from the Upgrade button when signed out, then opens the upgrade', async () => {
+        const sdk = fakePuter();
+        sdk.auth.signIn.mockImplementation(async () => {
+            sdk.signInAs('app-token', USER);
+            return { success: true };
+        });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        const signins = [];
+        el.addEventListener('signin', event => signins.push(event.detail));
+        part(el, '.upgrade-button').click();
+        expect(sdk.auth.signIn).toHaveBeenCalledTimes(1);
+        expect(sdk.ui.showUpgrade_).not.toHaveBeenCalled();
+        await settle();
+        expect(signins).toEqual([{ user: USER }]);
+        expect(sdk.ui.showUpgrade_).toHaveBeenCalledTimes(1);
+        expect(shown(el, '.avatar')).toBe(true);
+        expect(shown(el, '.upgrade-button')).toBe(true);
+    });
+
+    it('signs a temporary account in before its upgrade', async () => {
+        const sdk = fakePuter({ token: 'temp-token', user: TEMP });
+        sdk.auth.signIn.mockImplementation(async () => {
+            sdk.signInAs('app-token', USER);
+            return { success: true };
+        });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        part(el, '.upgrade-button').click();
+        expect(sdk.auth.signIn).toHaveBeenCalledTimes(1);
+        await settle();
+        expect(sdk.ui.showUpgrade_).toHaveBeenCalledTimes(1);
+    });
+
+    it('opens no upgrade when the sign-in it asks for is closed', async () => {
+        const sdk = fakePuter();
+        sdk.auth.signIn.mockImplementation(async () => {
+            throw new Error('closed');
+        });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        part(el, '.upgrade-button').click();
+        await settle();
+        expect(sdk.ui.showUpgrade_).not.toHaveBeenCalled();
+        expect(shown(el, '.sign-in')).toBe(true);
+        expect(shown(el, '.upgrade-button')).toBe(true);
+
+        // The next click asks again.
+        part(el, '.upgrade-button').click();
+        expect(sdk.auth.signIn).toHaveBeenCalledTimes(2);
+    });
+
+    it('opens no second sign-in while the Sign in button has one open', async () => {
+        const sdk = fakePuter();
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        part(el, '.sign-in').click();
+        part(el, '.upgrade-button').click();
+        expect(sdk.auth.signIn).toHaveBeenCalledTimes(1);
+    });
+
+    it('opens no upgrade for a seat that signs in from it, and hides the button', async () => {
+        const seat = { ...USER, team: { uid: 'team-1', name: 'Acme' } };
+        const sdk = fakePuter();
+        sdk.auth.signIn.mockImplementation(async () => {
+            sdk.signInAs('app-token', seat);
+            return { success: true };
+        });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        part(el, '.upgrade-button').click();
+        await settle();
+        expect(sdk.ui.showUpgrade_).not.toHaveBeenCalled();
+        expect(shown(el, '.avatar')).toBe(true);
+        expect(shown(el, '.upgrade-button')).toBe(false);
+    });
+
+    it('follows hide-upgrade and the sign-in as they change', async () => {
+        const sdk = fakePuter({ token: 'app-token', user: { ...USER, subscribed: true } });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount({ 'hide-upgrade': '' });
+        expect(shown(el, '.upgrade-button')).toBe(false);
+        el.removeAttribute('hide-upgrade');
+        expect(shown(el, '.upgrade-button')).toBe(true);
+        expect(part(el, '.upgrade-button').textContent).toBe('Manage plan');
+
+        sdk.signInAs(null);
+        await settle();
+        expect(shown(el, '.upgrade-button')).toBe(true);
+        expect(part(el, '.upgrade-button').textContent).toBe('Upgrade');
+        sdk.signInAs('other-token', { ...OTHER, team: { uid: 'team-1' } });
+        await settle();
+        expect(shown(el, '.upgrade-button')).toBe(false);
+        sdk.signInAs('other-token-2', OTHER);
+        await settle();
+        expect(shown(el, '.upgrade-button')).toBe(true);
+
+        el.setAttribute('hide-upgrade', '');
+        expect(shown(el, '.upgrade-button')).toBe(false);
+    });
+
+    it('reads Manage plan for an account with a plan', async () => {
+        vi.stubGlobal('puter', fakePuter({ token: 't', user: { ...USER, subscribed: true } }));
+        const el = await mount({ 'upgrade-label': 'Passer à un forfait' });
+        expect(shown(el, '.upgrade-button')).toBe(true);
+        expect(part(el, '.upgrade-button').textContent).toBe('Manage plan');
+
+        el.setAttribute('manage-plan-label', 'Gérer le forfait');
+        expect(part(el, '.upgrade-button').textContent).toBe('Gérer le forfait');
+    });
+
+    it('reads Manage plan once an upgrade made from the button closes', async () => {
+        const account = { ...USER, subscribed: false };
+        const sdk = fakePuter({ token: 't', user: account });
+        sdk.ui.showUpgrade_.mockImplementation(async () => {
+            sdk.upgrade(account);
+            return { upgraded: true };
+        });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        expect(part(el, '.upgrade-button').textContent).toBe('Upgrade');
+
+        part(el, '.upgrade-button').click();
+        await settle();
+        expect(part(el, '.upgrade-button').textContent).toBe('Manage plan');
+    });
+
+    it('reads Manage plan once an upgrade made elsewhere on the page closes', async () => {
+        const account = { ...USER, subscribed: false };
+        const sdk = fakePuter({ token: 't', user: account });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        expect(part(el, '.upgrade-button').textContent).toBe('Upgrade');
+
+        // Such as the upgrade a usage limit dialog's button frames.
+        sdk.upgrade(account);
+        expect(part(el, '.upgrade-button').textContent).toBe('Manage plan');
+    });
+
+    it('keeps the Upgrade button hidden for a seat, whose team changes the plan', async () => {
+        const seat = { ...USER, subscribed: true, team: { uid: 'team-1', name: 'Acme' } };
+        vi.stubGlobal('puter', fakePuter({ token: 't', user: seat }));
+        const el = await mount();
+        expect(shown(el, '.avatar')).toBe(true);
+        expect(shown(el, '.upgrade-button')).toBe(false);
+    });
+
+    it('offers Add credits, under Usage, to an account with a plan', async () => {
+        const sdk = fakePuter({ token: 't', user: { ...USER, subscribed: true } });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        part(el, '.avatar').click();
+        expect(shown(el, '.add-credits')).toBe(true);
+        expect(part(el, '.add-credits').textContent).toBe('Add credits');
+        expect(part(el, '.usage').nextElementSibling).toBe(part(el, '.add-credits'));
+
+        part(el, '.add-credits').click();
+        expect(sdk.ui.showTopUp_).toHaveBeenCalledTimes(1);
+        expect(shown(el, '.menu')).toBe(false);
+    });
+
+    it.each([
+        ['an account without a plan', { ...USER, subscribed: false }],
+        ['a server that reports no plans', USER],
+        ['a seat whose team pays for it', { ...USER, subscribed: true, team: { uid: 'team-1', name: 'Acme' } }],
+    ])('leaves Add credits out for %s, and out of the arrow keys', async (_label, user) => {
+        vi.stubGlobal('puter', fakePuter({ token: 't', user }));
+        const el = await mount();
+        part(el, '.avatar').click();
+        expect(shown(el, '.add-credits')).toBe(false);
+
+        part(el, '.usage').focus();
+        part(el, '.usage').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+        expect(el.shadowRoot.activeElement).toBe(part(el, '.open-puter'));
+    });
+
+    it('offers Add credits the next time the menu opens after an upgrade made on the page', async () => {
+        const account = { ...USER, subscribed: false };
+        vi.stubGlobal('puter', fakePuter({ token: 't', user: account }));
+        const el = await mount();
+        part(el, '.avatar').click();
+        expect(shown(el, '.add-credits')).toBe(false);
+        part(el, '.avatar').click();
+
+        // What the SDK does to its cached whoami when a framed upgrade reports a plan.
+        account.subscribed = true;
+        part(el, '.avatar').click();
+        expect(shown(el, '.add-credits')).toBe(true);
+    });
+
+    it('offers Add credits after an upgrade marks a whoami read again for the same token', async () => {
+        const sdk = fakePuter({ token: 't', user: { ...USER, subscribed: false } });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+
+        // Setting the token again reads whoami into a new object, which the upgrade then marks.
+        const reread = { ...USER, subscribed: false };
+        sdk.signInAs('t', reread);
+        sdk.whoami = reread;
+        await settle();
+        reread.subscribed = true;
+        part(el, '.avatar').click();
+        expect(shown(el, '.add-credits')).toBe(true);
+
+        // Never another account's plan.
+        part(el, '.avatar').click();
+        sdk.whoami = { ...OTHER, subscribed: true };
+        part(el, '.avatar').click();
+        expect(shown(el, '.add-credits')).toBe(false);
+    });
+
+    it('stops offering Add credits once the sign-in changes to an account without a plan', async () => {
+        const sdk = fakePuter({ token: 't', user: { ...USER, subscribed: true } });
+        vi.stubGlobal('puter', sdk);
+        const el = await mount();
+        expect(part(el, '.add-credits').hidden).toBe(false);
+        sdk.signInAs('other-token', OTHER);
+        await settle();
+        expect(part(el, '.add-credits').hidden).toBe(true);
+    });
+
+    it('moves focus through the menu with the arrow, Home and End keys', async () => {
+        vi.stubGlobal('puter', fakePuter({ token: 'app-token', user: USER }));
+        const el = await mount();
+        part(el, '.avatar').click();
+        const press = (key) => {
+            const event = new KeyboardEvent('keydown', { key, bubbles: true, composed: true, cancelable: true });
+            el.shadowRoot.activeElement.dispatchEvent(event);
+            return event;
+        };
+        const focused = () => el.shadowRoot.activeElement.classList[1];
+
+        expect(focused()).toBe('manage-account');
+        expect(press('ArrowDown').defaultPrevented).toBe(true);
+        expect(focused()).toBe('usage');
+        press('End');
+        expect(focused()).toBe('sign-out');
+        press('ArrowDown');
+        expect(focused()).toBe('manage-account');
+        press('ArrowUp');
+        expect(focused()).toBe('sign-out');
+        press('ArrowUp');
+        expect(focused()).toBe('feedback');
+        press('Home');
+        expect(focused()).toBe('manage-account');
+        expect(press('a').defaultPrevented).toBe(false);
+        expect(shown(el, '.menu')).toBe(true);
+    });
+
+    it('lands the first ArrowDown on the first item when the menu was opened with the pointer', async () => {
+        vi.stubGlobal('puter', fakePuter({ token: 'app-token', user: USER }));
+        const el = await mount();
+        part(el, '.avatar').dispatchEvent(new MouseEvent('click', { detail: 1, bubbles: true, composed: true }));
+        expect(shown(el, '.menu')).toBe(true);
+        expect(el.shadowRoot.activeElement).toBe(part(el, '.menu'));
+
+        const press = (key) => el.shadowRoot.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, composed: true, cancelable: true }));
+        press('ArrowDown');
+        expect(el.shadowRoot.activeElement.classList[1]).toBe('manage-account');
     });
 
     it('hangs the panel under its button with the caret pointing at it', async () => {
@@ -394,17 +748,32 @@ describe('<puter-user-menu>', () => {
         vi.stubGlobal('puter', fakePuter({ token: 'app-token', user: USER }));
         const el = await mount();
         const parts = [...el.shadowRoot.querySelectorAll('[part]')].map(node => node.getAttribute('part'));
-        expect(parts.sort()).toEqual(['apps-button', 'apps-panel', 'avatar', 'menu', 'sign-in']);
+        expect(parts.sort()).toEqual(['apps-button', 'apps-panel', 'avatar', 'menu', 'sign-in', 'upgrade-button']);
     });
 
     it('uses label attributes, including ones changed later', async () => {
         vi.stubGlobal('puter', fakePuter({ token: 'app-token', user: USER }));
-        const el = await mount({ 'apps-label': 'Applis', 'sign-out-label': 'Déconnexion', 'account-label': 'Compte' });
+        const el = await mount({
+            'upgrade-label': 'Passer à un forfait',
+            'apps-label': 'Applis',
+            'sign-out-label': 'Déconnexion',
+            'account-label': 'Compte',
+            'manage-account-label': 'Gérer le compte',
+            'usage-label': 'Utilisation',
+            'open-puter-label': 'Ouvrir Puter',
+            'feedback-label': 'Envoyer un avis',
+        });
+        expect(part(el, '.upgrade-button').textContent).toBe('Passer à un forfait');
         expect(part(el, '.apps-button').getAttribute('aria-label')).toBe('Applis');
         expect(part(el, '.apps-title').textContent).toBe('Applis');
         expect(part(el, '.apps-panel').getAttribute('aria-label')).toBe('Applis');
         expect(part(el, '.sign-out').textContent).toBe('Déconnexion');
         expect(part(el, '.avatar').getAttribute('aria-label')).toBe('Compte: jelveh');
+        expect(part(el, '.manage-account').textContent).toBe('Gérer le compte');
+        expect(part(el, '.usage').textContent).toBe('Utilisation');
+        expect(part(el, '.open-puter').textContent).toBe('Ouvrir Puter');
+        expect(part(el, '.feedback').textContent).toBe('Envoyer un avis');
+        expect(part(el, '.manage-account .menu-external')).not.toBeNull();
 
         el.setAttribute('close-label', 'Fermer');
         el.setAttribute('sign-in-label', 'Connexion');

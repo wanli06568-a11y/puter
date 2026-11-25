@@ -18,6 +18,7 @@
  */
 
 import { Writable } from 'node:stream';
+import v8 from 'node:v8';
 import type { Request, Response } from 'express';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { v4 as uuidv4 } from 'uuid';
@@ -229,6 +230,37 @@ describe('ProfileService', () => {
         ).toBeNull();
     });
 
+    // V8 stops optimizing regexps once a process holds enough compiled code,
+    // as long-running servers do, and an unoptimized one overflows on this.
+    it('answers a picture of several megabytes with 413', () => {
+        const picture = `data:image/png;base64,${'A'.repeat(6 * 1024 * 1024)}`;
+        v8.setFlagsFromString('--no-regexp-optimization');
+        try {
+            expect(() => service.validatePatch({ picture })).toThrow(
+                expect.objectContaining({
+                    statusCode: 413,
+                    code: 'profile_picture_too_large',
+                }),
+            );
+        } finally {
+            v8.setFlagsFromString('--regexp-optimization');
+        }
+    });
+
+    it('accepts a picture of the largest size, with or without padding', () => {
+        const prefix = 'data:image/png;base64,';
+        const full = `${prefix}${'A'.repeat(PROFILE_PICTURE_MAX_BYTES - prefix.length)}`;
+        expect(service.validatePatch({ picture: full })).toEqual({
+            picture: full,
+        });
+        expect(service.validatePatch({ picture: `${prefix}QQ` })).toEqual({
+            picture: `${prefix}QQ`,
+        });
+        expect(() => service.validatePatch({ picture: `${full}A` })).toThrow(
+            expect.objectContaining({ code: 'profile_picture_too_large' }),
+        );
+    });
+
     it('keeps what validates from a legacy profile and names the rest', () => {
         expect(
             service.normalizeLegacyProfile({
@@ -413,15 +445,5 @@ describe('ProfileService', () => {
         } finally {
             await limited.shutdown();
         }
-    });
-
-    it('builds the hosted URL from the static hosting domain', async () => {
-        const user = await makeUser();
-        // The default test config hosts sites under `site.puter.localhost`.
-        expect(service.getPublicUrl(user)).toMatch(
-            new RegExp(
-                `^https?://${PROFILES_SUBDOMAIN}\\.site\\.puter\\.localhost(:\\d+)?/${user.uuid}\\.profile$`,
-            ),
-        );
     });
 });

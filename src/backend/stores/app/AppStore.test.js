@@ -27,6 +27,9 @@ const STATS_CACHE_TTL_SECONDS = 30 * 60;
 let counter = 0;
 const freshUid = () => `app-test-${Date.now()}-${counter++}`;
 
+const filetypesOf = async (appStore, id) =>
+    (await appStore.getFiletypeAssociationsByIds([id])).get(id);
+
 // ioredis-mock keeps one in-memory dataset per process, so a server booted
 // later inherits the previous server's `apps:*` keys — and app ids restart
 // from 1 with every fresh database.
@@ -200,6 +203,37 @@ describe('AppStore app stats (cache-on-read)', () => {
         }
     });
 
+    it('splits a long uid list across ClickHouse queries', async () => {
+        const uids = Array.from({ length: 2500 }, () => freshUid());
+        const queried = [];
+
+        server.clients.clickhouse = {
+            query: async ({ query_params }) => {
+                queried.push(query_params.uids.length);
+                return {
+                    json: async () =>
+                        query_params.uids.map((u) => ({
+                            app_uid: u,
+                            open_count: '2',
+                            user_count: '1',
+                        })),
+                };
+            },
+        };
+
+        try {
+            const stats = await appStore.getAppsStats(uids);
+            expect(queried.sort((a, b) => b - a)).toEqual([1000, 1000, 500]);
+            expect(stats.size).toBe(2500);
+            expect(stats.get(uids[2499])).toMatchObject({
+                open_count: 2,
+                user_count: 1,
+            });
+        } finally {
+            delete server.clients.clickhouse;
+        }
+    });
+
     it('keeps ids longer than an app uid out of the ClickHouse query', async () => {
         const uid = freshUid();
         const longId = `iap-${'a'.repeat(36)}-extra`;
@@ -311,6 +345,40 @@ describe('AppStore batched lookups', () => {
         expect((await appStore.getByUids(null)).size).toBe(0);
     });
 
+    it('getByUids and getByIds skip values of the wrong type', async () => {
+        const a = await createApp('Typed');
+
+        const byUid = await appStore.getByUids([a.uid, 0, ['x'], { uid: 1 }]);
+        expect([...byUid.keys()]).toEqual([a.uid]);
+
+        const byId = await appStore.getByIds([a.id, true, ['x']]);
+        expect([...byId.keys()].map(Number)).toEqual([Number(a.id)]);
+    });
+
+    it('text lookups match no row for a value that is not a string', async () => {
+        const a = await createApp('Alpha');
+        // MySQL would cast the column for a number, so none may reach it.
+        const db = server.clients.db;
+        const reads = [
+            vi.spyOn(db, 'read'),
+            vi.spyOn(db, 'pread'),
+            vi.spyOn(db, 'tryHardRead'),
+        ];
+        for (const value of [0, 1, true, ['x'], { uid: a.uid }]) {
+            expect(await appStore.getByUid(value)).toBeNull();
+            expect(await appStore.getByName(value)).toBeNull();
+            expect(await appStore.resolveApp(value)).toBeNull();
+            expect(await appStore.existsByName(value)).toBe(false);
+            expect(await appStore.uidExistsOnPrimary(value)).toBe(false);
+        }
+        for (const spy of reads) {
+            expect(spy).not.toHaveBeenCalled();
+            spy.mockRestore();
+        }
+        expect((await appStore.getById(a.id))?.uid).toBe(a.uid);
+        expect((await appStore.getByUid(a.uid))?.id).toBe(a.id);
+    });
+
     it('getByIds still resolves id-keyed lookups off the shared engine', async () => {
         const a = await createApp('Alpha');
 
@@ -366,7 +434,7 @@ describe('AppStore filetype associations', () => {
             '.doc',
         ]);
 
-        const stored = await appStore.getFiletypeAssociations(app.id);
+        const stored = await filetypesOf(appStore, app.id);
         expect(stored.sort()).toEqual(['doc', 'docx']);
     });
 
@@ -375,7 +443,23 @@ describe('AppStore filetype associations', () => {
 
         await appStore.setFiletypeAssociations(app.id, ['.', '  ', 'txt']);
 
-        expect(await appStore.getFiletypeAssociations(app.id)).toEqual(['txt']);
+        expect(await filetypesOf(appStore, app.id)).toEqual(['txt']);
+    });
+
+    it('getFiletypeAssociationsByIds answers more ids than one IN chunk holds', async () => {
+        const app = await createApp();
+        await appStore.setFiletypeAssociations(app.id, ['csv']);
+        // Absent ids pad the request past the chunk size; the real one is last.
+        const ids = [
+            ...Array.from({ length: 450 }, (_, i) => 10_000_000 + i),
+            app.id,
+        ];
+
+        const byId = await appStore.getFiletypeAssociationsByIds(ids);
+
+        expect(byId.size).toBe(ids.length);
+        expect(byId.get(app.id)).toEqual(['csv']);
+        expect(byId.get(10_000_000)).toEqual([]);
     });
 
     it('getAppsByFiletype matches legacy rows stored with a leading dot', async () => {
@@ -400,6 +484,18 @@ describe('AppStore filetype associations', () => {
         expect(apps.filter((a) => a.id === app.id)).toHaveLength(1);
     });
 
+    it('getAppsByFiletype lists apps in the order they registered the extension', async () => {
+        const older = await createApp();
+        const newer = await createApp();
+        const ext = freshExt();
+        await insertRawAssociation(newer.id, ext);
+        await insertRawAssociation(older.id, ext);
+
+        const apps = await appStore.getAppsByFiletype(ext);
+
+        expect(apps.map((a) => a.id)).toEqual([newer.id, older.id]);
+    });
+
     it('getAppsByFiletype normalizes the requested extension', async () => {
         const app = await createApp();
         const ext = freshExt();
@@ -408,6 +504,29 @@ describe('AppStore filetype associations', () => {
         const apps = await appStore.getAppsByFiletype(`.${ext.toUpperCase()}`);
 
         expect(apps.map((a) => a.id)).toContain(app.id);
+    });
+
+    it('getAppsByFiletype serves its cached list until an association write for that extension', async () => {
+        const first = await createApp();
+        const second = await createApp();
+        const ext = freshExt();
+        const listIds = async () =>
+            (await appStore.getAppsByFiletype(ext)).map((a) => a.id).sort();
+        await appStore.setFiletypeAssociations(first.id, [ext]);
+        expect(await listIds()).toEqual([first.id]);
+        // The read does not wait for its own cache write.
+        await vi.waitFor(async () => {
+            expect(
+                await server.clients.redis.exists(`apps:by-filetype:${ext}`),
+            ).toBe(1);
+        });
+
+        // A row the store did not write leaves the cached list in place.
+        await insertRawAssociation(second.id, ext);
+        expect(await listIds()).toEqual([first.id]);
+
+        await appStore.setFiletypeAssociations(second.id, [ext]);
+        expect(await listIds()).toEqual([first.id, second.id].sort());
     });
 
     it('getAppsByFiletype returns [] when the extension normalizes to nothing', async () => {
@@ -823,7 +942,7 @@ describe('AppStore CRUD and cache invalidation', () => {
         expect(await appStore.delete(app.id)).toBe(true);
         expect(await appStore.getById(app.id)).toBeNull();
         expect(await appStore.getByUid(app.uid)).toBeNull();
-        expect(await appStore.getFiletypeAssociations(app.id)).toEqual([]);
+        expect(await filetypesOf(appStore, app.id)).toEqual([]);
     });
 
     it('drops the cached sites and workers that go with a deleted app', async () => {
@@ -970,6 +1089,22 @@ describe('AppStore CRUD and cache invalidation', () => {
         expect(excluded.id).toBe(newer.id);
     });
 
+    it('matches a punycode candidate against a row stored with the unicode host', async () => {
+        const app = await createApp();
+        // Rows written before index_urls were normalized can hold the
+        // unicode spelling.
+        await db.write('UPDATE `apps` SET `index_url` = ? WHERE `id` = ?', [
+            'https://m\u00fcnchen-apps.example/',
+            app.id,
+        ]);
+
+        const found = await appStore.findByIndexUrlCandidates([
+            'https://xn--mnchen-apps-thb.example/',
+        ]);
+
+        expect(found.id).toBe(app.id);
+    });
+
     it('returns null for an empty or non-array candidate list', async () => {
         expect(await appStore.findByIndexUrlCandidates([])).toBeNull();
         expect(await appStore.findByIndexUrlCandidates(null)).toBeNull();
@@ -1022,12 +1157,6 @@ describe('AppStore CRUD and cache invalidation', () => {
             'uid',
         ]);
 
-        const privateOnly = await appStore.listOwnedByIndexUrlCandidates(
-            OWNER,
-            candidates,
-            { requirePrivate: true },
-        );
-        expect(privateOnly.map((row) => row.id)).toEqual([privateApp.id]);
     });
 
     it('lists no index_url matches for no candidates, without a query', async () => {
@@ -1292,31 +1421,14 @@ describe('AppStore CRUD and cache invalidation', () => {
         ).toBe('Bumped');
     });
 
-    it('counts apps by owner, creator and per-caller visibility', async () => {
+    it('counts apps by owner and creator', async () => {
         const countOwner = 4600;
-        const viewer = 4601;
         const open = await createApp({}, { ownerUserId: countOwner });
         await createApp({}, { ownerUserId: countOwner, appOwner: open.id });
-        const hidden = await createApp({}, { ownerUserId: countOwner });
-        await db.write('UPDATE `apps` SET `protected` = 1 WHERE `id` = ?', [
-            hidden.id,
-        ]);
+        await createApp({}, { ownerUserId: countOwner });
 
         expect(await appStore.count({ ownerUserId: countOwner })).toBe(3);
         expect(await appStore.count({ appOwner: open.id })).toBe(1);
-
-        // The protected app is invisible to a stranger but visible to its
-        // owner.
-        const strangerView = await appStore.count({
-            ownerUserId: countOwner,
-            visibleToUserId: viewer,
-        });
-        expect(strangerView).toBe(2);
-        const ownerView = await appStore.count({
-            ownerUserId: countOwner,
-            visibleToUserId: countOwner,
-        });
-        expect(ownerView).toBe(3);
     });
 
     // -- filetype association batch + recent opens ----------------------
@@ -1348,7 +1460,7 @@ describe('AppStore CRUD and cache invalidation', () => {
         await expect(
             appStore.setFiletypeAssociations(app.id, []),
         ).resolves.toBeUndefined();
-        expect(await appStore.getFiletypeAssociations(app.id)).toEqual([]);
+        expect(await filetypesOf(appStore, app.id)).toEqual([]);
     });
 
     it('lists a user recent app opens most-recent-first, deduped', async () => {
@@ -1377,6 +1489,36 @@ describe('AppStore CRUD and cache invalidation', () => {
             first,
         ]);
         expect(await appStore.getRecentAppOpens(4702)).toEqual([]);
+    });
+
+    it('records an open that the recent list then reads', async () => {
+        const userId = 4710;
+        const uid = `app-recorded-${Date.now()}`;
+        await appStore.recordOpen(uid, userId, Math.floor(Date.now() / 1000));
+        expect(await appStore.getRecentAppOpens(userId)).toEqual([uid]);
+    });
+
+    it('lists the names of approved apps only, up to the limit', async () => {
+        const make = async () => {
+            const name = `approved-${Math.random().toString(36).slice(2, 10)}`;
+            return appStore.create(
+                { name, title: name, index_url: `https://${name}.example.com/` },
+                { ownerUserId: 1 },
+            );
+        };
+        const listed = await make();
+        const unlisted = await make();
+        await db.write(
+            `UPDATE apps SET approved_for_listing = ${db.booleanLiteral(true)} WHERE id = ?`,
+            [listed.id],
+        );
+
+        const names = await appStore.listApprovedNames({ limit: 10_000 });
+        expect(names).toContain(listed.name);
+        expect(names).not.toContain(unlisted.name);
+        expect(
+            await appStore.listApprovedNames({ limit: 1 }),
+        ).toHaveLength(1);
     });
 
     it('rejects a batch lookup on a column it does not own', async () => {
@@ -1495,6 +1637,70 @@ describe('AppStore CRUD and cache invalidation', () => {
         expect(cached === null || cached.owner_user_id === OWNER).toBe(true);
     });
 
+    it('sets admin flags so a lagging replica cannot cache the old row back', async () => {
+        const app = await createApp();
+        await appStore.getByUid(app.uid);
+        const stale = await rawRow(app.id);
+
+        const read = await withLaggingReplica([stale], async () => {
+            const written = await appStore.setAdminFields(app.id, {
+                approved_for_opening_items: true,
+            });
+            expect(written).toMatchObject({
+                uid: app.uid,
+                approved_for_opening_items: true,
+            });
+            return appStore.getByUid(app.uid);
+        });
+
+        expect(read.approved_for_opening_items).toBe(true);
+        expect(
+            (await appStore.getByUid(app.uid)).approved_for_opening_items,
+        ).toBe(true);
+    });
+
+    it('writes guarded admin flags only when they change, and nothing else', async () => {
+        const app = await createApp();
+        const set = (patch, options) =>
+            appStore.setAdminFields(app.id, patch, options);
+
+        // Unset reads as false, so clearing it changes nothing.
+        const incentive = (on) =>
+            set({ approved_for_incentive_program: on }, { guard: true });
+        expect(await incentive(false)).toBeNull();
+        expect(await incentive(true)).toMatchObject({
+            approved_for_incentive_program: true,
+        });
+        expect(await incentive(true)).toBeNull();
+
+        expect(await set({ last_review: 1_700_000_000 })).not.toBeNull();
+        expect((await rawRow(app.id)).last_review).not.toBeNull();
+
+        await expect(set({ godmode: true })).rejects.toThrow(/godmode/);
+        await expect(set({ approved_for_listing: 'yes' })).rejects.toThrow();
+        expect(await set({})).toBeNull();
+    });
+
+    it('tombstones a row written outside the store', async () => {
+        const app = await createApp({ title: 'Before' });
+        await appStore.getByUid(app.uid);
+        const stale = await rawRow(app.id);
+        await db.write('UPDATE `apps` SET `title` = ? WHERE `id` = ?', [
+            'After',
+            app.id,
+        ]);
+
+        const read = await withLaggingReplica([stale], async () => {
+            expect(await appStore.invalidateWrittenById(app.id)).toMatchObject({
+                title: 'After',
+            });
+            return appStore.getByUid(app.uid);
+        });
+
+        expect(read.title).toBe('After');
+        expect(await appStore.invalidateWrittenById(-1)).toBeNull();
+    });
+
     it('returns and caches a created app as the table holds it, without reading it back', async () => {
         const origin = `https://${freshName()}.built.test`;
         const uid = `app-${uuidv5(origin, uuidv5.URL)}`;
@@ -1582,6 +1788,15 @@ describe('AppStore detailed stats', () => {
         });
     });
 
+    it.each(['constructor', 'toString', '__proto__', 7, { toString: null }])(
+        'refuses %s as a grouping',
+        async (grouping) => {
+            await expect(
+                appStore.getAppStatsDetailed(APP_UID, { grouping }),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        },
+    );
+
     it('resolves an app with no opens to zeroes', async () => {
         expect(await appStore.getAppStatsDetailed('app-never-opened')).toEqual({
             open_count: 0,
@@ -1626,11 +1841,60 @@ describe('AppStore detailed stats', () => {
         expect(stats.open_count).toBe(0);
     });
 
-    it('treats an unknown period as all-time', async () => {
-        const stats = await appStore.getAppStatsDetailed(APP_UID, {
-            period: 'not-a-period',
+    it.each(['not-a-period', 'constructor', 7])(
+        'rejects %s as a period',
+        async (period) => {
+            await expect(
+                appStore.getAppStatsDetailed(APP_UID, {
+                    period,
+                    grouping: 'hour',
+                }),
+            ).rejects.toMatchObject({
+                statusCode: 400,
+                legacyCode: 'bad_request',
+            });
+        },
+    );
+
+    it('reads each documented alias as its own window', async () => {
+        const uid = `${APP_UID}-aliases`;
+        // One account per window, each outside the narrower ones.
+        for (const [userId, at] of [
+            [11, NOW],
+            [12, new Date('2026-05-20T12:00:00Z')],
+            [13, new Date('2025-11-10T12:00:00Z')],
+            [14, new Date('2025-01-10T12:00:00Z')],
+        ]) {
+            await db.write(
+                'INSERT INTO app_opens (app_uid, user_id, ts) VALUES (?, ?, ?)',
+                [uid, userId, Math.floor(at.getTime() / 1000) - 60],
+            );
+        }
+        const opens = async (period) =>
+            (await appStore.getAppStatsDetailed(uid, { period })).open_count;
+        expect(await opens('month_to_date')).toBe(1);
+        expect(await opens('year_to_date')).toBe(2);
+        expect(await opens('last_12_months')).toBe(3);
+        expect(await opens('all')).toBe(4);
+    });
+
+    it('refuses a grouping that would need more than 10,000 buckets', async () => {
+        await expect(
+            appStore.getAppStatsDetailed(APP_UID, {
+                period: 'all',
+                grouping: 'hour',
+                createdAt: new Date(Date.now() - 2 * 365 * 86_400_000),
+            }),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'bad_request',
         });
-        expect(stats.open_count).toBe(2);
+        const daily = await appStore.getAppStatsDetailed(APP_UID, {
+            period: 'all',
+            grouping: 'day',
+            createdAt: new Date(Date.now() - 2 * 365 * 86_400_000),
+        });
+        expect(daily.grouped_stats.open_count.length).toBeGreaterThan(700);
     });
 
     it('rejects an unsupported grouping', async () => {
@@ -1679,16 +1943,96 @@ describe('AppStore detailed stats', () => {
         },
     );
 
-    it('still reports week-grouped totals even when bucket keys do not line up', async () => {
-        // SQLite's `%Y-%U` week numbering differs from the ISO week the
-        // bucket list is generated with; totals are taken from the raw rows
-        // precisely so this mismatch can't zero them out.
+    it('bounds `last_week` to the week before the current one', async () => {
+        const uid = `app-lastweek-${Date.now()}`;
+        // One open five days back (last week in any time zone), one today.
+        for (const [userId, offset] of [
+            [1, 5 * 86400],
+            [2, 60],
+        ]) {
+            await db.write(
+                'INSERT INTO app_opens (app_uid, user_id, ts) VALUES (?, ?, ?)',
+                [uid, userId, nowSeconds - offset],
+            );
+        }
+
+        const lastWeek = await appStore.getAppStatsDetailed(uid, {
+            period: 'last_week',
+        });
+        const allTime = await appStore.getAppStatsDetailed(uid);
+
+        expect(lastWeek.open_count).toBe(1);
+        expect(lastWeek.user_count).toBe(1);
+        expect(allTime.open_count).toBe(2);
+    });
+
+    it('numbers week buckets by ISO week in a year that does not start on a Thursday', async () => {
+        const stats = await appStore.getAppStatsDetailed(APP_UID, {
+            period: '12m',
+            grouping: 'week',
+        });
+
+        // The window opens on 2025-06-17 and closes on 2026-06-17, both in
+        // ISO week 25 of their year.
+        const periods = stats.grouped_stats.open_count.map((b) => b.period);
+        expect(periods.at(0)).toBe('2025-25');
+        expect(periods.at(-1)).toBe('2026-25');
+        expect(periods).toHaveLength(53);
+    });
+
+    it('puts week-grouped opens in the bucket of their ISO week', async () => {
         const stats = await appStore.getAppStatsDetailed(APP_UID, {
             period: '30d',
             grouping: 'week',
         });
         expect(stats.open_count).toBe(2);
-        expect(stats.grouped_stats.open_count.length).toBeGreaterThan(0);
+        expect(stats.grouped_stats.open_count).toEqual([
+            { period: '2026-21', count: 0 },
+            { period: '2026-22', count: 0 },
+            { period: '2026-23', count: 0 },
+            { period: '2026-24', count: 0 },
+            { period: '2026-25', count: 2 },
+        ]);
+    });
+
+    it('labels weeks around a new year by the year the ISO week belongs to', async () => {
+        const uid = `app-week-year-${Date.now()}`;
+        const opens = [
+            [1, '2024-12-30T10:00:00Z'], // Monday of 2025's week 1
+            [2, '2025-12-29T10:00:00Z'], // Monday of 2026's week 1
+            [3, '2026-01-01T10:00:00Z'], // the same week, next calendar year
+            [4, '2027-01-03T10:00:00Z'], // Sunday of 2026's week 53
+        ];
+        for (const [userId, at] of opens) {
+            await db.write(
+                'INSERT INTO app_opens (app_uid, user_id, ts) VALUES (?, ?, ?)',
+                [uid, userId, Date.parse(at) / 1000],
+            );
+        }
+
+        vi.setSystemTime(new Date('2027-01-06T12:00:00Z'));
+        let stats;
+        try {
+            stats = await appStore.getAppStatsDetailed(uid, {
+                period: 'all',
+                createdAt: '2024-12-25T00:00:00Z',
+                grouping: 'week',
+            });
+        } finally {
+            vi.setSystemTime(NOW);
+        }
+
+        const buckets = stats.grouped_stats.open_count;
+        const periods = buckets.map((b) => b.period);
+        expect(new Set(periods).size).toBe(periods.length);
+        expect(periods.slice(0, 3)).toEqual(['2024-52', '2025-01', '2025-02']);
+        expect(periods.slice(-3)).toEqual(['2026-52', '2026-53', '2027-01']);
+        expect(buckets.filter((b) => b.count > 0)).toEqual([
+            { period: '2025-01', count: 1 },
+            { period: '2026-01', count: 2 },
+            { period: '2026-53', count: 1 },
+        ]);
+        expect(stats.open_count).toBe(4);
     });
 
     describe('with a ClickHouse client registered', () => {
@@ -1754,6 +2098,28 @@ describe('AppStore detailed stats', () => {
                         (b) => b.period === todayIso,
                     );
                     expect(bucket?.count).toBe(5);
+                },
+            );
+        });
+
+        it('reads ClickHouse weeks from their Monday into the ISO week bucket', async () => {
+            await withClickhouse(
+                [
+                    // The Monday of the week the pinned clock is in.
+                    { period: '2026-06-15', open_count: '4', user_count: '2' },
+                ],
+                async (seen) => {
+                    const stats = await appStore.getAppStatsDetailed(APP_UID, {
+                        period: '30d',
+                        grouping: 'week',
+                    });
+                    expect(seen[0].query).toContain(
+                        'toStartOfWeek(fromUnixTimestamp(ts), 1)',
+                    );
+                    expect(stats.grouped_stats.open_count.at(-1)).toEqual({
+                        period: '2026-25',
+                        count: 4,
+                    });
                 },
             );
         });

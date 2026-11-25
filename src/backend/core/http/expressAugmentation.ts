@@ -51,6 +51,13 @@ declare global {
             tokenAuthFailed?: boolean;
 
             /**
+             * What `authenticate` threw while checking the token (a database
+             * failure, say). The token may be fine; gates rethrow this instead
+             * of answering 401.
+             */
+            tokenAuthError?: unknown;
+
+            /**
              * Set when a token authenticated but its app is on the origin
              * blocklist. The auth probe leaves `actor` unset; gates translate
              * this into a 403 `app_blocked`.
@@ -98,6 +105,20 @@ declare global {
             deviceFingerprint?: string;
 
             /**
+             * The client's TLS fingerprint, read from the header named by
+             * `tlsFingerprintHeader`. Shared by every client on the same TLS
+             * stack, so it identifies software, not a person.
+             */
+            tlsFingerprint?: string;
+
+            /**
+             * Signals the proxy in front of the server raised on this request,
+             * read from the headers named by `requestSignalHeaders`. Empty when
+             * there are none.
+             */
+            requestSignals?: readonly string[];
+
+            /**
              * Parsed cookies, populated by the global `cookie-parser`
              * middleware.
              */
@@ -111,6 +132,13 @@ declare global {
              * `actor` in the egress middleware.
              */
             egressActor?: Actor;
+
+            /**
+             * Who a failure on this request is reported against when it has no
+             * `actor`, such as a hosted site's owner for an anonymous visitor.
+             * Read only by the error alarm.
+             */
+            alarmActor?: Actor;
 
             /**
              * Object-store requests made while serving this request, by class.

@@ -26,6 +26,7 @@ import { resolveCallableMethods } from '../meta.js';
 import {
     INTERNAL_ADMIN_DESTROY,
     INTERNAL_ADMISSION_BYPASS,
+    WORKER_NAME_MAX_LENGTH,
 } from './WorkerDriver.js';
 import type { WorkerDriver } from './WorkerDriver.js';
 
@@ -162,6 +163,33 @@ describe('WorkerDriver', () => {
                     }),
                 ),
             ).rejects.toMatchObject({ statusCode: 400 });
+        });
+
+        it('rejects names too long for the worker subdomain', async () => {
+            // `workers.puter.` + 51 characters overflows the 64-character column.
+            await expect(
+                inCtx(() =>
+                    target.create({
+                        appId: 'test-app',
+                        workerName: 'a'.repeat(WORKER_NAME_MAX_LENGTH + 1),
+                        filePath: '/test.js',
+                    }),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        });
+
+        it('accepts a name at the length limit', async () => {
+            // 503 is the missing Cloudflare config, past the name checks.
+            expect(WORKER_NAME_MAX_LENGTH).toBe(50);
+            await expect(
+                inCtx(() =>
+                    target.create({
+                        appId: 'test-app',
+                        workerName: 'a'.repeat(WORKER_NAME_MAX_LENGTH),
+                        filePath: '/test.js',
+                    }),
+                ),
+            ).rejects.toMatchObject({ statusCode: 503 });
         });
 
         it('allows valid worker names with underscores and dashes', async () => {
@@ -874,18 +902,14 @@ describe('WorkerDriver', () => {
                     scopes: 50,
                     owned: 50,
                 });
-                const list = vi
-                    .spyOn(server.stores.subdomain, 'listByUserIdAndPrefix')
-                    .mockResolvedValue(
-                        Array.from({ length: 16 }, () => ({})) as never,
-                    );
+                const count = vi
+                    .spyOn(server.stores.subdomain, 'countByUserIdAndPrefix')
+                    .mockResolvedValue(16);
                 await expect(createWorker()).rejects.not.toMatchObject({
                     statusCode: 403,
                 });
 
-                list.mockResolvedValue(
-                    Array.from({ length: 100 }, () => ({})) as never,
-                );
+                count.mockResolvedValue(100);
                 await expect(createWorker()).rejects.toMatchObject({
                     statusCode: 403,
                     message: 'Worker limit reached (max 100)',
@@ -1034,7 +1058,7 @@ describe('WorkerDriver', () => {
             // with an account id also demands a built worker preamble, which
             // is not built for backend tests.
             const store = server.stores.subdomain;
-            const originalList = store.listByUserIdAndPrefix.bind(store);
+            const originalCount = store.countByUserIdAndPrefix.bind(store);
             const driverConfig = (
                 target as unknown as { config: Record<string, unknown> }
             ).config;
@@ -1043,13 +1067,11 @@ describe('WorkerDriver', () => {
                 XAUTHKEY: 'test-key',
                 ACCOUNTID: 'test-account',
             };
-            let listCalls = 0;
-            store.listByUserIdAndPrefix = (async () => {
-                listCalls++;
-                return Array.from({ length: 100 }, (_, i) => ({
-                    subdomain: `workers.puter.w${i}`,
-                })) as never;
-            }) as typeof store.listByUserIdAndPrefix;
+            let countCalls = 0;
+            store.countByUserIdAndPrefix = (async () => {
+                countCalls++;
+                return 100;
+            }) as typeof store.countByUserIdAndPrefix;
 
             try {
                 await expect(
@@ -1061,7 +1083,7 @@ describe('WorkerDriver', () => {
                         }),
                     ),
                 ).rejects.toMatchObject({ statusCode: 403 });
-                expect(listCalls).toBe(1);
+                expect(countCalls).toBe(1);
 
                 // With the bypass the limit is never even counted; the call
                 // fails later, on the missing source file.
@@ -1075,9 +1097,9 @@ describe('WorkerDriver', () => {
                         }),
                     ),
                 ).rejects.not.toMatchObject({ statusCode: 403 });
-                expect(listCalls).toBe(1);
+                expect(countCalls).toBe(1);
             } finally {
-                store.listByUserIdAndPrefix = originalList;
+                store.countByUserIdAndPrefix = originalCount;
                 driverConfig.workers = originalWorkersConfig;
             }
         });

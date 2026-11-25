@@ -17,9 +17,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import { createHash } from 'node:crypto';
 import type { OIDCService } from '../services/auth/OIDCService.js';
 import type { SystemKVStore } from '../stores/systemKv/SystemKVStore.js';
-import type { TeamStoreContract } from '../core/teams.js';
+import type { OrgSeatRow, TeamStoreContract } from '../core/teams.js';
 import type { UserRow } from '../stores/user/UserStore.js';
 import type { IConfig } from '../types.js';
 import {
@@ -27,18 +28,13 @@ import {
     isCardFallbackEligible,
     type CardFallbackClients,
 } from './cardFallback.js';
-import { getTaskbarItems } from './taskbarItems.js';
-import { isEmailGateLast } from './verificationOrder.js';
-
-type TaskbarDeps = Parameters<typeof getTaskbarItems>[1];
+import { phoneLastDigits } from './phone.js';
+import { isEmailGateLast, isPhoneOnFileStep } from './verificationOrder.js';
 
 export interface UserDetailsDeps {
     config: IConfig;
-    // `db.write` backs the taskbar's first-read default row.
-    clients: CardFallbackClients & {
-        db: { write: (query: string, params?: unknown[]) => Promise<unknown> };
-    };
-    stores: TaskbarDeps['stores'] & {
+    clients: CardFallbackClients;
+    stores: {
         kv: Pick<SystemKVStore, 'get'>;
         team?: Pick<TeamStoreContract, 'getOrgSeat'>;
     };
@@ -53,11 +49,8 @@ const CLIENT_VISIBLE_FEATURE_FLAGS: ReadonlySet<string> = new Set([
     'prompt_user_when_navigation_away_from_puter',
 ]);
 
-// Keys that must never leave the server, whoever put them on a payload:
-// credentials and single-use tokens, the payment/phone identifiers used for
-// verification, the network identity recorded at signup, and anti-abuse
-// bookkeeping. The `requires_*_verification` flags stay; the GUI acts on them.
-const SENSITIVE_KEYS: ReadonlySet<string> = new Set([
+// Credentials and single-use tokens a user row (or its `metadata`) can hold.
+const SECRET_KEYS = [
     'password',
     'tmp_password',
     'pass_recovery_token',
@@ -66,20 +59,30 @@ const SENSITIVE_KEYS: ReadonlySet<string> = new Set([
     'change_email_confirm_token',
     'otp_secret',
     'otp_recovery_codes',
+] as const;
+
+// Keys that must never leave the server, whoever put them on a payload: the
+// secrets above, the payment/phone identifiers used for verification, the
+// network identity recorded at signup, and anti-abuse bookkeeping. The
+// `requires_*_verification` flags stay; the GUI acts on them.
+const SENSITIVE_KEYS: ReadonlySet<string> = new Set([
+    ...SECRET_KEYS,
     'card_fingerprint',
     'phone',
     'clean_email',
     'signup_ip',
     'signup_ip_forwarded',
     'signup_user_agent',
+    'signup_tls_fingerprint',
     'signup_origin',
     'signup_server',
     'audit_metadata',
+    'emailStream',
 ]);
 
 /**
- * Delete every sensitive key at any depth (`metadata` and `taskbar_items` are
- * nested). Depth-limited and cycle-safe. Runs last over a whole payload.
+ * Delete every sensitive key at any depth (`metadata` is nested). Depth-limited
+ * and cycle-safe. Runs last over a whole payload.
  */
 export const scrubSensitive = (
     value: unknown,
@@ -108,6 +111,53 @@ export const scrubSensitive = (
     }
 };
 
+/**
+ * A copy of the row without its credentials and single-use tokens (top level
+ * and in `metadata`), for code outside the auth path. `hasPassword` stands in
+ * for the hash, as on an actor's copy.
+ */
+export const withoutSecrets = (
+    user: UserRow,
+): UserRow & { hasPassword: boolean } => {
+    const copy: Record<string, unknown> = {
+        ...user,
+        hasPassword: user.password != null,
+    };
+    for (const key of SECRET_KEYS) delete copy[key];
+    if (user.metadata && typeof user.metadata === 'object') {
+        const metadata: Record<string, unknown> = { ...user.metadata };
+        for (const key of SECRET_KEYS) delete metadata[key];
+        copy.metadata = metadata;
+    }
+    return copy as UserRow & { hasPassword: boolean };
+};
+
+/**
+ * A short tag of the stored password hash. Any password replacement changes it
+ * (a new hash has a new salt), and it reveals nothing usable. Null without
+ * one.
+ */
+export const passwordTag = (user: { password?: unknown }): string | null =>
+    typeof user.password === 'string' && user.password
+        ? createHash('sha256').update(user.password).digest('hex').slice(0, 16)
+        : null;
+
+/**
+ * A temp account has neither a password nor an email. Reads `hasPassword` (an
+ * actor's copy, where `password` is stripped) before `password`. With
+ * `blankIsMissing`, an empty string counts as missing too.
+ */
+export const isTemporaryAccount = (
+    user: { password?: unknown; hasPassword?: boolean; email?: unknown },
+    { blankIsMissing = false }: { blankIsMissing?: boolean } = {},
+): boolean => {
+    const missing = (value: unknown) =>
+        blankIsMissing ? !value : value == null;
+    return (
+        !(user.hasPassword ?? !missing(user.password)) && missing(user.email)
+    );
+};
+
 // SQL datetimes go out as unix seconds; unparseable values are dropped.
 export const toUnixSeconds = (value: unknown): number | undefined => {
     if (!value) return undefined;
@@ -122,13 +172,21 @@ export const toUnixSeconds = (value: unknown): number | undefined => {
  * caller's job. Not scrubbed: run `scrubSensitive` on the final payload.
  */
 export async function buildUserDetails(
-    user: UserRow,
+    user: UserRow & { hasPassword?: boolean },
     deps: UserDetailsDeps,
-    opts: { isUser: boolean; iconSize?: number; noIcons?: boolean },
+    opts: {
+        isUser: boolean;
+        /** The account's team seat when the caller already read it. */
+        orgSeat?: OrgSeatRow | null;
+    },
 ): Promise<Record<string, unknown>> {
     const { config, clients, stores, services } = deps;
     const { isUser } = opts;
-    const oidcOnly = user.password === null;
+    // An actor's copy of the row carries `hasPassword` instead of the hash.
+    const oidcOnly =
+        user.hasPassword === undefined
+            ? user.password === null
+            : !user.hasPassword;
 
     // Non-boolean values (e.g. `"true"`) are coerced so the client never has
     // to guess.
@@ -153,6 +211,12 @@ export async function buildUserDetails(
         // The phone number itself is deliberately absent: nothing on the
         // client reads it. Only the verification flag ships.
         requires_phone_verification: user.requires_phone_verification,
+        // The last two digits of a number the owner has to prove again, so the
+        // client can say where the code goes.
+        phone_on_file:
+            isUser && isPhoneOnFileStep(user)
+                ? phoneLastDigits(String(user.phone))
+                : null,
         requires_card_verification: user.requires_card_verification,
         // Card and phone come before email for this account.
         email_gate_last: isEmailGateLast(user),
@@ -170,10 +234,7 @@ export async function buildUserDetails(
                   cardFallbackDepsFrom(clients),
               )
             : false,
-        desktop_bg_url: user.desktop_bg_url,
-        desktop_bg_color: user.desktop_bg_color,
-        desktop_bg_fit: user.desktop_bg_fit,
-        is_temp: user.password === null && user.email === null,
+        is_temp: oidcOnly && user.email === null,
         is_user_token: true,
         // Null until the account asks for a code; never minted here.
         referral_code: user.referral_code,
@@ -185,14 +246,6 @@ export async function buildUserDetails(
         hasDevAccountAccess: !!user.metadata?.hasDevAccountAccess,
     };
 
-    // Not an inline literal, so a `TaskbarDeps` without `clients` still
-    // accepts it.
-    const taskbarDeps = {
-        clients,
-        stores,
-        apiBaseUrl: String(config.api_base_url ?? ''),
-        config,
-    };
     const linkedProvider = async () => {
         if (!oidcOnly) return null;
         try {
@@ -202,22 +255,10 @@ export async function buildUserDetails(
             return null;
         }
     };
-    const taskbarItems = async () => {
-        if (!isUser) return null;
-        try {
-            return {
-                items: await getTaskbarItems(user, taskbarDeps, {
-                    iconSize: opts.iconSize,
-                    noIcons: opts.noIcons,
-                }),
-            };
-        } catch (error) {
-            return { error };
-        }
-    };
     // The team that pays for the account; every seat restriction keys on it.
     const orgSeat = async () => {
         if (!isUser || config.teams_enabled !== true) return null;
+        if (opts.orgSeat !== undefined) return { seat: opts.orgSeat };
         try {
             return { seat: await stores.team?.getOrgSeat(user.id) };
         } catch (error) {
@@ -226,26 +267,14 @@ export async function buildUserDetails(
     };
     // Independent and each best-effort, so read together; the results land
     // below in the order the payload has always listed them.
-    const [provider, taskbar, team] = await Promise.all([
-        linkedProvider(),
-        taskbarItems(),
-        orgSeat(),
-    ]);
+    const [provider, team] = await Promise.all([linkedProvider(), orgSeat()]);
 
     if (provider) {
         const origin = (config.origin ?? '').replace(/\/$/, '');
         details.oidc_revalidate_url = `${origin}/auth/oidc/${provider}/start?flow=revalidate&user_uuid=${encodeURIComponent(user.uuid)}`;
     }
 
-    if (taskbar) {
-        // Best-effort: the account still works without them.
-        if ('error' in taskbar) {
-            console.warn('[user-details] taskbar_items failed:', taskbar.error);
-            details.taskbar_items = [];
-        } else {
-            details.taskbar_items = taskbar.items;
-        }
-
+    if (isUser) {
         const directories: Record<string, unknown> = {};
         const nameToProp: Record<string, string> = {
             desktop_uuid: `/${user.username}/Desktop`,

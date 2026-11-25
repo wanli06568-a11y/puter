@@ -17,12 +17,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import UIWindow from '../UI/UIWindow.js';
 import UIAlert from '../UI/UIAlert.js';
-import i18n from '../i18n/i18n.js';
 import launch_app from './launchApp.js';
+// installs the global i18n()
+import '../i18n/i18n.js';
 import path from '../lib/path.js';
-import item_icon from './itemIcon.js';
 import { resolve_default_app } from './defaultApp.js';
 import { is_window_on_screen, user_facing_windows } from './windowVisibility.js';
 
@@ -72,7 +71,7 @@ const runOpen = async function (options) {
     //----------------------------------------------------------------
     const app_name = $(el_item).attr('data-app');
     if ( app_name ) {
-        launch_app({ name: app_name, newTab: take_tab() });
+        launch_app({ name: app_name, newTab: take_tab(), trigger: 'app_icon' });
         return;
     }
 
@@ -85,7 +84,7 @@ const runOpen = async function (options) {
             const text = typeof content === 'string' ? content : await content.text();
             const data = JSON.parse(text);
             if ( data.app ) {
-                launch_app({ name: data.app, newTab: take_tab() });
+                launch_app({ name: data.app, newTab: take_tab(), trigger: 'app_icon' });
                 return;
             }
         } catch (e) {
@@ -198,86 +197,9 @@ Please try recreating the link.`);
         UIAlert('This item can\'t be opened because it\'s in the trash. To use this item, first drag it out of the Trash.');
     }
     //----------------------------------------------------------------
-    // Is this a file (no dir) on a SaveFileDialog?
-    //----------------------------------------------------------------
-    else if ( $el_parent_window.attr('data-is_saveFileDialog') === 'true' && !is_dir ) {
-        $el_parent_window.find('.savefiledialog-filename').val($(el_item).attr('data-name'));
-        $el_parent_window.find('.savefiledialog-save-btn').trigger('click');
-    }
-    //----------------------------------------------------------------
-    // Is this a file (no dir) on an OpenFileDialog?
-    //----------------------------------------------------------------
-    else if ( $el_parent_window.attr('data-is_openFileDialog') === 'true' && !is_dir ) {
-        $el_parent_window.find('.window-disable-mask, .busy-indicator').show();
-        let busy_init_ts = Date.now();
-        try {
-            let filedialog_parent_uid = $el_parent_window.attr('data-parent_uuid');
-            let $filedialog_parent_app_window = $(`.window[data-element_uuid="${filedialog_parent_uid}"]`);
-            let parent_window_app_uid = $filedialog_parent_app_window.attr('data-app_uuid');
-            const initiating_app_uuid = $el_parent_window.attr('data-initiating_app_uuid');
-
-            let res = await puter.fs.sign(window.host_app_uid ?? parent_window_app_uid, { uid: uid, action: 'write' });
-            res = res.items;
-            // todo split is buggy because there might be a slash in the filename
-            res.path = window.privacy_aware_path(item_path);
-            const parent_uuid = $el_parent_window.attr('data-parent_uuid');
-            const return_to_parent_window = $el_parent_window.attr('data-return_to_parent_window') === 'true';
-            if ( return_to_parent_window ) {
-                // As the Open button: the token rides out with the answer.
-                window.deliverPopupTokenToOpener?.();
-                window.opener.postMessage({
-                    msg: 'fileOpenPicked',
-                    original_msg_id: $el_parent_window.attr('data-iframe_msg_uid'),
-                    items: Array.isArray(res) ? [...res] : [res],
-                    // LEGACY SUPPORT, remove this in the future when Polotno uses the new SDK
-                    // this is literally put in here to support Polotno's legacy code
-                    ...(!Array.isArray(res) && res),
-                }, '*');
-
-                window.close();
-            }
-            else if ( parent_uuid ) {
-                // send event to iframe
-                const target_iframe = $(`.window[data-element_uuid="${parent_uuid}"]`).find('.window-app-iframe').get(0);
-                if ( target_iframe ) {
-                    let retobj = {
-                        msg: 'fileOpenPicked',
-                        original_msg_id: $el_parent_window.attr('data-iframe_msg_uid'),
-                        items: Array.isArray(res) ? [...res] : [res],
-                        // LEGACY SUPPORT, remove this in the future when Polotno uses the new SDK
-                        // this is literally put in here to support Polotno's legacy code
-                        ...(!Array.isArray(res) && res),
-                    };
-                    target_iframe.contentWindow.postMessage(retobj, '*');
-                }
-
-                // focus iframe
-                $(target_iframe).get(0)?.focus({ preventScroll: true });
-
-                // send file_opened event
-                const file_opened_event = new CustomEvent('file_opened', { detail: res });
-
-                // dispatch event to parent window
-                $(`.window[data-element_uuid="${parent_uuid}"]`).get(0)?.dispatchEvent(file_opened_event);
-            }
-        } catch (e) {
-            console.log(e);
-        }
-        // done
-        let busy_duration = (Date.now() - busy_init_ts);
-        if ( busy_duration >= window.busy_indicator_hide_delay ) {
-            $el_parent_window.close();
-        } else {
-            setTimeout(() => {
-                // close this dialog
-                $el_parent_window.close();
-            }, Math.abs(window.busy_indicator_hide_delay - busy_duration));
-        }
-    }
-    //----------------------------------------------------------------
-    // Dashboard: is this file already open in an app window? In
-    // dashboard mode there is no taskbar — the file's row is where a
-    // user goes looking for a window they minimized — so restore that
+    // Dashboard: is this file already open in an app window? The
+    // file's row is where a user goes looking for a window they
+    // minimized, so restore that
     // window (edits intact) instead of minting a second instance.
     //----------------------------------------------------------------
     // The user's own windows only: a file opened in an instance another app
@@ -307,29 +229,14 @@ Please try recreating the link.`);
             name: associated_app_name,
             maximized: options.maximized ?? window.is_dashboard_mode,
             newTab: take_tab(),
+            trigger: 'app_icon',
         });
     }
     //----------------------------------------------------------------
-    // Dir with no open windows: create a new window
+    // Dir: show it in the window that lists it
     //----------------------------------------------------------------
-    else if ( is_dir && ($el_parent_window.length === 0 || options.new_window) ) {
-        UIWindow({
-            path: item_path,
-            title: path.basename(item_path),
-            icon: await item_icon({ is_dir: true, path: item_path }),
-            uid: $(el_item).attr('data-uid'),
-            is_dir: is_dir,
-            app: 'explorer',
-            top: options.maximized ? 0 : undefined,
-            left: options.maximized ? 0 : undefined,
-            height: options.maximized ? `calc(100% - ${window.taskbar_height + window.toolbar_height + 1}px)` : undefined,
-            width: options.maximized ? '100%' : undefined,
-        });
-    }
-    //----------------------------------------------------------------
-    // Dir with an open window: change the path of the open window
-    //----------------------------------------------------------------
-    else if ( $el_parent_window.length > 0 && is_dir ) {
+    else if ( is_dir ) {
+        if ( $el_parent_window.length === 0 ) return;
         window.window_nav_history[parent_win_id] = window.window_nav_history[parent_win_id].slice(0, window.window_nav_history_current_position[parent_win_id] + 1);
         window.window_nav_history[parent_win_id].push(item_path);
         window.window_nav_history_current_position[parent_win_id]++;
@@ -360,6 +267,7 @@ Please try recreating the link.`);
                 maximized: options.maximized ?? window.is_dashboard_mode,
                 file_uid: file_uid,
                 newTab: take_tab(),
+                trigger: 'file_open',
             });
             if ( target_file_uid ) launch_promise.finally(() => launching_file_uids.delete(target_file_uid));
             return;
@@ -445,6 +353,7 @@ Please try recreating the link.`);
                 maximized: options.maximized ?? window.is_dashboard_mode,
                 file_signature: open_item_meta.signature,
                 newTab: take_tab(),
+                trigger: 'file_open',
             });
             if ( target_file_uid ) launch_promise.finally(() => launching_file_uids.delete(target_file_uid));
         }
@@ -460,7 +369,6 @@ Please try recreating the link.`);
  *   user's gesture; an app the item opens in goes there instead of an in-page
  *   window (see launch_app). Closed when the item opens no app.
  * @param {boolean} [options.maximized]
- * @param {boolean} [options.new_window]
  */
 const open_item = async function (options) {
     try {

@@ -23,6 +23,7 @@ import type { Request, Response } from 'express';
 import { HttpError } from '../../core/http/HttpError.js';
 import type { PuterRouter } from '../../core/http/PuterRouter.js';
 import { PuterController } from '../types.js';
+import { SignInRefusedError } from '../../services/auth/SignInService.js';
 import { startWebSession } from '../auth/webSession.js';
 import {
     completeOidcLoginReturn,
@@ -32,6 +33,7 @@ import {
 } from '../auth/oidcLoginReturn.js';
 import type { UserRow } from '../../stores/user/UserStore.js';
 import { sessionCookieFlags } from '../../util/cookieFlags.js';
+import { secretsEqual } from '../../util/secureCompare.js';
 import { normalizeBonusCode } from '../../util/signupBonus.js';
 import { parseMaskedSharePath } from '../../services/fs/sharePathMask.js';
 import {
@@ -64,6 +66,7 @@ const ALLOWED_ERRORS = [
     'account_suspended',
     'unauthorized',
     'signup_blocked',
+    'signin_blocked',
     'bonus_code_invalid',
 ] as const;
 
@@ -102,16 +105,14 @@ function signupOptionsFromState(
 }
 
 // GUI pages an OIDC flow may return to: the root (where a share email lands),
-// /desktop, /dashboard, and direct app landings (/app/<name> and its
-// desktop-booted twin /desktop/app/<name>, mirroring APP_NAME_REGEX in
-// AppDriver). Strict whitelist — never a client-supplied URL (no open
-// redirect).
+// /dashboard, and direct app landings (/app/<name>, mirroring
+// APP_NAME_REGEX in AppDriver). Strict whitelist — never a client-supplied URL
+// (no open redirect).
 function isWhitelistedReturnPath(path: string): boolean {
     return (
         path === '/' ||
-        path === '/desktop' ||
         path === '/dashboard' ||
-        /^(\/desktop)?\/app\/[a-zA-Z0-9_-]{1,100}$/.test(path)
+        /^\/app\/[a-zA-Z0-9_-]{1,100}$/.test(path)
     );
 }
 
@@ -285,14 +286,6 @@ function buildErrorRedirectUrl(
     return `${base}${pagePath}?${params.toString()}`;
 }
 
-/** Length-safe constant-time string compare (never throws on mismatch). */
-function constantTimeEqual(a: string, b: string): boolean {
-    const ba = Buffer.from(a);
-    const bb = Buffer.from(b);
-    if (ba.length !== bb.length) return false;
-    return crypto.timingSafeEqual(ba, bb);
-}
-
 /**
  * True iff `target` parses as a URL whose origin equals `origin`. Used to clamp
  * OIDC redirect targets — `startsWith` would accept
@@ -355,7 +348,7 @@ export class OIDCController extends PuterController {
                     !decoded ||
                     typeof decoded.nonce !== 'string' ||
                     typeof cookieNonce !== 'string' ||
-                    !constantTimeEqual(cookieNonce, decoded.nonce)
+                    !secretsEqual(cookieNonce, decoded.nonce)
                 ) {
                     throw new HttpError(400, 'Invalid `opener_state`', {
                         legacyCode: 'bad_request',
@@ -438,9 +431,8 @@ export class OIDCController extends PuterController {
 
                 let appRedirectUri = flowRedirects[flow] ?? (origin || '/');
 
-                // Optional GUI return path so login started from /desktop,
-                // /dashboard, an /app/<name> landing, or a share link lands
-                // back there.
+                // Optional GUI return path so login started from /dashboard,
+                // an /app/<name> landing, or a share link lands back there.
                 const rawReturnTo = Array.isArray(req.query.return_to)
                     ? req.query.return_to[0]
                     : req.query.return_to;
@@ -624,7 +616,14 @@ export class OIDCController extends PuterController {
                 );
             }
 
-            await this.#finishLogin(req, res, user, stateDecoded);
+            await this.#finishLogin(
+                req,
+                res,
+                user,
+                stateDecoded,
+                'login',
+                resolved.created ? 'signup' : 'oidc',
+            );
         };
         router.get('/auth/oidc/callback/login', cbOpts, loginCb);
         router.post('/auth/oidc/callback/login', cbOpts, loginCb);
@@ -688,14 +687,14 @@ export class OIDCController extends PuterController {
                 );
             }
 
-            // If we landed on an existing account (either via the
-            // provider_sub or via email match), signal the GUI so it can
-            // render a "signed in" flow rather than "account created".
-            const extra =
-                resolved.origin === 'created'
-                    ? undefined
-                    : { oidc_switched: 'login' };
-            await this.#finishLogin(req, res, user, stateDecoded, extra);
+            await this.#finishLogin(
+                req,
+                res,
+                user,
+                stateDecoded,
+                'signup',
+                resolved.created ? 'signup' : 'oidc',
+            );
         };
         router.get('/auth/oidc/callback/signup', cbOpts, signupCb);
         router.post('/auth/oidc/callback/signup', cbOpts, signupCb);
@@ -836,7 +835,8 @@ if (window.opener) {
         | { error: string; code?: string; requestCode?: string }
         | {
               user: import('../../stores/user/UserStore.js').UserRow;
-              origin: 'linked-sub' | 'linked-email' | 'created';
+              /** Created by this callback, so its sign-in is the signup's. */
+              created?: boolean;
           }
     > {
         // 1. Existing provider/sub link.
@@ -844,7 +844,7 @@ if (window.opener) {
             provider,
             userinfo.sub,
         );
-        if (linked) return { user: linked, origin: 'linked-sub' };
+        if (linked) return { user: linked };
 
         // 2/3. Email match branch.
         const claimedEmail =
@@ -881,7 +881,7 @@ if (window.opener) {
                         error: outcome.error ?? 'Failed to link provider.',
                     };
                 }
-                return { user: byEmail, origin: 'linked-email' };
+                return { user: byEmail };
             }
         }
 
@@ -911,7 +911,7 @@ if (window.opener) {
                 requestCode: outcome.requestCode,
             };
         }
-        return { user: outcome.user, origin: 'created' };
+        return { user: outcome.user, created: true };
     }
 
     async #processCallback(
@@ -954,7 +954,7 @@ if (window.opener) {
             res.clearCookie(OIDC_NONCE_COOKIE_NAME, { path: '/' });
             if (
                 typeof cookieNonce !== 'string' ||
-                !constantTimeEqual(cookieNonce, expectedNonce)
+                !secretsEqual(cookieNonce, expectedNonce)
             ) {
                 return {
                     error: 'This sign-in could not be verified for your browser. Please start again.',
@@ -1000,7 +1000,8 @@ if (window.opener) {
         res: Response,
         user: UserRow,
         stateDecoded: Record<string, unknown>,
-        extraQueryParams?: Record<string, string>,
+        sourceFlow: 'login' | 'signup',
+        method: 'oidc' | 'signup',
     ): Promise<void> {
         const origin = (this.config.origin ?? '').replace(/\/$/, '');
         const continuation: OidcLoginContinuation = {
@@ -1018,7 +1019,6 @@ if (window.opener) {
                 stateDecoded.msg_id == null
                     ? null
                     : String(stateDecoded.msg_id),
-            switchedToLogin: extraQueryParams?.oidc_switched === 'login',
         };
         if (user.otp_enabled) {
             const challenge = this.services.token.sign(
@@ -1057,10 +1057,38 @@ if (window.opener) {
             res.redirect(302, `${origin}/action/oidc-2fa#${fragment}`);
             return;
         }
-        await startWebSession(req, res, user, {
-            config: this.config,
-            auth: this.services.auth,
-        });
+        try {
+            await startWebSession(
+                req,
+                res,
+                user,
+                {
+                    config: this.config,
+                    auth: this.services.auth,
+                    signIn: this.services.signIn,
+                    token: this.services.token,
+                    kv: this.stores.kv,
+                    user: this.stores.user,
+                },
+                method,
+            );
+        } catch (e) {
+            // A sign-in that has to be made again lands back on its page.
+            const retry = e instanceof HttpError && e.code === 'signin_retry';
+            if (!(e instanceof SignInRefusedError) && !retry) throw e;
+            return res.redirect(
+                302,
+                buildErrorRedirectUrl(
+                    origin,
+                    sourceFlow,
+                    'other',
+                    retry ? 'unauthorized' : 'signin_blocked',
+                    stateDecoded,
+                    retry ? undefined : (e as SignInRefusedError).requestCode,
+                    (p) => this.#mintPopupReturn(res, p),
+                ),
+            );
+        }
         res.redirect(
             302,
             completeOidcLoginReturn(res, user, continuation, {

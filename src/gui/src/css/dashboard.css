@@ -2739,15 +2739,17 @@ input.myapps-group-name:focus {
     }
 }
 
-/* In a popup that exists only for this dialog, the dialog is the page: a
-   centered column, with the actions pinned to the bottom edge. */
-.custom-domain-fullpage {
-    --cd-column: min(552px, 100% - 48px);
+/* In a popup that exists only to host one of these dialogs, the dialog is the
+   page: a centered column, with the actions pinned to the bottom edge. */
+.app-feedback-fullpage {
+    --afb-column: min(552px, 100% - 48px);
     padding: 0;
     align-items: stretch;
     background: var(--afb-bg);
 }
-.custom-domain-fullpage .custom-domain-modal {
+.app-feedback-fullpage .app-feedback-modal {
+    display: flex;
+    flex-direction: column;
     width: 100%;
     height: 100dvh;
     max-height: none;
@@ -2758,39 +2760,39 @@ input.myapps-group-name:focus {
     padding-bottom: 0;
     overflow: hidden;
 }
-.custom-domain-fullpage .app-feedback-x {
+.app-feedback-fullpage .app-feedback-x {
     display: none;
 }
-.custom-domain-fullpage .custom-domain-head {
-    width: var(--cd-column);
+.app-feedback-fullpage .app-feedback-head {
+    width: var(--afb-column);
     margin: 0 auto;
     padding: 28px 0 4px;
 }
-.custom-domain-fullpage .custom-domain-body {
+.app-feedback-fullpage .app-feedback-body {
     flex: 1;
     display: flex;
     flex-direction: column;
     overflow-y: auto;
     padding: 20px 0 0;
 }
-.custom-domain-fullpage .custom-domain-pane {
+.app-feedback-fullpage .app-feedback-pane {
     flex: 1 0 auto;
     display: flex;
     flex-direction: column;
 }
-.custom-domain-fullpage .custom-domain-pane > :not(.app-feedback-actions, .app-feedback-success-check, .custom-domain-state-icon) {
+.app-feedback-fullpage .app-feedback-pane > :not(.app-feedback-actions, .app-feedback-success-check, .custom-domain-state-icon) {
     box-sizing: border-box;
-    width: var(--cd-column);
+    width: var(--afb-column);
     margin-left: auto;
     margin-right: auto;
 }
 /* Keeps the actions off the content when it fills the page. */
-.custom-domain-fullpage .custom-domain-pane::after {
+.app-feedback-fullpage .app-feedback-pane::after {
     content: '';
     flex: 1 0 20px;
     order: 1;
 }
-.custom-domain-fullpage .app-feedback-actions {
+.app-feedback-fullpage .app-feedback-actions {
     order: 2;
     position: sticky;
     bottom: 0;
@@ -2799,8 +2801,17 @@ input.myapps-group-name:focus {
     background: var(--afb-bg);
     border-top: 1px solid var(--afb-border);
 }
-.custom-domain-fullpage .custom-domain-state .app-feedback-actions {
+.app-feedback-fullpage .app-feedback-unavailable .app-feedback-actions,
+.app-feedback-fullpage .custom-domain-state .app-feedback-actions {
     justify-content: center;
+}
+/* The message box takes the spare height instead of the spacer. */
+.app-feedback-fullpage .app-feedback-form::after {
+    flex-grow: 0;
+}
+.app-feedback-fullpage .app-feedback-message {
+    flex: 1 0 160px;
+    resize: none;
 }
 
 /* Add-an-app chooser (see showAddAppModal): the three ways to get an app, as
@@ -3341,8 +3352,7 @@ p.myapps-add-error {
 }
 
 /* -- Share modal --
-   Responsive, from-scratch replacement for UIWindowShare in the Dashboard:
-   a centered card on desktop, a bottom sheet on mobile. Mirrors the item
+   A centered card on desktop, a bottom sheet on mobile. Mirrors the item
    properties modal's shell so the two read as one system. */
 .share-modal-overlay {
     position: fixed;
@@ -3703,9 +3713,8 @@ select.share-modal-row-mode:disabled {
     font-size: 16px;
 }
 
-/* Recipient suggestions. The structure lives in style.css, shared with the
-   desktop share dialog; only the palette is restated here so the list picks
-   up the dashboard's tokens in both themes. */
+/* Recipient suggestions. The structure lives in style.css; only the palette
+   is set here so the list picks up the dashboard's tokens in both themes. */
 .share-modal {
     --share-suggest-bg: var(--dashboard-card-background);
     --share-suggest-border: var(--dashboard-border);
@@ -4955,7 +4964,6 @@ body.myapps-reordering .myapps-tile {
 
 .dashboard-section-files .directories li.active {
     color: var(--select-text);
-    font-weight: 500;
 }
 
 .dashboard-section-files .directories li img {
@@ -4998,7 +5006,7 @@ body.myapps-reordering .myapps-tile {
     border-bottom: 1px solid var(--dashboard-border);
 }
 
-.dashboard .path-nav-buttons {
+.dashboard-section-files .path-nav-buttons {
     flex-shrink: 0;
     padding: 4px 10px 4px 0px;
     display: flex;
@@ -5009,7 +5017,7 @@ body.myapps-reordering .myapps-tile {
     border-right: 1px dotted var(--dashboard-border);
 }
 
-.dashboard .path-btn {
+.dashboard-section-files .path-btn {
     width: 28px;
     cursor: pointer;
     border-radius: 5px;
@@ -5020,7 +5028,7 @@ body.myapps-reordering .myapps-tile {
 /* 36px touch targets in the same 28px footprint (they're <img>s, so no
    pseudo-element hit area) */
 @media (pointer: coarse) {
-    .dashboard .path-btn {
+    .dashboard-section-files .path-btn {
         width: 36px;
         padding: 8px;
         margin: -4px;
@@ -5043,7 +5051,7 @@ body.myapps-reordering .myapps-tile {
 }
 
 @media (hover: hover) {
-    .dashboard .path-btn:hover {
+    .dashboard-section-files .path-btn:hover {
         background-color: #EEE;
         border-color: #EEE;
     }
@@ -5246,7 +5254,9 @@ body.myapps-reordering .myapps-tile {
     min-height: 0;
     display: flex;
     flex-direction: column;
-    padding-bottom: 30px;
+    /* Ends above the footer, not under it, so a drop outline drawn on its
+       edge shows all the way round. */
+    margin-bottom: 30px;
     overflow-y: auto;
     touch-action: pan-y;
 }
@@ -6185,6 +6195,10 @@ body.myapps-reordering .myapps-tile {
     object-fit: contain;
 }
 
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-icon img.row-thumb {
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.18));
+}
+
 .dashboard-section-files .files-tab .files.files-grid-view .row .item-icon svg {
     width: 64px;
     height: 64px;
@@ -7026,7 +7040,7 @@ body.myapps-reordering .myapps-tile {
     }
 
     .dashboard-section-files .files {
-        padding-bottom: calc(30px + env(safe-area-inset-bottom, 0px));
+        margin-bottom: calc(30px + env(safe-area-inset-bottom, 0px));
     }
 
     /* The grids keep their own padding and clear the footer with a margin,
@@ -8573,6 +8587,8 @@ body.myapps-reordering .myapps-tile {
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    /* A text glyph such as a checkmark: a button doesn't inherit the text color. */
+    color: var(--dashboard-text, #444);
 }
 
 .context-menu-modal-dialog .context-menu-item-icon img {
@@ -8732,13 +8748,6 @@ body.myapps-reordering .myapps-tile {
 
 .submenu-arrow {
     margin-left: auto;
-}
-
-/* Dashboard mode runs fullpage (which normally hides the minimize button
-   because there's no taskbar to restore from), but here a minimized app can
-   be brought back from its Apps-tab tile — so keep the button available. */
-body.dashboard-mode .window-minimize-btn {
-    display: inline;
 }
 
 /* Fullpage mode sizes .window-body-app to 100% because fullpage windows have
@@ -9951,6 +9960,11 @@ body.dashboard-mode .notifications-close-all {
     pointer-events: none;
 }
 
+/* Above every window (phones pin them all at 9999999, the dashboard's
+   included) and under the stay-on-top band, like the auth dialog. */
+.dashboard-dialog-overlay.dashboard-dialog-above-windows {
+    z-index: 99999998;
+}
 .dashboard-dialog-overlay.dashboard-dialog-show {
     opacity: 1;
     pointer-events: auto;
@@ -10089,11 +10103,17 @@ body.dashboard-mode .notifications-close-all {
     overflow-wrap: anywhere;
 }
 
-.dashboard-dialog-message p {
+.dashboard-dialog-message p,
+.dashboard-dialog-message ul {
     margin: 0 0 10px;
 }
 
-.dashboard-dialog-message p:last-child {
+.dashboard-dialog-message ul {
+    padding-left: 20px;
+}
+
+.dashboard-dialog-message p:last-child,
+.dashboard-dialog-message ul:last-child {
     margin-bottom: 0;
 }
 
@@ -10590,6 +10610,253 @@ body.dashboard-mode .notifications-close-all {
     overflow-wrap: anywhere;
 }
 
+/* Contact Us: a message with screenshots or recordings attached */
+.dashboard-dialog.dashboard-contact-dialog {
+    width: min(500px, 100%);
+}
+
+.dashboard-contact-dialog .dashboard-form-input[name='message'] {
+    min-height: 132px;
+}
+
+.dashboard-contact-attachments {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.dashboard-contact-dropzone {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    margin: 0;
+    padding: 12px 14px;
+    border: 1px dashed var(--dashboard-border);
+    border-radius: 10px;
+    background: transparent;
+    color: var(--dashboard-text-primary);
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+    box-sizing: border-box;
+    transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.dashboard-contact-dropzone-icon {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    background: var(--select-tint);
+    color: var(--select-color);
+}
+
+.dashboard-contact-dropzone-icon svg {
+    width: 17px;
+    height: 17px;
+}
+
+.dashboard-contact-dropzone-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.dashboard-contact-dropzone-label,
+.dashboard-contact-dropzone-drop {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.dashboard-contact-dropzone-drop {
+    display: none;
+    color: var(--select-text);
+}
+
+.dashboard-contact-dropzone-hint {
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--dashboard-text-muted);
+}
+
+@media (hover: hover) {
+    .dashboard-contact-dropzone:hover:not(:disabled) {
+        border-color: var(--select-color);
+        background: var(--select-tint-weak);
+    }
+}
+
+.dashboard-contact-dropzone:focus-visible {
+    outline: none;
+    border-color: var(--select-color);
+    box-shadow: 0 0 0 3px var(--select-ring);
+}
+
+.dashboard-contact-dropzone:disabled {
+    cursor: default;
+    opacity: 0.6;
+}
+
+/* Files dragged anywhere over the dialog land here. */
+.dashboard-contact-dragging .dashboard-contact-dropzone {
+    border-style: solid;
+    border-color: var(--select-color);
+    background: var(--select-tint);
+    box-shadow: 0 0 0 3px var(--select-ring);
+}
+
+.dashboard-contact-dragging .dashboard-contact-dropzone-label {
+    display: none;
+}
+
+.dashboard-contact-dragging .dashboard-contact-dropzone-drop {
+    display: block;
+}
+
+.dashboard-contact-files {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.dashboard-contact-files[hidden] {
+    display: none;
+}
+
+.dashboard-contact-file {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    padding: 6px;
+    border: 1px solid var(--dashboard-border);
+    border-radius: 10px;
+    background: var(--dashboard-input-background);
+    animation: dashboard-contact-file-in 160ms ease;
+}
+
+@keyframes dashboard-contact-file-in {
+    from {
+        opacity: 0;
+        transform: translateY(-4px);
+    }
+}
+
+.dashboard-contact-file-thumb {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 7px;
+    overflow: hidden;
+    background: var(--dashboard-sidebar-background);
+    color: var(--dashboard-text-secondary);
+}
+
+.dashboard-contact-file-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.dashboard-contact-file-thumb svg {
+    width: 20px;
+    height: 20px;
+}
+
+.dashboard-contact-file-text {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+}
+
+.dashboard-contact-file-name {
+    overflow: hidden;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--dashboard-text-primary);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.dashboard-contact-file-size {
+    font-size: 12px;
+    color: var(--dashboard-text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.dashboard-contact-file-remove {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--dashboard-text-secondary);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.dashboard-contact-file-remove svg {
+    width: 16px;
+    height: 16px;
+}
+
+@media (hover: hover) {
+    .dashboard-contact-file-remove:hover:not(:disabled) {
+        background: var(--dashboard-hover);
+        color: var(--dashboard-text-primary);
+    }
+}
+
+.dashboard-contact-file-remove:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--select-ring);
+}
+
+.dashboard-contact-file-remove:disabled {
+    cursor: default;
+    opacity: 0.5;
+}
+
+/* Sending: the files are on their way and no longer up for change. */
+.dashboard-contact-sending .dashboard-contact-file {
+    opacity: 0.7;
+}
+
+@media (pointer: coarse) {
+    .dashboard-contact-dropzone {
+        min-height: 56px;
+    }
+
+    .dashboard-contact-file-remove {
+        width: 44px;
+        height: 44px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .dashboard-contact-file {
+        animation: none;
+    }
+}
+
 /* API token, shown once */
 .dashboard-token-warning {
     padding: 10px 12px;
@@ -10599,6 +10866,416 @@ body.dashboard-mode .notifications-close-all {
     color: var(--dashboard-warning-text);
     font-size: 13px;
     line-height: 1.45;
+}
+
+/* Blocked people: a switch, a field to block someone, and who is blocked. */
+.dashboard-blocked-dialog .dashboard-form-switch-field {
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--dashboard-border);
+}
+
+.dashboard-blocked-add-row {
+    display: flex;
+    gap: 8px;
+}
+
+.dashboard-blocked-add-row .dashboard-dialog-input {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.dashboard-blocked-add-row .dashboard-dialog-btn {
+    flex-shrink: 0;
+    width: auto;
+}
+
+.dashboard-blocked-add-btn:disabled,
+.dashboard-blocked-unblock:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+.dashboard-blocked-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 0;
+    border-top: 1px solid var(--dashboard-border);
+    font-size: 14px;
+    color: var(--dashboard-text-primary);
+}
+
+.dashboard-blocked-row:first-child {
+    border-top: none;
+}
+
+.dashboard-blocked-who {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.dashboard-blocked-row .dashboard-dialog-btn {
+    flex-shrink: 0;
+    width: auto;
+}
+
+.dashboard-blocked-empty {
+    margin: 0;
+    font-size: 13px;
+    color: var(--dashboard-text-muted);
+}
+
+/* Two-factor setup: confirm identity, scan, save recovery codes, verify. */
+.dashboard-dialog.dashboard-tfa-dialog {
+    width: min(480px, 100%);
+}
+
+.dashboard-tfa-dialog [hidden] {
+    display: none;
+}
+
+.tfa-setup {
+    color: var(--dashboard-text-primary);
+}
+
+.tfa-progress {
+    display: flex;
+    align-items: center;
+}
+
+.tfa-progress-step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    min-width: 0;
+}
+
+.tfa-progress-dot {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    box-sizing: border-box;
+    border: 2px solid var(--dashboard-border);
+    border-radius: 50%;
+    background: var(--dashboard-card-background);
+    color: var(--dashboard-text-muted);
+    font-size: 13px;
+    font-weight: 600;
+    transition: background 0.25s ease, border-color 0.25s ease, color 0.25s ease;
+}
+
+.tfa-progress-dot svg {
+    width: 14px;
+    height: 14px;
+    stroke-width: 3;
+}
+
+.tfa-progress-dot.active {
+    border-color: var(--dashboard-button-primary);
+    background: var(--dashboard-button-primary);
+    color: #fff;
+}
+
+.tfa-progress-dot.done {
+    border-color: var(--dashboard-success-border);
+    background: var(--dashboard-success-border);
+    color: #fff;
+}
+
+.tfa-progress-label {
+    max-width: 80px;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.3;
+    text-align: center;
+    color: var(--dashboard-text-muted);
+    transition: color 0.25s ease;
+}
+
+.tfa-progress-label.active {
+    color: var(--dashboard-text-primary);
+}
+
+.tfa-progress-line {
+    position: relative;
+    flex: 1;
+    min-width: 20px;
+    height: 2px;
+    margin: 0 8px 22px;
+    background: var(--dashboard-border);
+}
+
+.tfa-progress-line-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 0%;
+    height: 100%;
+    background: var(--dashboard-success-border);
+    transition: width 0.4s ease;
+}
+
+.tfa-screen {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.tfa-instruction {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--dashboard-text-secondary);
+}
+
+.tfa-qr-area {
+    display: flex;
+    justify-content: center;
+}
+
+/* A QR code only scans dark on light, whatever the theme. */
+.tfa-qr-area .qr-code {
+    width: auto;
+    padding: 12px;
+    border-radius: 12px;
+    background: #fff;
+}
+
+.tfa-qr-area .qr-code img {
+    display: block;
+    width: 180px;
+    height: 180px;
+    margin: 0;
+    cursor: zoom-in;
+}
+
+.tfa-qr-area.tfa-qr-large .qr-code img {
+    width: min(340px, 100%);
+    height: auto;
+    aspect-ratio: 1;
+    cursor: zoom-out;
+}
+
+.tfa-secret-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+}
+
+.tfa-secret-key {
+    min-width: 0;
+    padding: 8px 12px;
+    border: 1px solid var(--dashboard-border);
+    border-radius: 8px;
+    background: var(--dashboard-input-background);
+    color: var(--dashboard-text-primary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    letter-spacing: 1.5px;
+    overflow-wrap: anywhere;
+}
+
+.tfa-secret-row .dashboard-dialog-btn {
+    flex-shrink: 0;
+}
+
+.tfa-codes-card {
+    border: 1px solid var(--dashboard-border);
+    border-radius: 12px;
+    background: var(--dashboard-input-background);
+    overflow: hidden;
+}
+
+.tfa-codes-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    padding: 4px 0;
+}
+
+.tfa-code-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 14px;
+    letter-spacing: 1px;
+    color: var(--dashboard-text-primary);
+}
+
+.tfa-code-item-idx {
+    min-width: 16px;
+    font-family: inherit;
+    font-size: 11px;
+    letter-spacing: 0;
+    color: var(--dashboard-text-muted);
+}
+
+.tfa-codes-actions {
+    display: flex;
+    border-top: 1px solid var(--dashboard-border);
+}
+
+.tfa-codes-actions button {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: 40px;
+    padding: 10px;
+    border: none;
+    background: none;
+    color: var(--select-text);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.tfa-codes-actions button svg {
+    width: 14px;
+    height: 14px;
+}
+
+.tfa-codes-actions button + button {
+    border-left: 1px solid var(--dashboard-border);
+}
+
+.tfa-codes-actions button.copied {
+    color: var(--dashboard-success-text);
+}
+
+@media (hover: hover) {
+    .tfa-codes-actions button:hover {
+        background: var(--dashboard-hover);
+    }
+}
+
+.tfa-codes-actions button:focus-visible {
+    outline: none;
+    box-shadow: inset 0 0 0 3px var(--select-ring);
+}
+
+.tfa-confirmations {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.tfa-confirm-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.tfa-confirm-item input[type='checkbox'] {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    margin: 2px 0 0;
+    accent-color: var(--dashboard-button-primary);
+    cursor: pointer;
+}
+
+/* margin and text-shadow undo style.css's global `label` rule. */
+.tfa-confirm-item label {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--dashboard-text-secondary);
+    text-shadow: none;
+    cursor: pointer;
+}
+
+.tfa-action:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.dashboard-tfa-dialog .login-2fa-code-inputs .dashboard-dialog-input,
+.dashboard-tfa-dialog .login-2fa-code-inputs .dashboard-dialog-input:focus {
+    width: 46px;
+    height: 54px;
+    padding: 0;
+    text-align: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 22px;
+    font-weight: 600;
+}
+
+.dashboard-tfa-dialog .login-2fa-code-inputs .login-2fa-wrong {
+    border-color: var(--dashboard-danger-text);
+    animation: auth-shake 0.4s ease;
+}
+
+.tfa-code-status {
+    text-align: center;
+}
+
+.tfa-success-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 64px;
+    height: 64px;
+    margin: 8px auto 0;
+    border-radius: 50%;
+    background: var(--dashboard-success-background);
+    color: var(--dashboard-success-text);
+}
+
+.tfa-success-icon svg {
+    width: 32px;
+    height: 32px;
+}
+
+.tfa-success-title {
+    font-size: 20px;
+    font-weight: 700;
+    text-align: center;
+    color: var(--dashboard-text-primary);
+}
+
+.tfa-success-text {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.6;
+    text-align: center;
+    color: var(--dashboard-text-secondary);
+}
+
+@media (max-width: 380px) {
+    .dashboard-tfa-dialog .login-2fa-code-inputs .dashboard-dialog-input,
+    .dashboard-tfa-dialog .login-2fa-code-inputs .dashboard-dialog-input:focus {
+        width: 40px;
+        height: 48px;
+        font-size: 20px;
+    }
+
+    .tfa-codes-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .tfa-progress-label {
+        font-size: 10px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .dashboard-tfa-dialog .login-2fa-code-inputs .login-2fa-wrong {
+        animation: none;
+    }
 }
 
 /* A value to copy: the API token, a published address. */
@@ -11371,7 +12048,7 @@ body.dashboard-mode .notifications-close-all {
 
 .auth-dialog .signup-terms {
     margin: 18px 0 0;
-    font-size: 12px;
+    font-size: 11px;
     line-height: 1.5;
     color: var(--dashboard-text-muted);
     text-align: center;
@@ -11388,12 +12065,6 @@ body.dashboard-mode .notifications-close-all {
 
 .auth-turnstile:has(.cf-turnstile:empty) {
     display: none;
-}
-
-.cf-turnstile.captcha-completed {
-    border: 2px solid #4caf50;
-    border-radius: 4px;
-    padding: 2px;
 }
 
 /* Account picker */
@@ -11680,4 +12351,202 @@ span[data-avatar-user] > .avatar-picture {
     object-fit: cover;
     border-radius: inherit;
     pointer-events: none;
+}
+
+/* ======================================
+   File Pickers
+   ====================================== */
+
+/* An open, save or directory picker is the Files listing (the rules above
+   reach it through .dashboard-section-files) over a bar of buttons. */
+.window-filedialog .window-body-filedialog {
+    width: 100% !important;
+    height: calc(100% - var(--file-picker-head-height) - var(--file-picker-prompt-height)) !important;
+    padding: 0;
+    overflow: hidden;
+    background: var(--dashboard-background);
+}
+
+.window-filedialog {
+    --file-picker-head-height: 30px;
+    --file-picker-prompt-height: 64px;
+}
+
+/* A popup's picker has no head: the page is the window. */
+.window-filedialog.window-cover-page {
+    --file-picker-head-height: 0px;
+}
+
+.file-picker {
+    display: flex;
+    height: 100%;
+    color: var(--dashboard-text);
+}
+
+.file-picker * {
+    box-sizing: border-box;
+}
+
+.file-picker .files-tab {
+    width: 100%;
+    height: 100%;
+}
+
+/* The dashboard's 10px inset (.dashboard-content.files) is the folders'
+   own here. Below 768px the Files tab pushes them down past the dashboard's
+   menu toggle; a picker has no toggle. */
+.file-picker .directories {
+    width: 190px;
+    flex-shrink: 0;
+    padding-top: 7px;
+    padding-left: 10px;
+}
+
+.file-picker .directory-contents {
+    flex: 1;
+    min-width: 0;
+}
+
+/* On a phone the Files tab's crumbs clear the dashboard's menu button;
+   a picker has none beside them. */
+@media (max-width: 480px) {
+    .file-picker .header .path-breadcrumbs,
+    .file-picker .header .path-editor,
+    .file-picker .header .path.path-editing::after {
+        margin-left: 0;
+    }
+}
+
+/* No footer under the listing here. The Files tab's grids clear its footer
+   with a rule of their own, which this has to outrank. */
+.file-picker .files,
+.dashboard-section-files.file-picker .files-tab .files.files-grid-view {
+    margin-bottom: 0;
+}
+
+/* The columns keep their widths: nothing to drag. */
+.file-picker .header .columns .col-resize-handle {
+    cursor: default;
+    pointer-events: none;
+}
+
+.file-picker .files-tab.shared-view .header .columns,
+.file-picker .files-tab.shared-view .files.files-list-view .row {
+    grid-template-columns: 24px auto 4px 140px 4px 100px 4px 120px 4px 20px;
+}
+
+/* Files the picker can't pick: other types, or any file in a directory picker. */
+.file-picker .files .row.item-disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+.file-picker .files .row.item-disabled .item-more {
+    visibility: hidden;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files.file-picker .files .row.item-disabled:hover {
+        background: none;
+    }
+}
+
+.window-filedialog-prompt {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    box-sizing: border-box;
+    height: var(--file-picker-prompt-height);
+    padding: 0 16px;
+    border-top: 1px solid var(--dashboard-border);
+    background: var(--dashboard-background);
+}
+
+/* The name field shrinks so the buttons stay whole, on one line, on screen. */
+.window-filedialog-prompt-row {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    min-width: 0;
+    white-space: nowrap;
+}
+
+.window-filedialog-prompt-buttons {
+    flex: 0 0 auto;
+    margin-left: auto;
+}
+
+/* On a phone a dashboard dialog's buttons stack full width; these share
+   the bar with the name field. */
+.window-filedialog-prompt .dashboard-dialog-btn {
+    flex-shrink: 0;
+    width: auto;
+    min-width: 72px;
+}
+
+.window-filedialog-prompt .dashboard-dialog-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+    pointer-events: none;
+}
+
+.window-filedialog-prompt .savefiledialog-filename {
+    flex: 1;
+    min-width: 0;
+    width: auto;
+    height: 36px;
+    margin: 0;
+    padding: 0 12px;
+    border: 1px solid var(--dashboard-border);
+    border-radius: 10px;
+    background: var(--dashboard-input-background, var(--dashboard-background));
+    color: var(--dashboard-text-primary);
+    font-size: 13px;
+    font-family: inherit;
+}
+
+.window-filedialog-prompt .savefiledialog-filename:focus {
+    outline: none;
+    border-color: var(--select-color);
+    box-shadow: 0 0 0 3px var(--select-ring);
+}
+
+/* In a narrow open picker, Upload gives way so the buttons stay whole. */
+.window-filedialog-upload-here {
+    display: flex;
+    flex: 0 1 auto;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    padding: 6px 8px;
+    border-radius: 8px;
+    overflow: hidden;
+    white-space: nowrap;
+    color: var(--dashboard-text-secondary);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.window-filedialog-upload-here svg {
+    flex-shrink: 0;
+}
+
+.window-filedialog-upload-here:focus-visible {
+    outline: 2px solid var(--select-color);
+    outline-offset: -2px;
+}
+
+.window-filedialog-upload-here[aria-disabled="true"] {
+    opacity: 0.4;
+    pointer-events: none;
+}
+
+@media (hover: hover) {
+    .window-filedialog-upload-here:hover {
+        background: var(--dashboard-hover);
+        color: var(--dashboard-text-primary);
+    }
 }

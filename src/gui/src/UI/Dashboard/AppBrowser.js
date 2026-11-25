@@ -21,7 +21,7 @@ import { isTouchPrimaryDevice } from './ContextMenu/ContextMenu.js';
 import { bindBackdropDismiss } from './dashboardOverlay.js';
 import { reconcileAppOrder, serializeAppOrder, mergeSavedOrder, APPS_ORDER_KV_KEY } from './appOrder.js';
 import { parseRemovedApps, serializeRemovedApps, REMOVED_APPS_KV_KEY } from './removedApps.js';
-import { appTileLink } from './appLink.js';
+import { appCopyLink } from './appLink.js';
 import { appIconAttrs } from '../../helpers/appIcon.js';
 import { user_facing_windows } from '../../helpers/windowVisibility.js';
 import { focusExistingAppWindow } from '../../helpers/focusAppWindow.js';
@@ -59,7 +59,7 @@ const KV_READ_FAILED = Symbol('kv read failed');
  * @param {{ editable?: boolean, onLaunch?: (app: { appName: string, targetLink?: string }) => void, actions?: Object, guestApps?: Object[] }} options
  */
 export function createAppBrowser ({ editable = true, onLaunch, actions = {}, guestApps } = {}) {
-    const { showContextMenu, showAlert, launchApp, revokeAppSessions, beginTileLaunch, settleTileLaunch } = actions;
+    const { showContextMenu, showAlert, launchApp, revokeAppSessions, beginTileLaunch, settleTileLaunch, openSite } = actions;
 
     /** Lowercase app names that must not offer Uninstall in the My Apps tile context menu. */
     const APP_NAMES_NO_UNINSTALL = new Set([
@@ -68,10 +68,15 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
     ]);
 
     // -- Add-an-app tile --
-    /** Puter's app marketplace — the add-an-app tile's route to installing one. */
-    const APP_CENTER_APP_NAME = 'app-center';
-    /** Puter's AI app builder, which generates an app from a description. */
-    const BUILDER_APP_NAME = 'builder';
+    /**
+     * Where each of the add-an-app modal's app options goes: a site opened
+     * signed in, in a new tab, or the app opened in-page when the browser
+     * refuses the tab.
+     */
+    const ADD_APP_DESTINATIONS = {
+        browse: { site: 'https://apps.puter.com/', appName: 'app-center' },
+        ai: { site: 'https://builder.puter.com/', appName: 'builder' },
+    };
 
     // -- Drag-to-reorder tuning --
     const DRAG_START_DISTANCE = 5;      // px a pointer must travel before a drag begins
@@ -228,7 +233,7 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
             ? `src="${html_encode(window.icons['app-default.svg'])}"`
             : appIconAttrs(app, window.icons['app.svg']);
 
-        let h = `<div class="myapps-tile" role="button" tabindex="-1" data-app-name="${html_encode(app.name)}" data-app-title="${html_encode(title)}" data-app-uid="${html_encode(app.uid || '')}" data-target-link="${html_encode(targetLink)}" title="${html_encode(title)}">`;
+        let h = `<div class="myapps-tile" role="button" tabindex="-1" data-app-name="${html_encode(app.name)}" data-app-title="${html_encode(title)}" data-app-uid="${html_encode(app.uid || '')}" data-target-link="${html_encode(targetLink)}" data-index-url="${html_encode(app.index_url || '')}" title="${html_encode(title)}">`;
         h += '<div class="myapps-tile-icon">';
         h += `<img ${iconAttrs} alt="" draggable="false">`;
         // iOS-style uninstall badge; only shown while reorder mode is on (CSS).
@@ -383,7 +388,7 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
     function trapModalTab ($overlay) {
         $overlay.on('keydown', function (e) {
             if ( e.key !== 'Tab' ) return;
-            const focusables = $overlay.find('button, textarea').toArray()
+            const focusables = $overlay.find('button, textarea, input:not([type="hidden"]), select, a[href]').toArray()
                 .filter(el => ! el.disabled && el.offsetParent !== null);
             if ( focusables.length === 0 ) return;
             const first = focusables[0];
@@ -456,6 +461,12 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
             // restores its position if it comes back.
             const deleteData = $overlay.find('.myapps-modal-delete-data').is(':checked');
             const removedIndex = self._apps.findIndex(a => a.name === appName);
+            // Uninstalled from inside an open folder: where focus goes after.
+            const fromGroupId = $el_window.find('.myapps-group-panel-grid .myapps-tile').toArray()
+                .some(el => el.dataset.appName === appName) ? self._openGroupId : null;
+            const groupMates = fromGroupId
+                ? (findGroupById(self._groups, fromGroupId)?.apps ?? []).filter(name => name !== appName)
+                : [];
             const removedApp = removedIndex === -1 ? null : self._apps[removedIndex];
             // A running instance would be stranded: the tile is a headless
             // app's only switcher, so once it's gone a minimized window could
@@ -463,6 +474,9 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
             // also consumes the app's URL entry if it owns one).
             $(`.window[data-app="${html_encode(appName)}"]`).close();
             self._invalidateInFlightLoads();
+            // Until the revoke lands the server still lists the app as
+            // installed, so loads started meanwhile leave it out themselves.
+            self._pendingUninstalls.add(appName);
             self._setAppRemoved(appName, true);
             close({ restoreFocus: false });
 
@@ -494,9 +508,19 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                 self.renderApps($el_window, { preservePage: true, instant: true });
                 // The confirm button left with the modal; keep a keyboard user on
                 // the grid, at the slot the app vacated.
-                if ( slot !== -1 && (! document.activeElement || document.activeElement === document.body) ) {
-                    const tiles = $el_window.find('.myapps-page .myapps-tile').toArray();
-                    tiles[Math.min(slot, tiles.length - 1)]?.focus({ preventScroll: true });
+                if ( ! document.activeElement || document.activeElement === document.body ) {
+                    if ( slot !== -1 ) {
+                        const tiles = $el_window.find('.myapps-page .myapps-tile').toArray();
+                        tiles[Math.min(slot, tiles.length - 1)]?.focus({ preventScroll: true });
+                    } else if ( fromGroupId ) {
+                        // The folder may still be open, closed, or dissolved
+                        // into the one app left in it.
+                        const target = $el_window.find('.myapps-group-panel-grid .myapps-tile')[0]
+                            ?? $el_window.find(`.myapps-group-tile[data-group-id="${CSS.escape(fromGroupId)}"]`)[0]
+                            ?? $el_window.find('.myapps-page .myapps-tile').toArray()
+                                .find(el => groupMates.includes(el.dataset.appName));
+                        target?.focus({ preventScroll: true });
+                    }
                 }
                 // FLIP the survivors from their old boxes into the new layout.
                 const moved = [];
@@ -546,6 +570,9 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
             puter.perms.revokeApp(appUid, '*', { deleteData }).then(async (result) => {
                 // revokeApp resolves (never rejects) with `error` set on failure.
                 if ( result?.error ) throw result;
+                // Loads started before now may have read the app as installed.
+                self._invalidateInFlightLoads();
+                self._pendingUninstalls.delete(appName);
                 // Clearing the grants is only half of it. An app the user already
                 // opened holds a token that authenticates against a session row,
                 // and that row outlives the permission rows — so without this an
@@ -563,10 +590,11 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                     await revokeAppSessions(appUid);
                 } catch ( e ) {
                     console.error('Uninstalled the app but could not end its sessions:', e);
-                    showAlert(i18n('uninstall_sessions_failed', [displayName], false));
+                    showAlert(i18n('uninstall_sessions_failed', [displayName]), $el_window);
                 }
             }).catch(async err => {
                 console.error('Failed to uninstall app:', err);
+                self._pendingUninstalls.delete(appName);
                 await removalSettled;
                 self._invalidateInFlightLoads();
                 // The uninstall didn't happen — take the name back off the
@@ -576,7 +604,7 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                     self._apps.splice(Math.min(removedIndex, self._apps.length), 0, removedApp);
                     self.renderApps($el_window, { preservePage: true, instant: true });
                 }
-                showAlert(i18n('uninstall_failed', { name: displayName }, false));
+                showAlert(i18n('uninstall_failed', { name: displayName }), $el_window);
             });
         });
     }
@@ -693,13 +721,16 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
         $overlay.on('click', '.myapps-add-back', () => showPane('options'));
         $(document).on('keydown.add-app-modal', function (e) {
             if ( e.key !== 'Escape' ) return;
+            // Escape while composing (CJK input) cancels the composition only.
+            if ( e.originalEvent?.isComposing || e.keyCode === 229 ) return;
             // Escape steps back out of the form before it closes the modal, so a
             // half-written request survives a mis-hit key.
             if ( currentPane() === 'request' ) showPane('options');
             else close();
         });
 
-        // Opened exactly like an /app/<name> landing: the same pedagogical
+        // When the browser refuses the site's tab, the app opens in-page,
+        // exactly like an /app/<name> landing: the same pedagogical
         // click→morph→open intro plays (see beginDeepLinkLaunch) — and since
         // choosing App Center or the AI builder is usually asking for an app the
         // grid doesn't have yet, the intro is also what INSTALLS it: the tile
@@ -737,7 +768,7 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                     launched = outcome?.launchResult?.launched !== false;
                 }).catch(err => {
                     console.error(`Failed to launch ${appName}:`, err);
-                    showAlert(i18n('something_went_wrong', [], false));
+                    showAlert(i18n('something_went_wrong'), $el_window);
                 }).finally(() => {
                     browser.settleDeepLinkLaunch(appName, tile, launched);
                 });
@@ -759,10 +790,12 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                 showPane('request');
                 return;
             }
-            // An app is opening — the modal has nothing left to say.
+            const destination = ADD_APP_DESTINATIONS[key];
+            if ( ! destination ) return;
+            // Something is opening — the modal has nothing left to say.
             close();
-            if ( key === 'browse' ) openApp(APP_CENTER_APP_NAME);
-            else if ( key === 'ai' ) openApp(BUILDER_APP_NAME);
+            // Opened here, inside the click, so popup blockers allow the tab.
+            if ( ! openSite?.(destination.site) ) openApp(destination.appName);
         });
 
         // Nothing to send until something has been written.
@@ -905,6 +938,9 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
         _loadPromise: null,
         // Set by init: the open's first load joins Home's /get-launch-apps.
         _joinHomeLaunchApps: false,
+        // Set by init: the open's first load may take its saved layout from
+        // the SDK's boot batch; later loads read the store.
+        _bootKvRead: false,
         _pendingLoad: null,
         _savedOrderNames: null,
         _orderSavedAtSeq: 0,
@@ -917,6 +953,8 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
         // The last uninstalled-apps list a read returned, for loads whose read fails.
         _lastRemovedApps: null,
         _launchingApps: new Set(),
+        // Apps whose uninstall was confirmed but hasn't landed on the server.
+        _pendingUninstalls: new Set(),
         // A deep-link install mid-arrival ({ name, $el_window }) — its tile is
         // parked invisible until the intro's arrival beat (see
         // _spliceDeepLinkApp); and the session's landing-installed apps, kept
@@ -965,6 +1003,7 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
             this._arriving = null;
 
             this._joinHomeLaunchApps = true;
+            this._bootKvRead = true;
             this.loadApps($el_window);
 
             const self = this;
@@ -1126,15 +1165,16 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                     if ( ! tab ) beginTileLaunch(tile);
                     // The launch owns the tab from here, and closes it on failure.
                     launchApp(tab
-                        ? { name: appName, newTab: tab }
+                        ? { name: appName, newTab: tab, trigger: 'app_icon' }
                         : {
                             name: appName,
                             maximized: true,
                             window_options: { morph_from_dashboard_tile: true },
+                            trigger: 'app_icon',
                         })
                         .catch((err) => {
                             console.error(`Failed to launch ${appName}:`, err);
-                            showAlert(i18n('something_went_wrong', [], false));
+                            showAlert(i18n('something_went_wrong'), $el_window);
                         })
                         .finally(() => {
                             self._launchingApps.delete(appName);
@@ -1207,6 +1247,7 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                 const appTitle = $(this).attr('data-app-title');
                 const appUid = $(this).attr('data-app-uid');
                 const targetLink = $(this).attr('data-target-link');
+                const indexUrl = $(this).attr('data-index-url');
                 const noUninstall = APP_NAMES_NO_UNINSTALL.has((appName || '').toLowerCase());
                 // Same window set the running dot counts: Quit is offered for what
                 // the user has open, not for a helper another app is running in
@@ -1214,26 +1255,11 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                 const isRunning = !! appName
                     && user_facing_windows($(`.window[data-app="${html_encode(appName)}"]`)).length > 0;
 
-                // Every app opens in a new browser tab the way tiles did before
-                // in-page windows: external tiles via their site link, everything
-                // else via its /app/<name> URL.
                 const items = [
-                    {
-                        html: i18n('open_in_new_tab'),
-                        onClick: () => {
-                            if ( targetLink && targetLink !== '' ) {
-                                window.open(targetLink, '_blank', 'noopener,noreferrer');
-                            } else if ( appName ) {
-                                window.open(`/app/${encodeURIComponent(appName)}`, '_blank', 'noopener,noreferrer');
-                            }
-                        },
-                    },
-                    // The same destination the item above opens, as an absolute
-                    // URL so it is worth pasting somewhere other than this page.
                     {
                         html: i18n('copy_link'),
                         onClick: async () => {
-                            const link = appTileLink({ appName, targetLink }, window.location.origin);
+                            const link = appCopyLink({ appName, targetLink, indexUrl }, window.location.origin);
                             if ( link ) await window.copy_to_clipboard(link);
                         },
                     },
@@ -1362,7 +1388,7 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                 // account dialog, the touch action sheet, or the phone drawer.
                 if ( $('.dashboard-notifications-panel.open, .dashboard-dialog-overlay, .context-menu-modal-backdrop, .dashboard-sidebar.open').length ) return;
 
-                const $panelGrid = $el_window.find('.myapps-group-panel-grid');
+                const $panelGrid = $el_window.find('.myapps-group-overlay:not([inert]) .myapps-group-panel-grid');
                 const pageTiles = ($panelGrid.length
                     ? $panelGrid
                     : $el_window.find('.myapps-page').eq(self._page)
@@ -2237,6 +2263,8 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
             // removal below, so the tile a user reaches for the instant a folder
             // shuts would do nothing.
             $overlay.css('pointer-events', 'none');
+            // Nor may its tiles take focus (Tab, the arrow keys) on the way out.
+            $overlay.attr('inert', '');
 
             // Back into the tile it grew out of; if that tile is gone (the folder
             // dissolved, the page flipped) the card simply recedes where it is.
@@ -2334,14 +2362,32 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
             // boundary so their stale snapshot can't replay over it (see
             // _resolveGroups).
             this._groupsSavedAtSeq = this._loadSeq || 0;
-            try {
-                const p = puter.kv.set(APP_GROUPS_KV_KEY, JSON.stringify(groups));
-                if ( p && typeof p.catch === 'function' ) {
-                    p.catch(err => console.error('Failed to save app folders:', err));
+            this._persistLatest(APP_GROUPS_KV_KEY, JSON.stringify(groups), 'Failed to save app folders:');
+        },
+
+        // Saves `value` under `key` one write at a time, sending only the
+        // newest value once the write before it lands: two writes of a key in
+        // flight together (an eject's save, then the drop's) can land in
+        // either order, leaving the older layout stored.
+        _persistLatest (key, value, failureMessage) {
+            this._kvWrites ??= new Map();
+            let slot = this._kvWrites.get(key);
+            if ( ! slot ) this._kvWrites.set(key, slot = { pending: undefined, running: false });
+            slot.pending = value;
+            if ( slot.running ) return;
+            slot.running = true;
+            (async () => {
+                while ( slot.pending !== undefined ) {
+                    const next = slot.pending;
+                    slot.pending = undefined;
+                    try {
+                        await puter.kv.set(key, next);
+                    } catch ( err ) {
+                        console.error(failureMessage, err);
+                    }
                 }
-            } catch ( err ) {
-                console.error('Failed to save app folders:', err);
-            }
+                slot.running = false;
+            })();
         },
 
         // -- Drag-to-reorder --
@@ -3243,7 +3289,9 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
             // one — the in-memory record still covers this session, and the
             // next write retries the lot.
             this._removedWriteChain = (this._removedWriteChain || Promise.resolve()).then(async () => {
-                const names = parseRemovedApps(await puter.kv.get(REMOVED_APPS_KV_KEY));
+                // The object form skips the boot batch, which may predate
+                // another window's write.
+                const names = parseRemovedApps(await puter.kv.get({ key: REMOVED_APPS_KV_KEY }));
                 for ( const [name, isRemoved] of this._removedLocal ) {
                     if ( isRemoved ) names.add(name);
                     else names.delete(name);
@@ -3269,14 +3317,7 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
             // boundary so their stale snapshot can't replay over it (see
             // _resolveOrderNames).
             this._orderSavedAtSeq = this._loadSeq || 0;
-            try {
-                const p = puter.kv.set(APPS_ORDER_KV_KEY, JSON.stringify(names));
-                if ( p && typeof p.catch === 'function' ) {
-                    p.catch(err => console.error('Failed to save app order:', err));
-                }
-            } catch ( err ) {
-                console.error('Failed to save app order:', err);
-            }
+            this._persistLatest(APPS_ORDER_KV_KEY, JSON.stringify(names), 'Failed to save app order:');
         },
 
         loadApps ($el_window) {
@@ -3380,7 +3421,11 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
                     return { apps: all, complete: true };
                 };
 
-                const readKv = key => guestApps ? null : puter.kv.get(key).catch(() => KV_READ_FAILED);
+                // A refresh exists to pick up another tab's changes, which the
+                // boot batch may predate; the object form skips it.
+                const fromBoot = this._bootKvRead;
+                this._bootKvRead = false;
+                const readKv = key => guestApps ? null : puter.kv.get(fromBoot ? key : { key }).catch(() => KV_READ_FAILED);
                 const [installedResult, fetchedLaunchData, savedOrderRaw, removedAppsRaw, groupsRaw] = await Promise.all([
                     guestApps ? { apps: [], complete: true } : fetchAllInstalledApps(),
                     // The recommended list only adds tiles: if it fails (network,
@@ -3444,7 +3489,7 @@ export function createAppBrowser ({ editable = true, onLaunch, actions = {}, gue
 
                 // Append installed apps that aren't already in the list
                 for ( const app of installedApps ) {
-                    if ( seen.has(app.name) ) continue;
+                    if ( seen.has(app.name) || this._pendingUninstalls.has(app.name) ) continue;
                     seen.add(app.name);
                     merged.push(app);
                 }

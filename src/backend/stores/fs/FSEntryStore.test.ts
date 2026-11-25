@@ -53,20 +53,24 @@ describe('FSEntryStore', () => {
                 quoteIdentifier: (identifier: string) => `"${identifier}"`,
                 read: async (query: string) => {
                     queries.push(query);
-                    if (query.includes('SUM(size)')) {
-                        return [{ totalUsage: 321 }];
-                    }
-                    return [{ freeStorage: 654 }];
+                    return query.includes('SUM(size)')
+                        ? [{ totalUsage: 321 }]
+                        : [];
                 },
             },
             event: {
                 emitAndWaitConcurrently: async () => undefined,
             },
         };
+        const stores = {
+            user: {
+                getById: async () => ({ id: 42, uuid: 'u', free_storage: 654 }),
+            },
+        };
         const store = new FSEntryStore(
             config,
             clients as ConstructorParameters<typeof FSEntryStore>[1],
-            {} as ConstructorParameters<typeof FSEntryStore>[2],
+            stores as unknown as ConstructorParameters<typeof FSEntryStore>[2],
         );
 
         await expect(store.getUserStorageAllowance(42)).resolves.toEqual({
@@ -75,7 +79,6 @@ describe('FSEntryStore', () => {
         });
         expect(queries).toEqual([
             'SELECT COALESCE(SUM(size), 0) AS "totalUsage" FROM fsentries WHERE user_id = ?',
-            'SELECT uuid, free_storage AS "freeStorage" FROM "user" WHERE id = ? LIMIT 1',
         ]);
     });
 });
@@ -259,7 +262,7 @@ describe('FSEntryStore subdomain aggregation', () => {
 });
 
 describe('FSEntryStore cache invalidation', () => {
-    it('invalidates every key of an entry addressed by path, uuid or id', async () => {
+    it('invalidates every key of an entry addressed by uuid or id', async () => {
         const user = await makeUser();
         const file = await createFile(user, `${user.home}/Documents/cache.txt`);
         const keys = [
@@ -269,14 +272,6 @@ describe('FSEntryStore cache invalidation', () => {
         ];
 
         for (const [label, invalidate] of [
-            [
-                'path',
-                () =>
-                    store.invalidateEntryCacheByPathForUser(
-                        user.userId,
-                        file.path,
-                    ),
-            ],
             ['uuid', () => store.invalidateEntryCacheByUuid(file.uuid)],
             ['id', () => store.invalidateEntryCacheById(file.id)],
         ] as Array<[string, () => Promise<void>]>) {
@@ -290,17 +285,20 @@ describe('FSEntryStore cache invalidation', () => {
         }
     });
 
-    it('still clears the path key when no row exists at that path', async () => {
+    it('drops the old path key of an entry cached before a move', async () => {
         const user = await makeUser();
-        const key = `prodfsv2:fsentry:path:any:${user.home}/Documents/stale.txt`;
-        await server.clients.redis.setex(key, 60, '{"uuid":"stale"}');
-
-        await store.invalidateEntryCacheByPathForUser(
-            user.userId,
-            `${user.home}/Documents/stale.txt`,
+        const file = await createFile(user, `${user.home}/Documents/moved.txt`);
+        await store.getEntryByUuid(file.uuid);
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = ?, name = ? WHERE id = ?',
+            [`${user.home}/Documents/renamed.txt`, 'renamed.txt', file.id],
         );
 
-        await expect(server.clients.redis.get(key)).resolves.toBeNull();
+        await store.invalidateEntryCacheById(file.id);
+
+        await expect(
+            server.clients.redis.get(`prodfsv2:fsentry:path:any:${file.path}`),
+        ).resolves.toBeNull();
     });
 
     it('falls back to the cached copy to find the keys of a deleted entry', async () => {
@@ -444,7 +442,7 @@ describe('FSEntryStore cache invalidation', () => {
             store.batchCreateEntries([
                 {
                     userId: user.userId,
-                    uuid: uuidv4(),
+                    uuid: file.uuid,
                     path: file.path,
                     size: 7,
                     overwrite: true,
@@ -761,6 +759,23 @@ describe('FSEntryStore legacy NULL-path healing', () => {
         ).resolves.toMatchObject({ uuid: stored.uuid });
     });
 
+    it('walks the lineage up to 500 segments and skips it past that', async () => {
+        const user = await makeUser();
+        const depthOfHome = user.home.split('/').filter(Boolean).length;
+        const pathWithSegments = (segments: number) =>
+            `${user.home}${'/d'.repeat(segments - depthOfHome)}`;
+
+        const { stats, spy } = watchLineageReads();
+        try {
+            await expect(store.getEntryByPath(pathWithSegments(500))).resolves.toBeNull();
+            expect(stats.calls).toBe(1);
+            await expect(store.getEntryByPath(pathWithSegments(501))).resolves.toBeNull();
+            expect(stats.calls).toBe(1);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     it('returns null when a path segment cannot be resolved', async () => {
         const user = await makeUser();
         await expect(
@@ -783,6 +798,393 @@ describe('FSEntryStore legacy NULL-path healing', () => {
         });
     });
 
+    /** Serves `uuid`'s row from before the backfill to every replica read. */
+    const lagReplicaFor = async (uuid: string) => {
+        const db = server.clients.db;
+        const originalRead = (Object.getPrototypeOf(db) as typeof db).read;
+        const primary = vi
+            .spyOn(db, 'pread')
+            .mockImplementation(async (sql: string, params?: unknown[]) =>
+                originalRead.call(db, sql, params),
+            );
+        const [stale] = (await originalRead.call(
+            db,
+            `SELECT * FROM fsentries WHERE uuid = ?`,
+            [uuid],
+        )) as Array<Record<string, unknown>>;
+        const replica = vi
+            .spyOn(db, 'read')
+            .mockImplementation(async (sql: string, params?: unknown[]) => {
+                const rows = (await originalRead.call(db, sql, params)) as
+                    unknown[] | undefined;
+                if (!Array.isArray(rows)) return rows;
+                return rows.map((row) => {
+                    const r = row as Record<string, unknown>;
+                    if (r.uuid !== uuid) return row;
+                    const lagged = { ...r };
+                    for (const key of Object.keys(r)) {
+                        if (key in stale) lagged[key] = stale[key];
+                    }
+                    return lagged;
+                });
+            });
+        return {
+            mockRestore: () => {
+                replica.mockRestore();
+                primary.mockRestore();
+            },
+        };
+    };
+
+    it.each([
+        ['path', (folder: FSEntry) => store.getEntryByPath(folder.path)],
+        ['uuid', (folder: FSEntry) => store.getEntryByUuid(folder.uuid)],
+    ])(
+        'gives an entry healed by %s its written path while the replica lags',
+        async (_route, lookup) => {
+            const user = await makeUser();
+            await createFile(user, `${user.home}/Documents/lagged/keep.txt`);
+            const folder = (await store.getEntryByPath(
+                `${user.home}/Documents/lagged`,
+            ))!;
+            await blankPath(folder.uuid);
+
+            const spy = await lagReplicaFor(folder.uuid);
+            await server.clients.db.write(
+                'UPDATE fsentries SET layout = ? WHERE uuid = ?',
+                ['list', folder.uuid],
+            );
+            try {
+                await expect(lookup(folder)).resolves.toMatchObject({
+                    uuid: folder.uuid,
+                    path: folder.path,
+                    layout: 'list',
+                });
+            } finally {
+                spy.mockRestore();
+            }
+            await expect(pathOf(folder.uuid)).resolves.toBe(folder.path);
+        },
+    );
+
+    it('misses a path whose row has moved by the time it is healed', async () => {
+        const user = await makeUser();
+        await createFile(user, `${user.home}/Documents/gone/keep.txt`);
+        const folder = (await store.getEntryByPath(
+            `${user.home}/Documents/gone`,
+        ))!;
+        const desktop = (await store.getEntryByPath(`${user.home}/Desktop`))!;
+        await blankPath(folder.uuid);
+
+        const moved = `${user.home}/Desktop/gone`;
+        const db = server.clients.db;
+        const originalRead = (Object.getPrototypeOf(db) as typeof db).read;
+        const spy = vi
+            .spyOn(db, 'read')
+            .mockImplementation(async (sql: string, params?: unknown[]) => {
+                const rows = await originalRead.call(db, sql, params);
+                if (sql.includes('segments(depth, name)')) {
+                    await db.write(
+                        'UPDATE fsentries SET path = ?, parent_uid = ?, parent_id = ? WHERE uuid = ?',
+                        [moved, desktop.uuid, desktop.id, folder.uuid],
+                    );
+                }
+                return rows;
+            });
+        try {
+            await expect(
+                store.getEntryByPath(`${user.home}/Documents/gone`),
+            ).resolves.toBeNull();
+        } finally {
+            spy.mockRestore();
+        }
+        await expect(pathOf(folder.uuid)).resolves.toBe(moved);
+        await expect(
+            server.clients.redis.get(`prodfsv2:fsentry:uuid:${folder.uuid}`),
+        ).resolves.toBeNull();
+    });
+
+    it('heals a stored path the parent chain no longer spells, from the primary', async () => {
+        const user = await makeUser();
+        const file = await createFile(user, `${user.home}/Documents/kept.txt`);
+        await blankPath(file.uuid);
+
+        // The replica still has no path; the primary has one its names don't spell.
+        const lag = await lagReplicaFor(file.uuid);
+        const stale = `${user.home}/Documents/other.txt`;
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = ? WHERE uuid = ?',
+            [stale, file.uuid],
+        );
+        try {
+            await expect(
+                store.getEntryByPath(file.path),
+            ).resolves.toMatchObject({ uuid: file.uuid, path: file.path });
+        } finally {
+            lag.mockRestore();
+        }
+        await expect(pathOf(file.uuid)).resolves.toBe(file.path);
+        await expect(store.getEntryByPath(stale)).resolves.toBeNull();
+    });
+
+    it('heals the path-less children of a listing a few at a time', async () => {
+        const user = await makeUser();
+        const dir = `${user.home}/Documents/many`;
+        for (let i = 0; i < 25; i++) {
+            await createFile(user, `${dir}/f-${i}.txt`);
+        }
+        const folder = (await store.getEntryByPath(dir))!;
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = NULL WHERE parent_uid = ?',
+            [folder.uuid],
+        );
+        await server.clients.redis.flushall?.();
+
+        const db = server.clients.db;
+        const originalPread = (Object.getPrototypeOf(db) as typeof db).pread;
+        const stats = { inFlight: 0, peak: 0 };
+        const spy = vi
+            .spyOn(db, 'pread')
+            .mockImplementation(async (sql: string, params?: unknown[]) => {
+                if (!sql.includes('ancestors(')) {
+                    return originalPread.call(db, sql, params);
+                }
+                stats.inFlight++;
+                stats.peak = Math.max(stats.peak, stats.inFlight);
+                try {
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                    return await originalPread.call(db, sql, params);
+                } finally {
+                    stats.inFlight--;
+                }
+            });
+        let children: FSEntry[];
+        try {
+            children = await store.listChildren(folder.uuid);
+        } finally {
+            spy.mockRestore();
+        }
+        expect(children.map((child) => child.path).sort()).toEqual(
+            Array.from({ length: 25 }, (_, i) => `${dir}/f-${i}.txt`).sort(),
+        );
+        expect(stats.peak).toBeGreaterThan(1);
+        expect(stats.peak).toBeLessThanOrEqual(10);
+    });
+
+    it('invalidates only the rows a heal fills, under the path it wrote', async () => {
+        const user = await makeUser();
+        const file = await createFile(user, `${user.home}/Documents/fill.txt`);
+        await blankPath(file.uuid);
+
+        const lag = await lagReplicaFor(file.uuid);
+        const publish = vi.spyOn(
+            store as unknown as {
+                publishCacheKeys: (p: { keys: string[] }) => Promise<void>;
+            },
+            'publishCacheKeys',
+        );
+        try {
+            await store.getEntryByPath(file.path);
+            expect(
+                publish.mock.calls.flatMap(([params]) => params.keys),
+            ).toEqual(entryCacheKeys(file));
+        } finally {
+            publish.mockRestore();
+            lag.mockRestore();
+        }
+    });
+
+    it('updates only the rows whose path is empty', async () => {
+        const user = await makeUser();
+        const file = await createFile(user, `${user.home}/Documents/one.txt`);
+        await blankPath(file.uuid);
+
+        const write = vi.spyOn(server.clients.db, 'write');
+        try {
+            await expect(
+                store.getEntryByUuid(file.uuid),
+            ).resolves.toMatchObject({ path: file.path });
+            expect(
+                write.mock.calls.filter(([sql]) =>
+                    String(sql).includes('UPDATE fsentries SET path'),
+                ),
+            ).toHaveLength(1);
+        } finally {
+            write.mockRestore();
+        }
+    });
+
+    it('stops walking a parent chain that loops back on itself', async () => {
+        const user = await makeUser();
+        const file = await createFile(user, `${user.home}/Documents/loop.txt`);
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = NULL, parent_uid = uuid WHERE uuid = ?',
+            [file.uuid],
+        );
+        await server.clients.redis.flushall?.();
+
+        // A cap well past the store's own keeps an unbounded walk from hanging the run.
+        const db = server.clients.db;
+        const originalPread = (Object.getPrototypeOf(db) as typeof db).pread;
+        const walked: number[] = [];
+        const spy = vi
+            .spyOn(db, 'pread')
+            .mockImplementation(async (sql: string, params?: unknown[]) => {
+                if (!sql.includes('ancestors(')) {
+                    return originalPread.call(db, sql, params);
+                }
+                const rows = await originalPread.call(
+                    db,
+                    sql.replace(
+                        'ON f.uuid = a.parent_uid',
+                        'ON f.uuid = a.parent_uid AND a.depth < 10000',
+                    ),
+                    params,
+                );
+                walked.push(rows.length);
+                return rows;
+            });
+        try {
+            await expect(
+                store.getEntryByUuid(file.uuid),
+            ).resolves.toMatchObject({ uuid: file.uuid, path: null });
+        } finally {
+            spy.mockRestore();
+        }
+        expect(walked.length).toBeGreaterThan(0);
+        expect(Math.max(...walked)).toBeLessThan(10000);
+        await expect(pathOf(file.uuid)).resolves.toBeNull();
+    });
+
+    describe('when an ancestor is renamed while the heal runs', () => {
+        const setup = async () => {
+            const user = await makeUser();
+            const file = await createFile(
+                user,
+                `${user.home}/Documents/old/x.txt`,
+            );
+            const folder = (await store.getEntryByPath(
+                `${user.home}/Documents/old`,
+            ))!;
+            await blankPath(file.uuid);
+            const rename = () =>
+                server.clients.db.write(
+                    'UPDATE fsentries SET name = ?, path = ? WHERE uuid = ?',
+                    ['new', `${user.home}/Documents/new`, folder.uuid],
+                );
+            return { user, file, folder, rename };
+        };
+
+        it('misses the old path and writes nothing', async () => {
+            const { user, file, rename } = await setup();
+            const db = server.clients.db;
+            const originalRead = (Object.getPrototypeOf(db) as typeof db).read;
+            const spy = vi
+                .spyOn(db, 'read')
+                .mockImplementation(async (sql: string, params?: unknown[]) => {
+                    const rows = await originalRead.call(db, sql, params);
+                    if (sql.includes('segments(depth, name)')) {
+                        await rename();
+                    }
+                    return rows;
+                });
+            try {
+                await expect(
+                    store.getEntryByPath(`${user.home}/Documents/old/x.txt`),
+                ).resolves.toBeNull();
+            } finally {
+                spy.mockRestore();
+            }
+            await expect(pathOf(file.uuid)).resolves.toBeNull();
+        });
+
+        it('gives a row healed by uuid its current path', async () => {
+            const { user, file, folder, rename } = await setup();
+            const lag = await lagReplicaFor(folder.uuid);
+            await rename();
+            try {
+                await expect(
+                    store.getEntryByUuid(file.uuid),
+                ).resolves.toMatchObject({
+                    path: `${user.home}/Documents/new/x.txt`,
+                });
+            } finally {
+                lag.mockRestore();
+            }
+            await expect(pathOf(file.uuid)).resolves.toBe(
+                `${user.home}/Documents/new/x.txt`,
+            );
+        });
+    });
+
+    it('keeps a path written by a move that lands before the heal', async () => {
+        const user = await makeUser();
+        const file = await createFile(
+            user,
+            `${user.home}/Documents/before.txt`,
+        );
+        await blankPath(file.uuid);
+
+        const spy = await lagReplicaFor(file.uuid);
+        const moved = `${user.home}/Documents/after.txt`;
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = ?, name = ? WHERE uuid = ?',
+            [moved, 'after.txt', file.uuid],
+        );
+        try {
+            await expect(
+                store.getEntryByUuid(file.uuid),
+            ).resolves.toMatchObject({ path: moved });
+        } finally {
+            spy.mockRestore();
+        }
+        await expect(pathOf(file.uuid)).resolves.toBe(moved);
+    });
+
+    it('heals a path in which each row is the parent of the next', async () => {
+        const user = await makeUser();
+        await createFile(user, `${user.home}/Notes/a.txt`);
+        const file = await createFile(user, `${user.home}/notes/x.txt`);
+        await blankPath(file.uuid);
+
+        // Names match case-insensitively here, as under MySQL's collation.
+        const db = server.clients.db;
+        const originalRead = (Object.getPrototypeOf(db) as typeof db).read;
+        const spy = vi
+            .spyOn(db, 'read')
+            .mockImplementation(async (sql: string, params?: unknown[]) =>
+                originalRead.call(
+                    db,
+                    sql.includes('segments(depth, name)')
+                        ? sql.replaceAll(
+                              'f.name = s.name',
+                              'f.name = s.name COLLATE NOCASE',
+                          )
+                        : sql,
+                    params,
+                ),
+            );
+        try {
+            // The folder spelled as asked is the one walked, and it has no x.txt.
+            await expect(
+                store.getEntryByPath(`${user.home}/Notes/x.txt`),
+            ).resolves.toBeNull();
+            await expect(pathOf(file.uuid)).resolves.toBeNull();
+
+            await expect(
+                store.getEntryByPath(`${user.home}/notes/x.txt`),
+            ).resolves.toMatchObject({
+                uuid: file.uuid,
+                path: `${user.home}/notes/x.txt`,
+            });
+        } finally {
+            spy.mockRestore();
+        }
+        await expect(pathOf(file.uuid)).resolves.toBe(
+            `${user.home}/notes/x.txt`,
+        );
+    });
+
     it('leaves an entry alone when its ancestor chain is broken', async () => {
         const user = await makeUser();
         const orphan = await createFile(
@@ -799,6 +1201,22 @@ describe('FSEntryStore legacy NULL-path healing', () => {
             uuid: orphan.uuid,
             path: null,
         });
+        await expect(
+            server.clients.redis.get(`prodfsv2:fsentry:uuid:${orphan.uuid}`),
+        ).resolves.toBeNull();
+
+        const listed = await store.listChildren('does-not-exist');
+        expect(
+            listed.find((entry) => entry.uuid === orphan.uuid),
+        ).toMatchObject({ path: null });
+        await expect(
+            server.clients.redis.get(`prodfsv2:fsentry:uuid:${orphan.uuid}`),
+        ).resolves.toBeNull();
+
+        await store.updateEntryThumbnailByUuid(orphan.uuid, 'thumb');
+        await expect(
+            server.clients.redis.get(`prodfsv2:fsentry:uuid:${orphan.uuid}`),
+        ).resolves.toBeNull();
     });
 
     it('heals path-less rows surfaced by a batched id lookup and by search', async () => {
@@ -1185,7 +1603,7 @@ describe('FSEntryStore entry creation', () => {
         const [updated] = await store.batchCreateEntries([
             {
                 userId: user.userId,
-                uuid: uuidv4(),
+                uuid: original.uuid,
                 path: `${user.home}/Documents/ow.txt`,
                 size: 42,
                 overwrite: true,
@@ -1202,6 +1620,79 @@ describe('FSEntryStore entry creation', () => {
         expect(updated?.isPublic).toBe(true);
         expect(updated?.immutable).toBe(true);
         expect(updated?.thumbnail).toBe('data:image/png;base64,AA');
+    });
+
+    it('announces the thumbnail an overwrite drops', async () => {
+        const user = await makeUser();
+        const path = `${user.home}/Documents/ow-thumb.txt`;
+        const original = await createFile(user, path, {
+            thumbnail: 's3://puter-local/thumbnails/old',
+        });
+        const kept = await createFile(
+            user,
+            `${user.home}/Documents/ow-kept.txt`,
+            { thumbnail: 's3://puter-local/thumbnails/kept' },
+        );
+        const bare = await createFile(user, `${user.home}/Documents/ow-bare.txt`);
+
+        const discarded: Array<{ uuid: string; url: string }> = [];
+        const listener = (_key: string, data: { uuid: string; url: string }) => {
+            discarded.push(data);
+        };
+        server.clients.event.on('thumbnail.discarded', listener);
+        try {
+            await store.batchCreateEntries(
+                [
+                    { entry: original, thumbnail: undefined },
+                    { entry: kept, thumbnail: kept.thumbnail! },
+                    { entry: bare, thumbnail: undefined },
+                ].map(({ entry, thumbnail }) => ({
+                    userId: user.userId,
+                    uuid: entry.uuid,
+                    path: entry.path,
+                    size: 2,
+                    overwrite: true,
+                    thumbnail,
+                    bucket: 'puter-local',
+                    bucketRegion: 'us-west-2',
+                })),
+            );
+        } finally {
+            server.clients.event.off('thumbnail.discarded', listener);
+        }
+
+        expect(discarded).toEqual([
+            { uuid: original.uuid, url: 's3://puter-local/thumbnails/old' },
+        ]);
+        await expect(store.getEntryByUuidFromPrimary(original.uuid)).resolves
+            .toMatchObject({ thumbnail: null });
+    });
+
+    it('leaves the row alone when an overwrite brings a different object key', async () => {
+        const user = await makeUser();
+        const original = await createFile(
+            user,
+            `${user.home}/Documents/otherkey.txt`,
+            { size: 1 },
+        );
+
+        // The bytes for this write sit under a key the row doesn't name, so
+        // repointing bucket or size would describe an object that isn't there.
+        const returned = await createFile(user, original.path, {
+            size: 42,
+            overwrite: true,
+            bucket: 'elsewhere',
+            bucketRegion: 'eu-central-1',
+        });
+
+        expect(returned.uuid).toBe(original.uuid);
+        await expect(
+            store.getEntryByPath(original.path),
+        ).resolves.toMatchObject({
+            uuid: original.uuid,
+            size: 1,
+            bucket: 'puter-local',
+        });
     });
 
     it('refuses to clobber an existing entry without overwrite, or a directory with it', async () => {
@@ -1227,7 +1718,10 @@ describe('FSEntryStore entry creation', () => {
 
     it('propagates the underlying failure when an overwrite update fails', async () => {
         const user = await makeUser();
-        await createFile(user, `${user.home}/Documents/upfail.txt`);
+        const existing = await createFile(
+            user,
+            `${user.home}/Documents/upfail.txt`,
+        );
 
         const db = server.clients.db;
         const originalWrite = (Object.getPrototypeOf(db) as typeof db).write;
@@ -1243,6 +1737,7 @@ describe('FSEntryStore entry creation', () => {
         await expect(
             createFile(user, `${user.home}/Documents/upfail.txt`, {
                 overwrite: true,
+                uuid: existing.uuid,
             }),
         ).rejects.toThrow('update rejected');
 
@@ -1650,7 +2145,7 @@ describe('FSEntryStore timestamps and updates', () => {
             store.updateEntryThumbnailByUuid(
                 file.uuid,
                 's3://puter-local/x',
-                'data:image/png;base64,OTHER',
+                { thumbnail: 'data:image/png;base64,OTHER' },
             ),
         ).resolves.toBe(false);
         expect(
@@ -1661,12 +2156,38 @@ describe('FSEntryStore timestamps and updates', () => {
             store.updateEntryThumbnailByUuid(
                 file.uuid,
                 's3://puter-local/x',
-                'data:image/png;base64,OLD',
+                { thumbnail: 'data:image/png;base64,OLD' },
             ),
         ).resolves.toBe(true);
         expect(
             (await store.getEntryByUuidFromPrimary(file.uuid))?.thumbnail,
         ).toBe('s3://puter-local/x');
+    });
+
+    it('updates a thumbnail by uuid only while the row has the expected modified time', async () => {
+        const user = await makeUser();
+        const file = await createFile(
+            user,
+            `${user.home}/Documents/th-modified.txt`,
+        );
+
+        await expect(
+            store.updateEntryThumbnailByUuid(file.uuid, 'data:image/png;base64,AA', {
+                modified: file.modified - 1,
+            }),
+        ).resolves.toBe(false);
+        expect(
+            (await store.getEntryByUuidFromPrimary(file.uuid))?.thumbnail,
+        ).toBeNull();
+
+        await expect(
+            store.updateEntryThumbnailByUuid(file.uuid, 'data:image/png;base64,AA', {
+                modified: file.modified,
+            }),
+        ).resolves.toBe(true);
+        expect(
+            (await store.getEntryByUuidFromPrimary(file.uuid))?.thumbnail,
+        ).toBe('data:image/png;base64,AA');
     });
 
     it('reports a thumbnail update even when the replica has not seen the row', async () => {
@@ -1694,7 +2215,7 @@ describe('FSEntryStore timestamps and updates', () => {
                 store.updateEntryThumbnailByUuid(
                     file.uuid,
                     's3://puter-local/lag',
-                    'data:image/png;base64,OLD',
+                    { thumbnail: 'data:image/png;base64,OLD' },
                 ),
             ).resolves.toBe(true);
         } finally {
@@ -1841,7 +2362,7 @@ describe('FSEntryStore read-path cache backfill', () => {
                     }) as typeof pipeline.setex;
                     const exec = pipeline.exec.bind(pipeline);
                     pipeline.exec = (async () => {
-                        await gate;
+                        if (keys.length > 0) await gate;
                         return exec();
                     }) as typeof pipeline.exec;
                     return pipeline;
@@ -1854,29 +2375,6 @@ describe('FSEntryStore read-path cache backfill', () => {
             release: () => {
                 release();
                 pipelineSpy.mockRestore();
-                setexSpy.mockRestore();
-            },
-        };
-    };
-
-    /** Holds every SETEX sent one at a time until released. */
-    const holdSetex = () => {
-        const redis = server.clients.redis;
-        const realSetex = redis.setex.bind(redis);
-        let release!: () => void;
-        const gate = new Promise<void>((resolve) => {
-            release = resolve;
-        });
-        const setexSpy = vi.spyOn(redis, 'setex').mockImplementation((async (
-            ...args: Parameters<typeof realSetex>
-        ) => {
-            await gate;
-            return realSetex(...args);
-        }) as typeof redis.setex);
-        return {
-            setexSpy,
-            release: () => {
-                release();
                 setexSpy.mockRestore();
             },
         };
@@ -1952,12 +2450,12 @@ describe('FSEntryStore read-path cache backfill', () => {
 
         for (const read of reads) {
             await server.clients.redis.flushall?.();
-            const held = holdSetex();
+            const held = holdPipelines();
             let reading!: Promise<FSEntry | null | undefined>;
             try {
                 reading = read();
                 expect(await stillPending(reading)).toBe(true);
-                expect(held.setexSpy).toHaveBeenCalled();
+                expect(held.queued.some((keys) => keys.length > 0)).toBe(true);
             } finally {
                 held.release();
             }
@@ -1974,9 +2472,6 @@ describe('FSEntryStore read-path cache backfill', () => {
         await server.clients.redis.flushall?.();
 
         const redis = server.clients.redis;
-        const setexSpy = vi
-            .spyOn(redis, 'setex')
-            .mockRejectedValue(new Error('cache down'));
         const realPipeline = redis.pipeline.bind(redis);
         const pipelineSpy = vi
             .spyOn(redis, 'pipeline')
@@ -1996,10 +2491,8 @@ describe('FSEntryStore read-path cache backfill', () => {
             await expect(store.listChildren(file.parentUid!)).resolves.toEqual([
                 expect.objectContaining({ uuid: file.uuid }),
             ]);
-            expect(setexSpy).toHaveBeenCalled();
             expect(pipelineSpy).toHaveBeenCalled();
         } finally {
-            setexSpy.mockRestore();
             pipelineSpy.mockRestore();
         }
     });
@@ -2094,6 +2587,14 @@ describe('FSEntryStore listing and pagination', () => {
             'sub',
         ]);
         expect(second.cursor).toBeUndefined();
+    });
+
+    it('rejects a fractional limit below one with 400', async () => {
+        const err = await caught(() =>
+            store.listChildrenPage(parent.uuid, { limit: 0.5 }),
+        );
+        expect(err.statusCode).toBe(400);
+        expect(err.message).toBe('limit must be a positive number');
     });
 
     it('paginates each nullable sort column without dropping rows', async () => {
@@ -3067,20 +3568,15 @@ describe('FSEntryStore pending upload sessions', () => {
         );
     });
 
-    it('records completed, failed and aborted transitions', async () => {
+    it('records failed and aborted transitions', async () => {
         const user = await makeUser();
-        const completed = makeSession(user);
         const failed = makeSession(user);
         const aborted = makeSession(user);
-        await store.batchCreatePendingEntries([completed, failed, aborted]);
+        await store.batchCreatePendingEntries([failed, aborted]);
 
-        await store.markPendingEntryCompleted(completed.sessionId);
         await store.markPendingEntryFailed(failed.sessionId, 'upload broke');
         await store.abortPendingEntry(aborted.sessionId, 'caller aborted');
 
-        await expect(
-            store.getPendingEntryBySessionId(completed.sessionId),
-        ).resolves.toMatchObject({ status: 'completed', failureReason: null });
         await expect(
             store.getPendingEntryBySessionId(failed.sessionId),
         ).resolves.toMatchObject({
@@ -3351,18 +3847,18 @@ describe('FSEntryStore pending upload sessions', () => {
             const legacy = makeSession(user);
             await seedUnpartitioned(legacy);
 
-            await store.markPendingEntryCompleted(legacy.sessionId);
+            await store.markPendingEntryFailed(legacy.sessionId, 'broke');
 
             await expect(
                 readStored(legacy.sessionId, true),
-            ).resolves.toMatchObject({ status: 'completed' });
+            ).resolves.toMatchObject({ status: 'failed' });
             // The partition wins over the stale copy left behind.
             await expect(
                 readStored(legacy.sessionId, false),
             ).resolves.toMatchObject({ status: 'pending' });
             await expect(
                 store.getPendingEntryBySessionId(legacy.sessionId),
-            ).resolves.toMatchObject({ status: 'completed' });
+            ).resolves.toMatchObject({ status: 'failed' });
         });
     });
 });
@@ -3469,10 +3965,12 @@ describe('FSEntryStore storage allowance', () => {
             usageSpy.mockRestore();
             await askedOnce;
 
-            const userSpy = failOn('free_storage');
+            const userSpy = vi
+                .spyOn(server.stores.user, 'getById')
+                .mockRejectedValue(new Error('user row'));
             await expect(
                 store.getUserStorageAllowance(user.userId),
-            ).rejects.toThrow('free_storage');
+            ).rejects.toThrow('user row');
             userSpy.mockRestore();
             await new Promise((resolve) => setTimeout(resolve, 50));
             expect(asked).toHaveLength(1);
@@ -3801,7 +4299,7 @@ describe('FSEntryStore lost-insert recovery', () => {
         spy.mockRestore();
     });
 
-    it('updates the race winner in place when overwrite was requested', async () => {
+    it('hands back the race winner untouched when overwrite was requested', async () => {
         const user = await makeUser();
         const uuid = uuidv4();
         const spy = loseInsertRace(uuid, () =>
@@ -3827,13 +4325,14 @@ describe('FSEntryStore lost-insert recovery', () => {
         ]);
         spy.mockRestore();
 
-        // The winner's row survived; our payload was written onto it.
+        // Our object is under `uuid`, not the winner's key, so the winner's
+        // row is returned as it stands for the caller to move the bytes onto.
         expect(entry?.uuid).not.toBe(uuid);
-        expect(entry?.size).toBe(77);
-        expect(entry?.thumbnail).toBe('thumb');
+        expect(entry?.size).not.toBe(77);
+        expect(entry?.thumbnail).not.toBe('thumb');
         await expect(
             store.getEntryByPath(`${user.home}/Documents/recovered.txt`),
-        ).resolves.toMatchObject({ size: 77, uuid: entry?.uuid });
+        ).resolves.toMatchObject({ size: entry?.size, uuid: entry?.uuid });
     });
 });
 
@@ -3977,6 +4476,21 @@ describe('FSEntryStore lineage backfill under a lenient collation', () => {
             });
     };
 
+    it('reads nothing at a name only the collation matches', async () => {
+        const user = await makeUser();
+        await store.getEntryByPath(`${user.home}/Desktop`);
+        await server.clients.redis.flushall?.();
+
+        const spy = matchNamesLeniently('Deßktop', 'Desktop');
+        try {
+            await expect(
+                store.getEntryByPath(`${user.home}/Deßktop`),
+            ).resolves.toBeNull();
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     it('writes the stored path, not the requested spelling', async () => {
         const user = await makeUser();
         const desktop = (await store.getEntryByPath(`${user.home}/Desktop`))!;
@@ -3984,7 +4498,10 @@ describe('FSEntryStore lineage backfill under a lenient collation', () => {
 
         const spy = matchNamesLeniently('Deßktop', 'Desktop');
         try {
-            const resolved = await store.getEntryByPath(`${user.home}/Deßktop`);
+            const resolved = await store.getEntryByPath(
+                `${user.home}/Deßktop`,
+                { foldedNames: true },
+            );
             expect(resolved?.uuid).toBe(desktop.uuid);
             expect(resolved?.path).toBe(`${user.home}/Desktop`);
         } finally {
@@ -4002,12 +4519,37 @@ describe('FSEntryStore lineage backfill under a lenient collation', () => {
 
         const spy = matchNamesLeniently('Deßktop', 'Desktop');
         try {
-            await store.getEntryByPath(`${user.home}/Deßktop`);
+            await store.getEntryByPath(`${user.home}/Deßktop`, {
+                foldedNames: true,
+            });
         } finally {
             spy.mockRestore();
         }
         await expect(pathOf(desktop.uuid)).resolves.toBe(
             `${user.home}/Desktop`,
         );
+    });
+});
+
+describe('FSEntryStore lookups by a value that is not a string', () => {
+    let lookupServer: PuterServer;
+
+    beforeAll(async () => {
+        lookupServer = await setupTestServer();
+    });
+
+    afterAll(async () => {
+        await lookupServer?.shutdown();
+    });
+
+    it('match no row', async () => {
+        const stores = lookupServer.stores;
+        for (const value of [0, 1, true, ['x'], { uid: 'x' }]) {
+            for (const row of [
+                await stores.fsEntry.getEntryByUuid(value as never),
+                await stores.fsEntry.getEntryByUuidFromPrimary(value as never),
+            ])
+                expect(row).toBeNull();
+        }
     });
 });

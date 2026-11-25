@@ -20,6 +20,7 @@
 import { metrics } from '@opentelemetry/api';
 import { createPool, ExecuteValues, type Pool } from 'mysql2';
 import { Span } from '../../util/span.js';
+import { assertBindableParams } from './bindableParams.js';
 import { AbstractDatabaseClient, type WriteResult } from './DatabaseClient';
 import { SQLBatcher } from './SQLBatcher.js';
 import { isRetriableError } from './retriableErrors.js';
@@ -36,8 +37,6 @@ const replicaFailoverCounter = metrics
         description:
             'Reads that failed on the replica batcher and were retried on the primary',
     });
-
-export { compareMigrationFilenames } from './migrationFilenames.js';
 
 type PoolConfig = Parameters<typeof createPool>[0];
 
@@ -56,7 +55,6 @@ export class MySQLDatabaseClient extends AbstractDatabaseClient {
     /** Primary pool, SELECT-only: same rows as `db`, coalesced like the replica. */
     private dbPrimaryRead!: SQLBatcher;
     private configuration = Configuration.SINGLE;
-    private shutdownStarted = false;
 
     constructor(config: IConfig) {
         super(config);
@@ -109,17 +107,10 @@ export class MySQLDatabaseClient extends AbstractDatabaseClient {
         );
     }
 
-    override async onServerPrepareShutdown(): Promise<void> {
-        if (this.shutdownStarted) return;
-        this.shutdownStarted = true;
-
-        // Pools stay open; onServerShutdown closes them after the layers
-        // above have drained.
-        console.log('[mysql] entering drain mode');
-    }
-
+    // Pools stay open through prepare-shutdown; this closes them after the
+    // layers above have drained.
     override async onServerShutdown(): Promise<void> {
-        await this.closeCurrentPools('shutdown');
+        await this.closeCurrentPools();
     }
 
     // ------------------------------------------------------------------
@@ -134,6 +125,7 @@ export class MySQLDatabaseClient extends AbstractDatabaseClient {
         query: string,
         params: unknown[] = [],
     ): Promise<Record<string, unknown>[]> {
+        assertBindableParams(query, params);
         let result;
         try {
             result = await this.dbReplica.execute(query, params);
@@ -160,6 +152,7 @@ export class MySQLDatabaseClient extends AbstractDatabaseClient {
         query: string,
         params: unknown[] = [],
     ): Promise<Record<string, unknown>[]> {
+        assertBindableParams(query, params);
         const result = await this.dbPrimaryRead.execute(query, params);
         if (!result) return [];
         return (result[0] as Record<string, unknown>[]) ?? [];
@@ -170,6 +163,7 @@ export class MySQLDatabaseClient extends AbstractDatabaseClient {
         query: string,
         params: unknown[] = [],
     ): Promise<WriteResult> {
+        assertBindableParams(query, params);
         const result = await this.db.execute(query, params);
         const header = result[0] as {
             insertId?: number;
@@ -192,6 +186,8 @@ export class MySQLDatabaseClient extends AbstractDatabaseClient {
         entries: { statement: string; values: unknown[] }[],
     ): Promise<void> {
         if (entries.length === 0) return;
+        for (const { statement, values } of entries)
+            assertBindableParams(statement, values);
         // Bypass the SQLBatcher: it coalesces queries from unrelated callers
         // into a single multi-statement string, which is incompatible with
         // wrapping a transaction around just *our* statements. Acquire a
@@ -223,6 +219,7 @@ export class MySQLDatabaseClient extends AbstractDatabaseClient {
         query: string,
         params: unknown[],
     ): Promise<Record<string, unknown>[]> {
+        assertBindableParams(query, params);
         const result = await this.dbReplica.execute(query, params);
         if (!result) return [];
         return (result[0] as Record<string, unknown>[]) ?? [];
@@ -330,92 +327,17 @@ export class MySQLDatabaseClient extends AbstractDatabaseClient {
     // Internal pool lifecycle
     // ------------------------------------------------------------------
 
-    private async closePool(
-        pool: Pool,
-        label: string,
-        timeoutMs: number | null = null,
-    ): Promise<void> {
-        if (!pool) return;
-
-        await new Promise<void>((resolve, reject) => {
-            let settled = false;
-            let timer: ReturnType<typeof setTimeout> | null = null;
-
-            const finish = (err?: unknown) => {
-                if (settled) return;
-                settled = true;
-                if (timer) clearTimeout(timer);
-                if (err) reject(err);
-                else resolve();
-            };
-
-            if (timeoutMs !== null) {
-                timer = setTimeout(() => {
-                    console.warn(
-                        `[mysql] timed out closing pool (${label}); forcing`,
-                    );
-                    this.forceDestroyConnections(pool, `${label}:timeout`);
-                    finish();
-                }, timeoutMs);
-            }
-
-            try {
-                pool.end((err) => finish(err));
-            } catch (err) {
-                finish(err);
-            }
+    private closePool(pool: Pool): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            pool.end((err) => (err ? reject(err) : resolve()));
         });
     }
 
-    private forceDestroyConnections(pool: Pool, label: string): void {
-        // mysql2 internal — _allConnections is a CircularBuffer
-        const all = (
-            pool as unknown as {
-                _allConnections?: {
-                    forEach: (fn: (c: { destroy: () => void }) => void) => void;
-                };
-            }
-        )._allConnections;
-        if (!all || typeof all.forEach !== 'function') return;
-
-        let count = 0;
-        all.forEach((conn) => {
-            try {
-                conn.destroy();
-                count++;
-            } catch {
-                // no-op
-            }
-        });
-        if (count > 0)
-            console.warn(
-                `[mysql] force-closed ${count} connections (${label})`,
-            );
-    }
-
-    private async closeCurrentPools(reason: string): Promise<void> {
-        const timeoutMs = reason.startsWith('signal:') ? 45_000 : null;
-        const tasks: Promise<void>[] = [];
-
-        if (this.primaryPool) {
-            tasks.push(
-                this.closePool(
-                    this.primaryPool,
-                    `${reason}:primary`,
-                    timeoutMs,
-                ),
-            );
-        }
-        if (this.replicaPool && this.replicaPool !== this.primaryPool) {
-            tasks.push(
-                this.closePool(
-                    this.replicaPool,
-                    `${reason}:replica`,
-                    timeoutMs,
-                ),
-            );
-        }
-
-        await Promise.all(tasks);
+    private async closeCurrentPools(): Promise<void> {
+        const pools = [this.primaryPool];
+        if (this.replicaPool !== this.primaryPool) pools.push(this.replicaPool);
+        await Promise.all(
+            pools.filter(Boolean).map((pool) => this.closePool(pool)),
+        );
     }
 }

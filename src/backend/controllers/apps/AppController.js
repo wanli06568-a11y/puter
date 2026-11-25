@@ -21,6 +21,7 @@ import {
     isAccessTokenActor,
     isAccountContext,
     isAppActor,
+    viaWorkerOf,
 } from '../../core/actor.js';
 import { HttpError } from '../../core/http/HttpError.js';
 import {
@@ -52,8 +53,8 @@ const APP_READ_LIMIT = {
 /**
  * Unauthenticated icon serving; no actor to key on, so the bucket is the
  * address — and an address is a NAT, a campus or a carrier gateway that can
- * hold hundreds of desktops. Each desktop boot pulls the taskbar's icons at
- * once, so a single burst from one network is already thousands of requests.
+ * hold hundreds of desktops. Each dashboard load pulls its app icons at once,
+ * so a single burst from one network is already thousands of requests.
  * Responses are publicly cacheable and usually a redirect, so the ceiling is
  * not protecting bandwidth; it is there so a client looping on a broken icon
  * can't spin unbounded.
@@ -100,10 +101,7 @@ export class AppController extends PuterController {
         const ts = Math.floor(Date.now() / 1000);
         const work = (async () => {
             try {
-                await this.clients.db.write(
-                    'INSERT INTO `app_opens` (`app_uid`, `user_id`, `ts`) VALUES (?, ?, ?)',
-                    [appUid, userId, ts],
-                );
+                await this.stores.app.recordOpen(appUid, userId, ts);
             } catch (e) {
                 console.warn('[rao] insert failed:', e);
             }
@@ -201,6 +199,13 @@ export class AppController extends PuterController {
             },
             async (req, res) => {
                 const actor = req.actor;
+                // Server-side code running as the account (a worker, an events
+                // handler) is not someone opening the app. Answered as success
+                // so deployed workers, which still ask, don't log a failure.
+                if (viaWorkerOf(actor)) {
+                    res.json({});
+                    return;
+                }
                 const bodyAppUid = req.body?.app_uid;
                 const callerAppUid = actor?.effectiveApp?.uid;
                 const app_uid =
@@ -458,7 +463,7 @@ export class AppController extends PuterController {
                 (icon.startsWith('data:') || !/^https?:\/\//i.test(icon));
             if (!isInline) {
                 const redirectUrl =
-                    await this.services.appIcon?.resolveIconRedirectUrl?.(
+                    await this.services.appIcon.resolveIconRedirectUrl(
                         appUid,
                         size,
                     );
@@ -523,7 +528,7 @@ export class AppController extends PuterController {
         };
 
         // Icons are <img src> targets from the GUI (root) AND resolved via
-        // api_base_url in taskbar payloads. Register on both so either origin
+        // api_base_url in app summaries. Register on both so either origin
         // works without a cross-subdomain redirect.
         router.get(
             '/app-icon/:app_uid',

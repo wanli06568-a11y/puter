@@ -21,11 +21,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import jQuery from '../lib/jquery-3.6.1/jquery-3.6.1.min.js';
 
-vi.mock('../UI/UIWindow.js', () => ({ default: vi.fn() }));
 vi.mock('../UI/UIAlert.js', () => ({ default: vi.fn(async () => undefined) }));
-vi.mock('../i18n/i18n.js', () => ({ default: key => key }));
 vi.mock('./launchApp.js', () => ({ default: vi.fn(async () => ({ launchResult: { launched: true } })) }));
-vi.mock('./itemIcon.js', () => ({ default: vi.fn() }));
 vi.mock('./defaultApp.js', () => ({ resolve_default_app: vi.fn(async () => null) }));
 
 globalThis.$ = globalThis.jQuery = jQuery;
@@ -36,20 +33,20 @@ const { default: UIAlert } = await import('../UI/UIAlert.js');
 const { resolve_default_app } = await import('./defaultApp.js');
 const { default: open_item } = await import('./openItem.js');
 
-const row = ({ name = 'notes.txt', path = '/user/notes.txt', uid = 'file-1' } = {}) => {
+const row = ({ name = 'notes.txt', path = '/user/notes.txt', uid = 'file-1', isDir = false, parent = document.body } = {}) => {
     const el = document.createElement('div');
     for ( const [key, value] of Object.entries({
         'data-uid': uid,
         'data-path': path,
         'data-name': name,
-        'data-is_dir': '0',
+        'data-is_dir': isDir ? '1' : '0',
         'data-shortcut_to': '',
         'data-shortcut_to_path': '',
         'data-associated_app_name': '',
     }) ) {
         el.setAttribute(key, value);
     }
-    document.body.appendChild(el);
+    parent.appendChild(el);
     return el;
 };
 
@@ -79,8 +76,18 @@ describe('open_item with a new tab', () => {
             name: 'editor',
             file_uid: 'file-1',
             newTab: tab,
+            trigger: 'file_open',
         }));
         expect(tab.close).not.toHaveBeenCalled();
+    });
+
+    it('launches an app shortcut as an app icon click', async () => {
+        const el = row();
+        el.setAttribute('data-app', 'notes');
+        const tab = newTab();
+        await open_item({ item: el, newTab: tab });
+
+        expect(launch_app).toHaveBeenCalledWith({ name: 'notes', newTab: tab, trigger: 'app_icon' });
     });
 
     it('closes the tab before offering a download when no app opens the file', async () => {
@@ -111,5 +118,51 @@ describe('open_item with a new tab', () => {
         expect(tab.opener).toBeNull();
         expect(tab.location.href).toBe('https://example.com/page');
         expect(tab.close).not.toHaveBeenCalled();
+    });
+});
+
+describe('open_item with no app for the file', () => {
+    it('offers to download it', async () => {
+        window.is_dashboard_mode = false;
+        window.trigger_download = vi.fn();
+        UIAlert.mockResolvedValueOnce('download_file');
+
+        await open_item({ item: row({ name: 'data.bin', path: '/user/data.bin' }) });
+
+        expect(UIAlert).toHaveBeenCalledTimes(1);
+        expect(UIAlert.mock.calls[0][1].map(button => button.value ?? button.label)).toEqual(['download_file', 'Cancel']);
+        expect(window.trigger_download).toHaveBeenCalledWith(['/user/data.bin']);
+    });
+});
+
+
+describe('open_item with a folder', () => {
+    const folder = (parent) => row({ name: 'Docs', path: '/user/Docs', uid: 'dir-1', isDir: true, parent });
+
+    it('shows it in the window that lists it', async () => {
+        const win = document.createElement('div');
+        win.className = 'window';
+        win.setAttribute('data-id', '7');
+        document.body.appendChild(win);
+        window.window_nav_history = { 7: ['/user'] };
+        window.window_nav_history_current_position = { 7: 0 };
+        window.update_window_path = vi.fn();
+
+        await open_item({ item: folder(win) });
+
+        expect(window.window_nav_history[7]).toEqual(['/user', '/user/Docs']);
+        expect(window.window_nav_history_current_position[7]).toBe(1);
+        expect(window.update_window_path).toHaveBeenCalledWith(expect.anything(), '/user/Docs');
+        expect(launch_app).not.toHaveBeenCalled();
+    });
+
+    it('opens nothing when no window lists it', async () => {
+        window.update_window_path = vi.fn();
+
+        await open_item({ item: folder() });
+
+        expect(window.update_window_path).not.toHaveBeenCalled();
+        expect(launch_app).not.toHaveBeenCalled();
+        expect(jQuery.ajax).not.toHaveBeenCalled();
     });
 });

@@ -24,13 +24,9 @@ export interface AlarmFields {
     [key: string]: unknown;
 }
 
-export interface AlarmOccurrence {
-    message: string;
-    fields: AlarmFields;
-    timestamp: number;
-}
-
 export interface AlarmOptions {
+    /** Plain-language chat summary shown in place of the diagnostic field grid. */
+    summary?: string;
     /**
      * Collapse repeats of this alarm id into a single incident on transports
      * that de-duplicate (PagerDuty). Only right when the id already pins down
@@ -39,6 +35,12 @@ export interface AlarmOptions {
      * alarm raises its own incident per occurrence.
      */
     dedup?: boolean;
+    /**
+     * Chat channel key naming the area that owns this alarm (`billing`,
+     * `ai_providers`). Config maps keys to channels; an unmapped or absent key
+     * posts to the default channel. Fixed by the alarm's first occurrence.
+     */
+    channel?: string;
 }
 
 export interface Alarm extends AlarmOptions {
@@ -48,25 +50,25 @@ export interface Alarm extends AlarmOptions {
     fields: AlarmFields;
     error?: Error;
     started: number;
-    /**
-     * Every occurrence ever counted, including those aged out of the two lists
-     * below.
-     */
+    /** Every occurrence counted since the alarm started. */
     count: number;
-    /**
-     * Timestamps of the most recent occurrences only — see
-     * `OCCURRENCE_HISTORY_LIMIT`.
-     */
-    timestamps: number[];
-    /** The most recent occurrences only — see `OCCURRENCE_HISTORY_LIMIT`. */
-    occurrences: AlarmOccurrence[];
+    /** When the latest occurrence was recorded, epoch ms. */
+    lastSeen: number;
     severity?: PagerSeverity;
-    noAlert?: boolean;
     /** Set once a config mute has been logged, so it's reported only once. */
     muteLogged?: boolean;
+    /** The last call raised, so repeats too frequent to report keep it open. */
+    call?: AlarmCall;
+    /** When `call` was last handed to the call handlers, epoch ms. */
+    callAt?: number;
 }
 
 export interface AlertPayload {
+    /**
+     * Plain-language chat summary; diagnostic fields remain available to other
+     * transports.
+     */
+    summary?: string;
     id: string;
     /**
      * Key a de-duplicating transport groups by. Equal to `id` for alarms raised
@@ -86,20 +88,30 @@ export interface AlertPayload {
     repeatCount: number;
     /** False for the first occurrence of an alarm id. */
     isRepeat: boolean;
+    /** Chat channel key from {@link AlarmOptions.channel}. */
+    channel?: string;
+    /** Call group config assigned this alarm, when it phones someone. */
+    callGroup?: string;
     /** PagerDuty `custom_details` payload. */
     custom?: Record<string, unknown>;
 }
 
-export type AlertHandler = (alert: AlertPayload) => Promise<void>;
-
-export interface KnownErrorRule {
-    match: {
-        id: string;
-        message?: string;
-        fields?: Record<string, unknown>;
-    };
-    action: {
-        type: 'no-alert' | 'severity';
-        value?: PagerSeverity;
-    };
+/** What a transport reports about an alert it delivered. */
+export interface AlertDelivery {
+    /** Link to the delivered alert, such as the chat message it became. */
+    url?: string;
 }
+
+export type AlertHandler = (
+    alert: AlertPayload,
+) => Promise<AlertDelivery | void>;
+
+/** An alarm that config says phones someone, once its transports settled. */
+export interface AlarmCall {
+    group: string;
+    alert: AlertPayload;
+    /** Where a responder can read the alarm; empty when no transport linked. */
+    links: string[];
+}
+
+export type CallHandler = (call: AlarmCall) => Promise<void>;

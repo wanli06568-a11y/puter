@@ -34,6 +34,7 @@ import {
     openIdCursor,
     type PageResult,
 } from '../../util/pagination.js';
+import { nowSeconds } from '../../util/time.js';
 import { KV_GLOBAL_APP_KEY } from '../systemKv/SystemKVStore.js';
 import { PuterStore } from '../types.js';
 import { assertColumnWidths, KV_SHARE_HANDLE_WIDTHS } from './columnWidths.js';
@@ -164,8 +165,6 @@ const FORGET_BATCH = 500;
 
 /** Rows one app-deletion retire pass takes. */
 export const KV_HANDLE_RETIRE_BATCH = 500;
-
-const nowSeconds = (): number => Math.floor(Date.now() / 1000);
 
 /** Whether a forget stamped `at` came after the one numbered `before`. */
 const forgottenSince = (at: number | undefined, before: number): boolean =>
@@ -646,7 +645,9 @@ export class KvShareHandleStore extends PuterStore {
         revokedBy: KvShareRevokedBy,
         scope: { ownerUserId?: number; granteeUserId?: number } = {},
     ): Promise<void> {
-        const unique = [...new Set(handles)];
+        const unique = [
+            ...new Set(handles.filter((h) => typeof h === 'string')),
+        ];
         if (unique.length === 0) return;
         const where = [
             `\`handle\` IN (${unique.map(() => '?').join(', ')})`,
@@ -755,6 +756,7 @@ export class KvShareHandleStore extends PuterStore {
         ownerUserId: number,
         changes: KvShareHandleUpdate,
     ): Promise<KvShareHandle | null> {
+        if (typeof handle !== 'string') return null;
         const sets: string[] = [];
         const params: unknown[] = [];
         if (changes.permission !== undefined) {

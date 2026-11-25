@@ -20,7 +20,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import jQuery from '../../lib/jquery-3.6.1/jquery-3.6.1.min.js';
 
-vi.mock('../UIAlert.js', () => ({ default: vi.fn() }));
 vi.mock('../../helpers/itemIcon.js', () => ({ default: vi.fn(async () => ({ image: 'icon.svg' })) }));
 
 globalThis.$ = jQuery;
@@ -67,5 +66,41 @@ describe('UIItemPropertiesModal', () => {
         expect(fsentry.has_website).toBe(false);
         expect(window.update_sites_cache).toHaveBeenCalled();
         expect(puter._cache.del).toHaveBeenCalledWith('readdir:/alice');
+    });
+
+    it('takes the site address off rows inside the folder, keeping one another site serves', async () => {
+        const fsentry = { uid: 'u1', name: 'site', path: '/alice/site', is_dir: true, has_website: true };
+        $('<div class="item" data-uid="u1" data-has_website="1"><img class="item-has-website-badge"></div>')
+            .data('fsentry', fsentry).appendTo('body');
+        const child = (path, url) => $(`<div class="item" data-path="${path}" data-website_url="${url}"><img class="item-has-website-url-badge" style="display:block"></div>`).appendTo('body');
+        const $inside = child('/alice/site/a.txt', 'https://mysite.puter.site/a.txt');
+        const $nested = child('/alice/site/docs/b.txt', 'https://docs.puter.site/b.txt');
+        const site = (subdomain, path) => ({ subdomain, root_dir: { path, subdomains: [{ subdomain, address: `https://${subdomain}.puter.site` }] } });
+        window.sites = [site('mysite', '/alice/site'), site('docs', '/alice/site/docs')];
+        window.determine_website_url = (path) => {
+            const match = window.sites.find((s) => path.startsWith(`${s.root_dir.path}/`));
+            return match ? `https://${match.subdomain}.puter.site${path.slice(match.root_dir.path.length)}` : null;
+        };
+        window.extractSubdomain = () => 'mysite';
+        window.update_sites_cache = vi.fn();
+        globalThis.puter = {
+            fs: { stat: vi.fn(({ success }) => {
+                success({ ...fsentry, id: 'u1', modified: 1700000000, created: 1700000000, subdomains: [{ uuid: 's1', address: 'https://mysite.puter.site' }] });
+                return Promise.resolve();
+            }) },
+            hosting: { update: vi.fn(async () => ({})) },
+            fsCacheKey: (kind, path) => `${kind}:${path}`,
+            _cache: { del: vi.fn() },
+        };
+
+        UIItemPropertiesModal({ name: 'site', path: '/alice/site', uid: 'u1' });
+        await tick();
+        $('.item-props-disassociate').trigger('click');
+        await tick();
+
+        expect($inside.attr('data-website_url')).toBe('');
+        expect($inside.find('.item-has-website-url-badge').css('display')).toBe('none');
+        expect($nested.attr('data-website_url')).toBe('https://docs.puter.site/b.txt');
+        expect($nested.find('.item-has-website-url-badge').css('display')).toBe('block');
     });
 });

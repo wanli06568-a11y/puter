@@ -6,23 +6,43 @@ import { escapeHtml } from '../lib/html.js';
  * @property {string} [method] The SDK call that was refused.
  * @property {string} [reason] Which upgrade the refusal asks for.
  * @property {string} [appID] The app the refused call ran as.
+ * @property {() => boolean} [onUpgrade] Runs when the user clicks Upgrade, instead of
+ *   opening the dashboard's upgrade page in a new tab. Returning false opens the tab anyway.
+ * @property {() => void} [onTopUp] Makes Add Credits the dialog's main button, for an account
+ *   that can buy add-on credit, and runs when the user clicks it. Upgrade stays beside it.
  */
 
 const UPGRADE_PAGE = 'https://puter.com/dashboard/';
 
 /**
- * The dashboard page the upgrade button opens. It carries what was refused,
- * so the dashboard can open its upgrade flow with that context.
+ * The dashboard page the upgrade button opens. The dashboard opens its
+ * upgrade flow for the `upgrade` parameter, which says what was refused, or
+ * is empty for an upgrade no refusal asked for.
  *
  * @param {Pick<UsageLimitDialogOptions, 'reason' | 'appID' | 'method'>} [context]
  * @returns {string}
  */
 export const upgradeUrl = ({ reason, appID, method } = {}) => {
     const url = new URL(UPGRADE_PAGE);
-    if ( reason ) url.searchParams.set('upgrade', reason);
+    url.searchParams.set('upgrade', reason || '');
     if ( appID ) url.searchParams.set('upgrade_app', appID);
     if ( method ) url.searchParams.set('upgrade_method', method);
     url.hash = 'home';
+    return url.href;
+};
+
+/**
+ * The dashboard page that opens the top-up flow, for buying add-on credit.
+ *
+ * @param {string} [guiOrigin] The deployment whose dashboard it is; Puter's by default.
+ * @param {string} [appID] The app whose page asked for the top-up.
+ * @returns {string}
+ */
+export const topUpUrl = (guiOrigin, appID) => {
+    const url = new URL('/dashboard/', guiOrigin || UPGRADE_PAGE);
+    url.searchParams.set('topup', '');
+    if ( appID ) url.searchParams.set('topup_app', appID);
+    url.hash = 'usage';
     return url.href;
 };
 
@@ -31,13 +51,15 @@ class UsageLimitDialog extends (globalThis.HTMLElement || Object) {
      * @param {string} message Plain-text line saying what was refused.
      * @param {UsageLimitDialogOptions} [options]
      */
-    constructor (message, { title = 'Low Balance', method, reason, appID } = {}) {
+    constructor (message, { title = 'Low Balance', method, reason, appID, onUpgrade, onTopUp } = {}) {
         super();
         this.message = message || 'You have reached your usage limit for this account.';
         // Not `this.title`: on an HTMLElement that is the tooltip attribute.
         this.heading = title;
         this.method = method;
         this.upgradeUrl = upgradeUrl({ reason, appID, method });
+        this.onUpgrade = onUpgrade;
+        this.onTopUp = onTopUp;
 
         this.attachShadow({ mode: 'open' });
 
@@ -180,6 +202,10 @@ class UsageLimitDialog extends (globalThis.HTMLElement || Object) {
             color: #bedef5;
         }
 
+        .button-secondary {
+            margin-bottom: 10px;
+        }
+
         .button-cancel {
             background: none;
         }
@@ -247,10 +273,13 @@ class UsageLimitDialog extends (globalThis.HTMLElement || Object) {
                     </svg>
                 </div>
                 <h2>${escapeHtml(this.heading)}</h2>
-                <p class="message">${escapeHtml(this.message)}<br>Please upgrade to continue.</p>
+                <p class="message">${escapeHtml(this.message)}<br>${onTopUp ? 'Add credits to continue.' : 'Please upgrade to continue.'}</p>
                 ${this.method ? `<p class="method">${escapeHtml(this.method)}</p>` : ''}
                 <div class="buttons">
-                    <button class="button button-primary" id="upgrade-btn">Upgrade Now</button>
+                    ${onTopUp ? `
+                    <button class="button button-primary" id="top-up-btn">Add Credits</button>
+                    <button class="button button-secondary" id="upgrade-btn">Upgrade Plan</button>` : `
+                    <button class="button button-primary" id="upgrade-btn">Upgrade Now</button>`}
                     <button class="button button-cancel" id="close-btn">Close</button>
                 </div>
             </div>
@@ -270,8 +299,16 @@ class UsageLimitDialog extends (globalThis.HTMLElement || Object) {
         });
 
         this.shadowRoot.querySelector('#upgrade-btn').addEventListener('click', () => {
-            window.open(this.upgradeUrl, '_blank');
+            // Closed first, so the frame the upgrade shows in isn't under this modal.
             this.close();
+            const shown = this.onUpgrade ? this.onUpgrade() !== false : false;
+            if ( ! shown ) window.open(this.upgradeUrl, '_blank');
+        });
+
+        this.shadowRoot.querySelector('#top-up-btn')?.addEventListener('click', () => {
+            // Closed first, so the frame the top-up shows in isn't under this modal.
+            this.close();
+            this.onTopUp();
         });
 
         // Close on backdrop click
@@ -304,7 +341,7 @@ if ( typeof globalThis.HTMLElement !== 'undefined' && globalThis.customElements 
  * dropped, so racing requests can't stack dialogs.
  *
  * @param {string} message Plain-text line saying what was refused; the dialog
- *   adds the "upgrade to continue" line itself.
+ *   adds the "upgrade to continue" or "add credits to continue" line itself.
  * @param {UsageLimitDialogOptions} [options]
  */
 export function showUsageLimitDialog (message, options = {}) {

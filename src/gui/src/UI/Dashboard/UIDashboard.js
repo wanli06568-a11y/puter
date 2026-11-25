@@ -21,13 +21,15 @@
 
 import UIWindow from '../UIWindow.js';
 import UIContextMenu from '../UIContextMenu.js';
-import UIAlert from '../UIAlert.js';
+import UIDashboardDialog from './UIDashboardDialog.js';
 import UIWindowSaveAccount from '../UIWindowSaveAccount.js';
 import UIAuthLogin from '../Auth/UIAuthLogin.js';
-import UIWindowFeedback from '../UIWindowFeedback.js';
 import apply_item_added_to_containers from '../../helpers/applyItemAddedToContainers.js';
 import { clear_shared_param } from '../../helpers/parseSharedPath.js';
+import { forgetWorkers, forgetWorkersAfterMove } from '../../helpers/trashWorkers.js';
+import { reconnectAfterServerDisconnect } from '../../helpers/socketReconnect.js';
 import UIDashboardNotifications from './UIDashboardNotifications.js';
+import UIDashboardContactDialog from './UIDashboardContactDialog.js';
 import {
     answerNotificationReceipts,
     notificationSocketAcks,
@@ -75,8 +77,7 @@ async function UIDashboard (options) {
     // eslint-disable-next-line no-unused-vars
     options = options ?? {};
 
-    // Mark dashboard mode on <body> so window chrome can adapt — e.g. app
-    // windows keep their minimize button even though fullpage-mode hides it.
+    // Mark dashboard mode on <body> so window chrome and notifications can adapt.
     $('body').addClass('dashboard-mode');
 
     // Create mutable tabs array from built-in tabs
@@ -286,6 +287,7 @@ async function UIDashboard (options) {
         withCredentials: true,
     });
     answerNotificationReceipts(window.socket);
+    reconnectAfterServerDisconnect(window.socket, () => window.auth_token);
 
     window.socket.on('error', (error) => {
         console.error('Dashboard Socket Error:', error);
@@ -360,7 +362,7 @@ async function UIDashboard (options) {
         // Only the rows: the loading overlay lives in the listing too.
         const dashboard = window.dashboard_object;
         if ( msg.is_empty && dashboard && dashboard.currentPath === window.trash_path ) {
-            $('.files-tab .files .item').remove();
+            dashboard.$el_window.find('.files-tab .files .item').remove();
             dashboard.syncEmptiedTrash?.();
         }
     });
@@ -376,13 +378,15 @@ async function UIDashboard (options) {
     // step, and say the folder is empty when the Files listing just lost its
     // last row (rows can also sit in a file picker window).
     const remove_row = (el_row) => {
-        const from_listing = $(el_row).closest('.files-tab .files').length > 0;
+        const from_listing = !! window.dashboard_object?.$el_window?.find('.files-tab .files').get(0)?.contains(el_row);
         $(el_row).remove();
         if ( from_listing ) window.dashboard_object?.renderEmptyPlaceholderIfNeeded?.();
         window.dashboard_object?.updateFooterStats?.();
     };
 
     window.socket.on('item.moved', async (resp) => {
+        // This tab's own moves included: they can change a worker's source path.
+        forgetWorkersAfterMove(resp.path);
         if ( resp.original_client_socket_id === window.socket.id ) return;
 
         // Fade out the stale row at the item's OLD location only. A moved item
@@ -438,6 +442,8 @@ async function UIDashboard (options) {
     });
 
     window.socket.on('item.renamed', async (item) => {
+        // A rename can change a worker's source path.
+        forgetWorkers();
         if ( item.original_client_socket_id === window.socket.id ) return;
 
         const $el = $(`.item[data-uid='${item.uid}']`);
@@ -445,7 +451,7 @@ async function UIDashboard (options) {
 
         // Files-tab rows go through the shared updater, which also refits
         // the name and keeps the entry their handlers use current.
-        const $fileRows = $el.filter('.files-tab .item');
+        const $fileRows = $el.filter((_, el) => !! window.dashboard_object?.$el_window?.find('.files-tab').get(0)?.contains(el));
         if ( $fileRows.length ) window.UIDashboardFileItemUpdate?.($fileRows, item);
         const $others = $el.not($fileRows);
 
@@ -459,9 +465,13 @@ async function UIDashboard (options) {
     });
 
     window.socket.on('item.updated', async (item) => {
+        // The owner hears of a rename as an update.
+        forgetWorkers();
         if ( item.original_client_socket_id === window.socket.id ) return;
 
-        const $el = $(`.item[data-uid='${item.uid}']`);
+        // A file picker lists its folder again itself; re-sorted here, its
+        // row would land in the Files tab.
+        const $el = $(`.item[data-uid='${item.uid}']`).not('.file-picker .item');
         if ( $el.length === 0 ) return;
 
         // Delegate to the shared row updater (defined in TabFiles.init) so
@@ -548,12 +558,13 @@ async function UIDashboard (options) {
         const filePath = route.path;
         notifications.close({ restoreFocus: false });
         // What was open over the tab being left goes with it, as on a
-        // sidebar click: the phone drawer, a menu, and Files' Share and
+        // sidebar click: the phone drawer, a menu, Files' Share and
         // Properties, which act on its rows (their changes are already saved),
-        // and its image preview.
+        // its image preview, and a dialog or the photo crop, each through its
+        // own close button.
         setMobileSidebar(false);
         $('.context-menu').remove();
-        $el_window.find('.share-modal-close, .item-props-close').trigger('click');
+        $el_window.find('.share-modal-close, .item-props-close, .dashboard-dialog-overlay .dashboard-dialog-close, .profile-crop-close').trigger('click');
         if ( tab !== 'files' && TabFiles.previewOpen ) TabFiles.closeImagePreview();
 
         // Switch to correct tab
@@ -900,16 +911,8 @@ async function UIDashboard (options) {
             // Contact Us
             {
                 html: i18n('contact_us'),
-                onClick: async function () {
-                    UIWindowFeedback({
-                        window_options: {
-                            backdrop: true,
-                            close_on_backdrop_click: true,
-                            parent_center: true,
-                            stay_on_top: true,
-                            has_head: false,
-                        },
-                    });
+                onClick: function () {
+                    UIDashboardContactDialog({ $container: $el_window, returnFocusTo: $btn.get(0) });
                 },
             },
             '-',
@@ -919,18 +922,19 @@ async function UIDashboard (options) {
                 onClick: async function () {
                     // Check for open windows
                     if ( $('.window-app').length > 0 ) {
-                        const alert_resp = await UIAlert({
-                            message: `<p>${i18n('confirm_open_apps_log_out', [], false)}</p>`,
+                        const alert_resp = await UIDashboardDialog({
+                            message: i18n('confirm_open_apps_log_out'),
+                            tone: 'warning',
                             buttons: [
+                                { label: i18n('cancel', [], false), value: false, type: 'quiet' },
                                 {
                                     label: i18n('close_all_windows_and_log_out', [], false),
                                     value: 'close_and_log_out',
                                     type: 'primary',
                                 },
-                                {
-                                    label: i18n('cancel', [], false),
-                                },
                             ],
+                            $container: $el_window,
+                            returnFocusTo: $btn.get(0),
                         });
                         if ( alert_resp === 'close_and_log_out' ) {
                             window.logout();

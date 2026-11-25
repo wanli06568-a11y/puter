@@ -17,14 +17,16 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import bcrypt from 'bcrypt';
 import type { Request } from 'express';
-import crypto from 'node:crypto';
 import { v4 as uuidv4 } from 'uuid';
 import type { EventMetadata } from '../../clients/event/types.js';
 import { HttpError } from '../../core/http/HttpError.js';
 import type { UserRow } from '../../stores/user/UserStore.js';
 import { isOwnedEmailConflict } from '../../stores/user/UserStore.js';
+import {
+    generateEmailConfirmCode,
+    hashPassword,
+} from '../../util/credentials.js';
 import { cleanEmail, isBlockedEmail } from '../../util/email.js';
 import { isPuterEmailAddress } from '../email/mailbox.js';
 import {
@@ -32,7 +34,9 @@ import {
     checkSignupBonus,
     validateSignupBonus,
 } from '../../util/signupBonus.js';
+import { requestIp } from '../../util/requestIp.js';
 import { isUsernameTaken } from '../../util/username.js';
+import { isTemporaryAccount } from '../../util/userDetails.js';
 import { isEmailGateLast } from '../../util/verificationOrder.js';
 import {
     generateDefaultFsentries,
@@ -40,6 +44,26 @@ import {
     provisionUser,
 } from '../../util/userProvisioning.js';
 import { PuterService } from '../types.js';
+
+const EMAIL_STREAM_NAME = /^[a-z0-9][a-z0-9:_-]{0,63}$/;
+
+/** How long a mailed confirmation code is honored, from its latest send. */
+const CONFIRMATION_CODE_TTL_SECONDS = 60 * 60;
+const confirmationCodeSentKey = (userId: number): string =>
+    `email-confirm-code-sent:${userId}`;
+
+const emailStreamName = (value: unknown): string | null => {
+    if (value == null) return null;
+    if (typeof value === 'string' && EMAIL_STREAM_NAME.test(value)) {
+        return value;
+    }
+    console.warn('[signup] ignored email_stream:', value);
+    return null;
+};
+
+/** Where a confirmation email was sent from; names its failure alarm. */
+export type ConfirmationEmailStage =
+    'signup' | 'save-account' | 'resend' | 'deferred' | 'sign-in' | 'team';
 
 /** What `puter.signup.validate` and the bonus hooks decided about a signup. */
 export type SignupGateOutcome =
@@ -51,6 +75,8 @@ export type SignupGateOutcome =
           requiresCardVerification: boolean;
           /** Card and phone come before email (see `isEmailGateLast`). */
           emailGateLast: boolean;
+          /** Stream the confirmation email is sent on; `null` for the default. */
+          emailStream: string | null;
       }
     | { verdict: 'bonus_code_invalid' }
     | {
@@ -85,9 +111,11 @@ export interface SignupInput {
     bonusCode: string | null;
 }
 
-/** The trusted client address; `req.ip` honors `trust proxy`. */
-export const signupClientIp = (req: Request): string | null =>
-    req.ip || req.socket?.remoteAddress || null;
+export interface SignupResult {
+    user: UserRow;
+    /** Whether the transport accepted a confirmation email sent at signup. */
+    confirmationEmailSent?: boolean;
+}
 
 const OIDC_ONLY_MESSAGE =
     'New accounts can only be created with a sign-in provider right now.';
@@ -181,7 +209,7 @@ export class SignupService extends PuterService {
      */
     async runSignupGate(input: SignupGateInput): Promise<SignupGateOutcome> {
         const { req, email, isTemp, bonusCode } = input;
-        const clientIp = signupClientIp(req);
+        const clientIp = requestIp(req);
         const fingerprint = input.fingerprint ?? null;
 
         // Only form and temp signups carry no source; OIDC and team
@@ -222,6 +250,7 @@ export class SignupService extends PuterService {
             data: input.data,
             ip: clientIp,
             user_agent: req?.headers?.['user-agent'] ?? null,
+            tls_fingerprint: req?.tlsFingerprint ?? null,
             email,
             // The form `email.validate` was given, so the abuse harness can
             // find the verdict that hook cached for this address.
@@ -238,6 +267,7 @@ export class SignupService extends PuterService {
             email_gate_last: false,
             message: null as string | null,
             code: null as string | null,
+            email_stream: null as string | null,
             ...(input.fingerprint !== undefined ? { fingerprint } : {}),
             // Signup-time reputation, persisted on the user row.
             reputation: null as number | null,
@@ -314,6 +344,7 @@ export class SignupService extends PuterService {
             emailGateLast:
                 Boolean(validateEvent.email_gate_last) &&
                 (requiresPhoneVerification || requiresCardVerification),
+            emailStream: emailStreamName(validateEvent.email_stream),
         };
     }
 
@@ -321,7 +352,7 @@ export class SignupService extends PuterService {
      * A form or temp signup. Returns the account to sign in; throws the 4xx a
      * refused signup answers with.
      */
-    async signup(input: SignupInput): Promise<UserRow> {
+    async signup(input: SignupInput): Promise<SignupResult> {
         const { req, body, isTemp, fingerprint, bonusCode } = input;
 
         // Runs before the duplicate checks so a disabled endpoint doesn't
@@ -346,7 +377,25 @@ export class SignupService extends PuterService {
             }
         }
 
-        if (await this.stores.user.getByUsername(body.username)) {
+        // Independent reads, issued together; their errors keep this order.
+        // The early email check spares an obvious duplicate the validate hook
+        // and a bcrypt round. It runs again against the primary right before
+        // the write, and the unique index catches whatever still slips through.
+        const [usernameOwner, homePathConflict, emailClaim] =
+            await Promise.allSettled([
+                this.stores.user.getByUsername(body.username),
+                this.stores.fsEntry.findHomePathConflict(
+                    body.username,
+                    undefined,
+                    { includeDescendants: true },
+                ),
+                isTemp ? null : this.#resolveSignupEmailClaim(body.email),
+            ]);
+        const settled = <T>(result: PromiseSettledResult<T>): T => {
+            if (result.status === 'rejected') throw result.reason;
+            return result.value;
+        };
+        if (settled(usernameOwner)) {
             throw new HttpError(
                 400,
                 'This username already exists in our database. Please use another one.',
@@ -355,28 +404,15 @@ export class SignupService extends PuterService {
         }
         // A free username whose home path is occupied would provision a
         // second root there.
-        if (
-            await this.stores.fsEntry.findHomePathConflict(
-                body.username,
-                undefined,
-                { includeDescendants: true },
-            )
-        ) {
+        if (settled(homePathConflict)) {
             throw new HttpError(400, 'This username is not available.', {
                 legacyCode: 'bad_request',
             });
         }
+        let pseudoUser = settled(emailClaim);
 
-        const clientIp = signupClientIp(req);
+        const clientIp = requestIp(req);
         const proxyIpChain = req.headers['x-forwarded-for'];
-
-        // The cheap early email check, so an obvious duplicate doesn't pay for
-        // the validate hook and a bcrypt round. It runs again against the
-        // primary right before the write, and the unique index catches
-        // whatever still slips through.
-        let pseudoUser = isTemp
-            ? null
-            : await this.#resolveSignupEmailClaim(body.email);
 
         const gate = await this.runSignupGate({
             req,
@@ -417,11 +453,9 @@ export class SignupService extends PuterService {
         }
 
         const userUuid = uuidv4();
-        const emailConfirmCode = String(crypto.randomInt(100000, 1000000));
+        const emailConfirmCode = generateEmailConfirmCode();
         const emailConfirmToken = uuidv4();
-        const passwordHash = isTemp
-            ? null
-            : await bcrypt.hash(body.password, 8);
+        const passwordHash = isTemp ? null : await hashPassword(body.password);
         const signupSqlTs = new Date()
             .toISOString()
             .slice(0, 19)
@@ -534,6 +568,7 @@ export class SignupService extends PuterService {
                         // column; the raw chain stays in `audit_metadata`.
                         signup_ip_forwarded: clientIp,
                         signup_user_agent: req.headers?.['user-agent'] ?? null,
+                        signup_tls_fingerprint: req.tlsFingerprint ?? null,
                         signup_origin:
                             (req.headers?.origin as string | null) ?? null,
                         signup_server: this.config.serverId,
@@ -572,10 +607,25 @@ export class SignupService extends PuterService {
         }
 
         const emailGateLast = !isTemp && gate.emailGateLast;
-        if (emailGateLast) user = await this.#markEmailGateLast(user);
+        // A claimed row may hold the stream of an earlier signup.
+        const storedStream = user.metadata?.emailStream ?? null;
+        const metadataPatch = {
+            ...(emailGateLast ? { emailGateLast: true } : {}),
+            ...(gate.emailStream !== storedStream
+                ? { emailStream: gate.emailStream }
+                : {}),
+        };
+        if (Object.keys(metadataPatch).length > 0) {
+            await this.stores.user.updateMetadata(user.id, metadataPatch);
+            user = {
+                ...user,
+                metadata: { ...user.metadata, ...metadataPatch },
+            };
+        }
 
+        let confirmationEmailSent: boolean | undefined;
         if (!isTemp && user.requires_email_confirmation && !emailGateLast) {
-            await this.sendConfirmationEmail(
+            confirmationEmailSent = await this.sendConfirmationEmail(
                 user,
                 'signup',
                 (body.send_confirmation_code ?? true)
@@ -589,10 +639,15 @@ export class SignupService extends PuterService {
             bonusCode,
             fingerprint,
             // The created/claimed row: a claimed placeholder has credentials.
-            isTemp: user.password === null && user.email === null,
+            isTemp: isTemporaryAccount(user),
             saveAccount: !isTemp,
         });
-        return user;
+        return {
+            user,
+            ...(confirmationEmailSent !== undefined
+                ? { confirmationEmailSent }
+                : {}),
+        };
     }
 
     /**
@@ -649,10 +704,10 @@ export class SignupService extends PuterService {
         }
     }
 
-    /** Record that this account clears card and phone before email. */
-    async #markEmailGateLast(user: UserRow): Promise<UserRow> {
-        await this.stores.user.updateMetadata(user.id, { emailGateLast: true });
-        return { ...user, metadata: { ...user.metadata, emailGateLast: true } };
+    /** The stream this account's confirmation emails are sent on. */
+    confirmationStream(user: UserRow): string {
+        const stored = user.metadata?.emailStream;
+        return typeof stored === 'string' ? stored : 'signup';
     }
 
     /**
@@ -674,7 +729,7 @@ export class SignupService extends PuterService {
                 ? user.email_confirm_code
                 : null;
         if (!code) {
-            code = String(crypto.randomInt(100000, 1000000));
+            code = generateEmailConfirmCode();
             await this.stores.user.update(user.id, {
                 email_confirm_code: code,
             });
@@ -685,13 +740,16 @@ export class SignupService extends PuterService {
     /**
      * Send the confirmation code (or link) for the account's address. A lost
      * message is alarmed rather than thrown: the account exists either way.
+     * Resolves to whether the transport accepted the message.
      */
     async sendConfirmationEmail(
         user: UserRow,
-        stage: 'signup' | 'resend' | 'deferred',
+        stage: ConfirmationEmailStage,
         message: { code: string } | { token: string },
-    ): Promise<void> {
-        if (!this.clients.email || !user.email) return;
+    ): Promise<boolean> {
+        if (!this.clients.email || !user.email) return false;
+        const stream = this.confirmationStream(user);
+        if ('code' in message) await this.#markConfirmationCodeSent(user.id);
         try {
             const sent =
                 'code' in message
@@ -699,6 +757,7 @@ export class SignupService extends PuterService {
                           user.email,
                           'email_verification_code',
                           { code: message.code },
+                          { stream },
                       )
                     : await this.clients.email.send(
                           user.email,
@@ -706,11 +765,49 @@ export class SignupService extends PuterService {
                           {
                               link: `${this.config.origin ?? ''}/confirm-email-by-token?token=${message.token}&user_uuid=${user.uuid}`,
                           },
+                          { stream },
                       );
             // `null` = dropped for want of a transport; silent otherwise.
-            if (sent === null) this.#confirmationEmailFailed(stage, user, null);
+            if (sent === null) {
+                this.#confirmationEmailFailed(stage, user, null);
+                return false;
+            }
+            return true;
         } catch (e) {
             this.#confirmationEmailFailed(stage, user, e);
+            return false;
+        }
+    }
+
+    /**
+     * Whether the account's confirmation code was mailed within the hour. Fails
+     * open: when the marker can't be read, the code is honored.
+     */
+    async isConfirmationCodeCurrent(userId: number): Promise<boolean> {
+        try {
+            const { res } = await this.stores.kv.get({
+                key: confirmationCodeSentKey(userId),
+            });
+            return res != null;
+        } catch (e) {
+            console.warn('[confirm-email] code marker read failed:', e);
+            return true;
+        }
+    }
+
+    // Best effort: without the marker the code reads as expired, and a resend
+    // writes it again.
+    async #markConfirmationCodeSent(userId: number): Promise<void> {
+        try {
+            await this.stores.kv.set({
+                key: confirmationCodeSentKey(userId),
+                value: true,
+                expireAt:
+                    Math.floor(Date.now() / 1000) +
+                    CONFIRMATION_CODE_TTL_SECONDS,
+            });
+        } catch (e) {
+            console.warn('[confirm-email] code marker write failed:', e);
         }
     }
 
@@ -765,6 +862,17 @@ export class SignupService extends PuterService {
                 legacyCode: 'email_already_in_use' as never,
             });
         }
+        await this.announceEmailConfirmed(user, { originalClientSocketId });
+    }
+
+    /**
+     * What follows an account's first confirmed address, whichever route
+     * confirmed it: the verified group, other tabs, and listeners.
+     */
+    async announceEmailConfirmed(
+        user: UserRow,
+        { originalClientSocketId }: { originalClientSocketId?: unknown } = {},
+    ): Promise<void> {
         await promoteToVerifiedGroup(this.stores.group, this.config, user);
 
         // Best-effort side channels. Other tabs refresh; the one that sent
@@ -792,20 +900,32 @@ export class SignupService extends PuterService {
         email: string,
         opts: { force?: boolean; releaseSeat?: boolean } = {},
     ): Promise<UserRow | null> {
+        return (await this.#emailHolder(email, opts)).holder;
+    }
+
+    /** `seated`: an unconfirmed holder that still holds a team seat. */
+    async #emailHolder(
+        email: string,
+        opts: { force?: boolean; releaseSeat?: boolean },
+    ): Promise<{ holder: UserRow | null; seated: boolean }> {
         let force = opts.force;
         for (;;) {
             const holder = await this.stores.user.findEmailOwner(email, {
                 force,
             });
-            if (!holder || holder.email_confirmed) return holder;
-            if (!(await this.stores.team?.getOrgSeat(holder.id))) return holder;
-            if (!opts.releaseSeat) return null;
+            if (!holder || holder.email_confirmed) {
+                return { holder, seated: false };
+            }
+            if (!(await this.stores.team?.getOrgSeat(holder.id))) {
+                return { holder, seated: false };
+            }
+            if (!opts.releaseSeat) return { holder: null, seated: false };
             if (
                 !(await this.services.team?.releaseUnconfirmedSeatEmail(
                     holder.id,
                 ))
             )
-                return holder;
+                return { holder, seated: true };
             force = true;
         }
     }
@@ -819,17 +939,14 @@ export class SignupService extends PuterService {
         email: string,
         opts: { force?: boolean; releaseSeat?: boolean } = {},
     ): Promise<UserRow | null> {
-        const existing = await this.signupEmailHolder(email, opts);
+        const { holder: existing, seated } = await this.#emailHolder(
+            email,
+            opts,
+        );
         if (!existing) return null;
         // A provisioned account looks exactly like a claimable placeholder,
         // but claiming it hands a stranger that team's membership.
-        const orgSeat =
-            (await this.stores.team?.getOrgSeat(existing.id)) ?? null;
-        if (
-            existing.email_confirmed ||
-            existing.password !== null ||
-            orgSeat !== null
-        ) {
+        if (existing.email_confirmed || existing.password !== null || seated) {
             throw new HttpError(
                 400,
                 'This email already exists in our database. Please use another one.',
@@ -862,7 +979,7 @@ export class SignupService extends PuterService {
      * phone/card gate is outstanding either.
      */
     #confirmationEmailFailed(
-        stage: 'signup' | 'resend' | 'deferred',
+        stage: ConfirmationEmailStage,
         user: UserRow,
         cause: unknown,
     ): void {
@@ -873,10 +990,15 @@ export class SignupService extends PuterService {
                 : cause === null
                   ? 'no transport configured (message dropped)'
                   : String(cause);
-        console.warn(
-            `[${stage === 'resend' ? 'send-confirm-email' : 'signup'}] ` +
-                `confirmation email not delivered: ${detail}`,
-        );
+        const route =
+            stage === 'resend'
+                ? 'send-confirm-email'
+                : stage === 'save-account' ||
+                    stage === 'sign-in' ||
+                    stage === 'team'
+                  ? stage
+                  : 'signup';
+        console.warn(`[${route}] confirmation email not delivered: ${detail}`);
         // Best-effort: failing to alarm must not fail the signup.
         try {
             this.clients.alarm?.create(
@@ -894,8 +1016,8 @@ export class SignupService extends PuterService {
                     detail,
                     ...(cause instanceof Error ? { error: cause } : {}),
                 },
-                'warning',
-                { dedup: true },
+                'info',
+                { dedup: true, channel: 'email' },
             );
         } catch (e) {
             console.warn(`[${stage}] confirmation-email alarm failed:`, e);

@@ -75,27 +75,46 @@ export const providerStartUrl = (provider, kind, referrer) => {
     return url;
 };
 
+/** @type {WeakMap<import('./authFlow.js').AuthFlow, Promise<{ providers?: string[], signupOidcOnly?: boolean } | null>>} */
+const lookups = new WeakMap();
+
 /**
- * Fetches the configured providers and fills `$list` with a button for each.
- * A self-hosted instance's own provider gets a generic button.
+ * The configured providers, looked up once per auth flow so moving between
+ * its screens draws them straight away instead of after another round trip.
+ *
+ * @param {import('./authFlow.js').AuthFlow} flow
+ */
+const lookUpProviders = (flow) => {
+    let lookup = lookups.get(flow);
+    if ( ! lookup ) {
+        lookup = (async () => {
+            try {
+                const res = await fetch(`${window.api_origin}/auth/oidc/providers`);
+                return res.ok ? await res.json() : null;
+            } catch {
+                return null;
+            }
+        })();
+        lookups.set(flow, lookup);
+    }
+    return lookup;
+};
+
+/**
+ * Fills `$list` with a button for each configured provider. A self-hosted
+ * instance's own provider gets a generic button.
  *
  * @param {jQuery} $list Where the buttons go.
  * @param {object} opts
  * @param {'login'|'signup'} opts.kind
  * @param {() => string | undefined} opts.referrer Read when a button is pressed.
+ * @param {import('./authFlow.js').AuthFlow} opts.flow The flow showing `$list`.
  * @returns {Promise<{ providers: string[], signupOidcOnly: boolean } | null>}
  *   Null when none are offered here or the lookup failed.
  */
-export async function renderProviderButtons ($list, { kind, referrer }) {
+export async function renderProviderButtons ($list, { kind, referrer, flow }) {
     if ( ! mayOfferProviders() ) return null;
-    let data;
-    try {
-        const res = await fetch(`${window.api_origin}/auth/oidc/providers`);
-        if ( ! res.ok ) return null;
-        data = await res.json();
-    } catch {
-        return null;
-    }
+    const data = await lookUpProviders(flow);
     if ( ! Array.isArray(data?.providers) || ! data.providers.length ) return null;
 
     const ordered = [
@@ -115,7 +134,15 @@ export async function renderProviderButtons ($list, { kind, referrer }) {
     }
     $list.html(h);
     $list.on('click', '.auth-provider-btn', function () {
-        window.location.href = providerStartUrl($(this).attr('data-provider'), kind, referrer());
+        const url = providerStartUrl($(this).attr('data-provider'), kind, referrer());
+        // A provider won't load in a frame, so the framing page opens this
+        // in a popup instead. `unavailable` covers an SDK that can't.
+        if ( window.embedded_in_frame ) {
+            window.tell_popup_frame('provider', { url });
+            window.tell_popup_frame('unavailable');
+            return;
+        }
+        window.location.href = url;
     });
     return { providers: ordered, signupOidcOnly: data.signupOidcOnly === true };
 }

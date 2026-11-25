@@ -673,16 +673,15 @@ describe('DDBClient — unprocessed batch items', () => {
         ]);
     });
 
-    it('gives up with a bad-request error when items never drain', async () => {
+    it('gives up with a 503 when items never drain', async () => {
         requestCount = 0;
         responses = Array.from({ length: 12 }, () => unprocessed('stuck'));
 
         await expect(
             stubClient().batchPut([{ table: TABLE, item: { pk: 'stuck' } }]),
         ).rejects.toMatchObject({
-            statusCode: 400,
-            legacyCode: 'bad_request',
-            message: 'Failed to batch write all items to DynamoDB',
+            statusCode: 503,
+            code: 'db_unavailable',
         });
         // One initial attempt plus the full retry budget.
         expect(requestCount).toBe(9);
@@ -787,16 +786,15 @@ describe('DDBClient — unprocessed batch keys', () => {
         ]);
     });
 
-    it('gives up with a bad-request error when keys never drain', async () => {
+    it('gives up with a 503 when keys never drain', async () => {
         requestCount = 0;
         responses = Array.from({ length: 12 }, () => unprocessed('stuck'));
 
         await expect(
             stubClient().batchGet([{ table: TABLE, items: { pk: 'stuck' } }]),
         ).rejects.toMatchObject({
-            statusCode: 400,
-            legacyCode: 'bad_request',
-            message: 'Failed to batch get all items from DynamoDB',
+            statusCode: 503,
+            code: 'db_unavailable',
         });
         // One initial attempt plus the full retry budget.
         expect(requestCount).toBe(9);
@@ -1214,4 +1212,88 @@ describe('DDBClient — throttle logging', () => {
         ).rejects.toMatchObject({ name: 'ConditionalCheckFailedException' });
         expect(ddbWarnings()).toEqual([]);
     });
+});
+
+describe('DDBClient — the item a refusal returns', () => {
+    let server: Server;
+    let endpoint: string;
+    let sent: Record<string, unknown>[];
+
+    beforeAll(async () => {
+        server = createServer((req, res) => {
+            let body = '';
+            req.on('data', (chunk) => (body += chunk));
+            req.on('end', () => {
+                sent.push(JSON.parse(body));
+                res.writeHead(400, {
+                    'content-type': 'application/x-amz-json-1.0',
+                });
+                res.end(
+                    JSON.stringify({
+                        __type: 'com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException',
+                        message: 'The conditional request failed',
+                        Item: { pk: { S: 'held' }, ttl: { N: '42' } },
+                    }),
+                );
+            });
+        });
+        await new Promise<void>((resolve) =>
+            server.listen(0, '127.0.0.1', resolve),
+        );
+        endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    });
+
+    afterAll(async () => {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    beforeEach(() => {
+        sent = [];
+    });
+
+    const stubClient = () =>
+        new DDBClient({
+            port: 0,
+            extensions: [],
+            dynamo: {
+                aws: {
+                    access_key: 'a',
+                    secret_key: 'b',
+                    region: 'eu-central-1',
+                },
+                endpoint,
+            },
+        } as unknown as IConfig);
+    const condition = { expression: 'attribute_not_exists(pk)' };
+
+    it.each([
+        [
+            'put',
+            (o: object) => stubClient().put(TABLE, { pk: 'held', sk: 'a' }, o),
+        ],
+        [
+            'del',
+            (o: object) => stubClient().del(TABLE, { pk: 'held', sk: 'a' }, o),
+        ],
+    ])(
+        '%s asks for the refusing item only when told to, and hands it back undecoded',
+        async (_label, write) => {
+            await expect(
+                write({ condition, returnOldOnRefusal: true }),
+            ).rejects.toMatchObject({
+                name: 'ConditionalCheckFailedException',
+                Item: { pk: { S: 'held' }, ttl: { N: '42' } },
+            });
+            expect(sent[0]).toMatchObject({
+                ReturnValuesOnConditionCheckFailure: 'ALL_OLD',
+            });
+
+            await expect(write({ condition })).rejects.toMatchObject({
+                name: 'ConditionalCheckFailedException',
+            });
+            expect(sent[1]).not.toHaveProperty(
+                'ReturnValuesOnConditionCheckFailure',
+            );
+        },
+    );
 });

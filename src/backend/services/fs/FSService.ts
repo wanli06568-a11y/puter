@@ -20,21 +20,9 @@
 import { createHash } from 'node:crypto';
 import { posix as pathPosix } from 'node:path';
 import type { TransformCallback } from 'node:stream';
-import { pipeline, Readable, Transform } from 'node:stream';
+import { finished, Readable, Transform } from 'node:stream';
 import { v4 as uuidv4 } from 'uuid';
 import type { EventKey, EventMap } from '../../clients/event/types.js';
-import {
-    BinaryPayload,
-    CompleteWriteRequest,
-    CompleteWriteResponse,
-    SignedWriteRequest,
-    SignedWriteResponse,
-    SignMultipartPartsRequest,
-    SignMultipartPartsResponse,
-    UploadMode,
-    WriteRequest,
-    WriteResponse,
-} from '../../controllers/fs/requestTypes.js';
 import {
     Actor,
     handlerDepthOf,
@@ -73,17 +61,23 @@ import {
     runWithConcurrencyLimitSettled,
 } from '../../util/concurrency.js';
 import { isUniqueViolation } from '../../util/dbError.js';
+import { entryNamesMatch } from '../../util/entryNames.js';
 import { AclMode } from '../acl/ACLService.js';
 import type { puterServices } from '../index.js';
 import {
     APP_DATA_FS_MODE_CLASSES,
     appDataOwnerOf,
     appDataPermission,
+    appDataRootPath,
     appDataSharingAllowed,
     carriesClosedAppData,
     closedAppDataOwners,
 } from '../permission/appDataScopes.js';
 import { MANAGE_PERM_PREFIX } from '../permission/consts.js';
+import {
+    fsEntryPermission,
+    parseFsPathPermission,
+} from '../permission/fsPathPermission.js';
 import { PermissionUtil } from '../permission/permissionUtil.js';
 import { PuterService } from '../types.js';
 import {
@@ -93,12 +87,23 @@ import {
 } from './resolveNode.js';
 import type {
     BatchWritePrepareRequest,
+    BinaryPayload,
+    CompleteWriteRequest,
+    CompleteWriteResponse,
     NormalizedWriteInput,
     PreparedBatchWrite,
+    SignedWriteRequest,
+    SignedWriteResponse,
+    SignMultipartPartsRequest,
+    SignMultipartPartsResponse,
+    UploadByteBudget,
     UploadedBatchWriteItem,
+    UploadMode,
     UploadPayload,
     UploadPreparedBatchItemInput,
     UploadProgressTrackerLike,
+    WriteRequest,
+    WriteResponse,
 } from './types.js';
 
 const DEFAULT_CONTENT_TYPE = 'application/octet-stream';
@@ -155,9 +160,74 @@ const foreignAppDataOwner = (
     return appUid;
 };
 
+const storageLimitError = () =>
+    new HttpError(413, 'Storage limit reached', {
+        legacyCode: 'storage_limit_reached',
+    });
+
+/**
+ * What a streamed body may take: its declared size when it has one, else the
+ * owner's free storage. A size of 0 is how streamed writes say "unknown".
+ */
+const streamBudgetFor = (
+    declaredSize: number,
+    storageBudget: UploadByteBudget | undefined,
+): UploadByteBudget | undefined => {
+    if (declaredSize > 0) {
+        return {
+            remaining: declaredSize,
+            overflow: () =>
+                new HttpError(
+                    400,
+                    'File content is longer than its declared size',
+                    { legacyCode: 'bad_request' },
+                ),
+        };
+    }
+    if (storageBudget?.remaining === Infinity) return undefined;
+    return storageBudget ?? { remaining: 0, overflow: storageLimitError };
+};
+
+/**
+ * Takes the bytes a body of known length adds past its declared size out of the
+ * owner's free storage, before any of it is uploaded.
+ */
+const drawKnownLength = (
+    uploadBody: UploadPayload,
+    declaredSize: number,
+    storageBudget: UploadByteBudget | undefined,
+): void => {
+    if (uploadBody.contentLength === undefined) return;
+    const extra = uploadBody.contentLength - declaredSize;
+    if (extra <= 0) return;
+    if (!storageBudget || extra > storageBudget.remaining) {
+        throw storageLimitError();
+    }
+    storageBudget.remaining -= extra;
+};
+
 /** `name` under `parentPath` as stored: no trimming or normalizing. */
 const childPath = (parentPath: string, name: string): string =>
     parentPath === '/' ? `/${name}` : `${parentPath}/${name}`;
+
+/**
+ * The name is held by a differently named entry the database folds onto it (see
+ * `entryNamesMatch`). That entry is never replaced or returned instead.
+ */
+const foldedNameConflict = (name: string): HttpError =>
+    new HttpError(
+        409,
+        `An entry whose name conflicts with \`${name}\` already exists`,
+        { legacyCode: 'conflict' },
+    );
+
+/**
+ * `occupant`, found at `path`, is a different name the database folded. The
+ * store resolves a stored path spelled otherwise through the parent chain.
+ */
+const holdsFoldedName = (occupant: FSEntry, path: string): boolean =>
+    !entryNamesMatch(occupant.name, pathPosix.basename(path)) ||
+    !entryNamesMatch(occupant.path, path);
 
 /** `/<username>/AppData/<appUid>`: the directory an app's launch provisions. */
 const isAppDataRootPath = (path: string): boolean => {
@@ -172,12 +242,6 @@ const isAppDataRootPath = (path: string): boolean => {
 
 /** Ends a subtree removal whose `proceed` check said to stop. */
 class RemovalStopped extends Error {}
-
-const isNoSuchKeyError = (err: unknown): boolean => {
-    if (!err || typeof err !== 'object') return false;
-    const e = err as { name?: unknown; Code?: unknown };
-    return e.name === 'NoSuchKey' || e.Code === 'NoSuchKey';
-};
 
 const isInvalidRangeError = (err: unknown): boolean => {
     if (!err || typeof err !== 'object') return false;
@@ -340,25 +404,12 @@ export class FSService extends PuterService {
         // front.
         permissions.registerRewriter({
             id: 'fs-path-to-uid',
-            matches: (permission: string) => {
-                if (
-                    !permission.startsWith('fs:') &&
-                    !permission.startsWith(`${MANAGE_PERM_PREFIX}:fs:`)
-                )
-                    return false;
-                // Parse on component boundaries: a path can contain `fs:` (e.g. a home dir named `…fs`), which a raw split mistakes for the mode delimiter.
-                const parts = PermissionUtil.split(permission);
-                const fsIndex = parts[0] === MANAGE_PERM_PREFIX ? 1 : 0;
-                const specifier = parts[fsIndex + 1];
-                return Boolean(specifier && specifier.startsWith('/'));
-            },
+            matches: (permission: string) =>
+                parseFsPathPermission(permission) !== null,
             rewrite: async (permission: string): Promise<string> => {
-                const parts = PermissionUtil.split(permission);
-                const hasManage = parts[0] === MANAGE_PERM_PREFIX;
-                const fsIndex = hasManage ? 1 : 0;
-                const path = parts[fsIndex + 1];
-                const rest = parts.slice(fsIndex + 2);
-                if (!path) return permission;
+                const parsed = parseFsPathPermission(permission);
+                if (!parsed) return permission;
+                const { hasManage, path, rest } = parsed;
                 const entry = await fsEntryStore.getEntryByPath(path);
                 if (!entry) {
                     throw new HttpError(404, `Entry not found: path=${path}`, {
@@ -369,6 +420,20 @@ export class FSService extends PuterService {
                 return hasManage ? `${MANAGE_PERM_PREFIX}:${joined}` : joined;
             },
         });
+
+        // The rules below see the same uid once per scan option; the scan's
+        // memo keeps that to one entry lookup per scan.
+        const entryFor = (
+            uid: string,
+            memo: Map<string, unknown> | undefined,
+        ): Promise<FSEntry | null> => {
+            const key = `fs-entry:${uid}`;
+            const known = memo?.get(key) as Promise<FSEntry | null> | undefined;
+            if (known) return known;
+            const lookup = fsEntryStore.getEntryByUuid(uid);
+            memo?.set(key, lookup);
+            return lookup;
+        };
 
         // -- is-owner --------------------------------------------------
         // For user actors, `fs:<uuid>:*` resolves iff the actor owns the
@@ -388,7 +453,7 @@ export class FSService extends PuterService {
                     )
                 );
             },
-            check: async ({ actor, permission }): Promise<unknown> => {
+            check: async ({ actor, permission, memo }): Promise<unknown> => {
                 if (!isPlainUserActor(actor)) return undefined;
                 if (!actor.user?.id) return undefined;
 
@@ -397,7 +462,7 @@ export class FSService extends PuterService {
                 const uid = parts[1];
                 if (!uid) return undefined;
 
-                const entry = await fsEntryStore.getEntryByUuid(uid);
+                const entry = await entryFor(uid, memo);
                 if (!entry) return undefined;
                 if (entry.userId === actor.user.id) return {};
                 return undefined;
@@ -420,7 +485,7 @@ export class FSService extends PuterService {
             shortcut: true,
             matches: (permission: string): boolean =>
                 permission.startsWith(`${MANAGE_PERM_PREFIX}:fs:`),
-            check: async ({ actor, permission }): Promise<unknown> => {
+            check: async ({ actor, permission, memo }): Promise<unknown> => {
                 // Apps are bounded by their user through a separate path;
                 // widening them here would let one outrun that bound.
                 if (!isPlainUserActor(actor)) return undefined;
@@ -430,7 +495,7 @@ export class FSService extends PuterService {
                 const uid = PermissionUtil.split(stripped)[1];
                 if (!uid) return undefined;
 
-                const entry = await fsEntryStore.getEntryByUuid(uid);
+                const entry = await entryFor(uid, memo);
                 // Owning the entry is `is-owner`'s answer to give, and it runs
                 // first — there is nothing to inherit on your own tree.
                 if (!entry || entry.userId === actor.user.id) return undefined;
@@ -440,7 +505,7 @@ export class FSService extends PuterService {
                 ).slice(1);
                 if (ancestors.length === 0) return undefined;
                 const wanted = ancestors.map((ancestor) =>
-                    PermissionUtil.join(MANAGE_PERM_PREFIX, 'fs', ancestor.uid),
+                    fsEntryPermission(ancestor.uid, MANAGE_PERM_PREFIX),
                 );
 
                 // Read the stores rather than re-entering `scan`, which would
@@ -454,13 +519,18 @@ export class FSService extends PuterService {
                         wanted,
                     ),
                     permissionStore.readUserGroupPerms(actor.user.id, wanted),
-                    permissionStore.getFlatUserPerms(actor.user.id, wanted),
+                    permissionStore.getFlatUserPermsForRefs(
+                        wanted.map((permission) => ({
+                            holderUserId: actor.user!.id!,
+                            permission,
+                        })),
+                    ),
                 ]);
-                const held =
-                    linked.length > 0 ||
-                    group.length > 0 ||
-                    flat.some((value) => value && !value.deleted);
-                return held ? {} : undefined;
+                if (linked.length > 0 || group.length > 0) return {};
+                const { kept } = await permissionStore.withoutOrphanedFlatPerms(
+                    flat.filter(({ value }) => !value.deleted),
+                );
+                return kept.length > 0 ? {} : undefined;
             },
         });
 
@@ -485,23 +555,20 @@ export class FSService extends PuterService {
                     )
                 );
             },
-            check: async ({ actor, permission }): Promise<unknown> => {
+            check: async ({ actor, permission, memo }): Promise<unknown> => {
                 if (!isAppActor(actor)) return undefined;
                 const username = actor.user?.username;
                 const appUid = actor.effectiveApp!.uid;
                 if (!username || !appUid) return undefined;
 
-                const stripped = permission.replaceAll(
-                    `${MANAGE_PERM_PREFIX}:`,
-                    '',
-                );
+                const stripped = PermissionUtil.stripManageArms(permission);
                 const uid = PermissionUtil.split(stripped)[1];
                 if (!uid) return undefined;
 
-                const entry = await fsEntryStore.getEntryByUuid(uid);
+                const entry = await entryFor(uid, memo);
                 if (!entry) return undefined;
 
-                const root = `/${username}/AppData/${appUid}`;
+                const root = appDataRootPath(username, appUid);
                 if (entry.path === root || entry.path.startsWith(`${root}/`)) {
                     return {};
                 }
@@ -805,6 +872,7 @@ export class FSService extends PuterService {
                     // granted access to, even when those live outside the
                     // writer's own namespace.
                     crossNamespace: true,
+                    foldedNames: true,
                 },
             );
         for (let index = 0; index < initialPaths.length; index++) {
@@ -829,15 +897,28 @@ export class FSService extends PuterService {
             const readPromise = this.stores.fsEntry.getEntryByPath(path, {
                 useTryHardRead: true,
                 skipCache: true,
+                foldedNames: true,
             });
             existingEntryCache.set(path, readPromise);
             return await readPromise;
         };
 
         const results: WriteTargetResolutionResult[] = [];
+        const overwrittenUids = new Set<string>();
         for (const input of inputs) {
             let normalizedInput = input.normalizedInput;
             let existingEntry = await loadExistingEntry(normalizedInput.path);
+            if (
+                existingEntry &&
+                holdsFoldedName(existingEntry, normalizedInput.path)
+            ) {
+                if (normalizedInput.overwrite && !normalizedInput.dedupeName) {
+                    throw foldedNameConflict(
+                        pathPosix.basename(normalizedInput.path),
+                    );
+                }
+                normalizedInput = { ...normalizedInput, overwrite: false };
+            }
             const pathReservedInBatch = reservedPaths.has(normalizedInput.path);
             let pendingDirectory =
                 !existingEntry &&
@@ -885,19 +966,35 @@ export class FSService extends PuterService {
             if (existingEntry && !normalizedInput.overwrite) {
                 // v1 wire contract: clients (the GUI's save dialogs among
                 // them) key on `item_with_same_name_exists` + `entry_name`
-                // to offer an overwrite prompt.
+                // to offer an overwrite prompt, naming the entry they show.
                 throw new HttpError(
                     409,
                     'A file already exists at this path and overwrite was not requested',
                     {
                         legacyCode: 'item_with_same_name_exists',
                         fields: {
-                            entry_name: pathPosix.basename(
+                            entry_name: holdsFoldedName(
+                                existingEntry,
                                 normalizedInput.path,
-                            ),
+                            )
+                                ? existingEntry.name
+                                : pathPosix.basename(normalizedInput.path),
                         },
                     },
                 );
+            }
+
+            // Two spellings of one folder reach the same file; refused before
+            // either upload lands on its object.
+            if (existingEntry) {
+                if (overwrittenUids.has(existingEntry.uuid)) {
+                    throw new HttpError(
+                        409,
+                        `Batch contains duplicate target path: ${existingEntry.name}`,
+                        { legacyCode: 'conflict' },
+                    );
+                }
+                overwrittenUids.add(existingEntry.uuid);
             }
 
             // An overwrite reuses the entry's uuid as the object key, so the
@@ -1051,20 +1148,20 @@ export class FSService extends PuterService {
     /**
      * The shared allowance check: usage plus pending bytes against the max,
      * from a replica. Only settled bytes can make this stricter than a plain
-     * replica check, so only then is the primary consulted. Returns whether a
-     * limit was actually enforced and throws the existing 413 when `delta`
-     * doesn't fit.
+     * replica check, so only then is the primary consulted. Returns the bytes
+     * still free after `delta` (Infinity when no limit applies) and throws the
+     * existing 413 when `delta` doesn't fit.
      */
     async #checkStorageAllowance(
         userId: number,
         delta: number,
         storageAllowanceMaxOverride?: number,
         pending?: PendingUploadBytes,
-    ): Promise<boolean> {
+    ): Promise<number> {
         // Skip the allowance lookup entirely for unmetered writes — it costs
         // a query plus a quota-bonus round trip whose answer can't matter.
         if (storageAllowanceMaxOverride === UNLIMITED_STORAGE_ALLOWANCE) {
-            return false;
+            return Infinity;
         }
 
         const [fast, resolvedPending] = await Promise.all([
@@ -1076,18 +1173,16 @@ export class FSService extends PuterService {
             storageAllowanceMaxOverride,
         );
         if (fastMax === UNLIMITED_STORAGE_ALLOWANCE) {
-            return false;
+            return Infinity;
         }
 
         const { activeBytes, settledBytes } = resolvedPending;
         const fastProjected = fast.curr + activeBytes + settledBytes + delta;
         if (!(fastProjected > fastMax)) {
-            return true;
+            return fastMax - fastProjected;
         }
         if (settledBytes === 0) {
-            throw new HttpError(413, 'Storage limit reached', {
-                legacyCode: 'storage_limit_reached',
-            });
+            throw storageLimitError();
         }
 
         const exact = await this.stores.fsEntry.getUserStorageAllowance(
@@ -1099,25 +1194,25 @@ export class FSService extends PuterService {
             storageAllowanceMaxOverride,
         );
         if (exactMax === UNLIMITED_STORAGE_ALLOWANCE) {
-            return false;
+            return Infinity;
         }
-        if (!(exact.curr + activeBytes + delta > exactMax)) {
-            return true;
+        const exactProjected = exact.curr + activeBytes + delta;
+        if (!(exactProjected > exactMax)) {
+            return exactMax - exactProjected;
         }
 
-        throw new HttpError(413, 'Storage limit reached', {
-            legacyCode: 'storage_limit_reached',
-        });
+        throw storageLimitError();
     }
 
+    /** Returns the bytes still free once `incomingSize` is stored. */
     async #assertStorageAllowance(
         userId: number,
         incomingSize: number,
         existingSize = 0,
         storageAllowanceMaxOverride?: number,
         pending?: PendingUploadBytes,
-    ): Promise<void> {
-        await this.#checkStorageAllowance(
+    ): Promise<number> {
+        return this.#checkStorageAllowance(
             userId,
             incomingSize - existingSize,
             storageAllowanceMaxOverride,
@@ -1126,17 +1221,17 @@ export class FSService extends PuterService {
     }
 
     /**
-     * Same check for a batch's combined delta. Returns whether a limit was
-     * actually enforced.
+     * Same check for a batch's combined delta. Returns the bytes still free
+     * after it, Infinity when no limit applies.
      */
     async #assertStorageAllowanceForBatch(
         userId: number,
         sizeChanges: Array<{ incomingSize: number; existingSize: number }>,
         storageAllowanceMaxOverride?: number,
         pending?: PendingUploadBytes,
-    ): Promise<boolean> {
+    ): Promise<number> {
         if (sizeChanges.length === 0) {
-            return false;
+            return Infinity;
         }
 
         const delta = sizeChanges.reduce(
@@ -1244,7 +1339,7 @@ export class FSService extends PuterService {
                       }
                     : { activeBytes: 0, settledBytes: 0 };
 
-                const enforced = await this.#assertStorageAllowanceForBatch(
+                const headroom = await this.#assertStorageAllowanceForBatch(
                     owner,
                     ownerClaims.map((claim) => ({
                         incomingSize: claim.incomingSize,
@@ -1253,7 +1348,7 @@ export class FSService extends PuterService {
                     override,
                     pending,
                 );
-                if (!enforced && ownerHeld.length > 0) {
+                if (headroom === Infinity && ownerHeld.length > 0) {
                     // Nothing to guard for this owner — give the leases back
                     // rather than holding bytes no check will ever read.
                     await this.stores.uploadReservation.release(
@@ -1422,15 +1517,25 @@ export class FSService extends PuterService {
         );
     }
 
+    /**
+     * With a `budget`, a body that outgrows it fails with `budget.overflow()`,
+     * which aborts the upload. The latest chunk is held back until the next one
+     * arrives or the body ends, so the store never receives a body of the
+     * expected length that then turns out to be longer.
+     */
     #createCountingStream(
         source: Readable,
         uploadTracker?: UploadProgressTrackerLike,
+        budget?: UploadByteBudget,
     ): {
         stream: Readable;
         uploadedSize: () => number;
         contentHashSha256: () => string;
+        overflowError: () => Error | null;
     } {
         let uploadedBytes = 0;
+        let overflowError: Error | null = null;
+        let held: Buffer | Uint8Array | string | null = null;
         const hash = createHash('sha256');
         const countingStream = new Transform({
             transform(
@@ -1447,37 +1552,69 @@ export class FSService extends PuterService {
                     hash.update(chunk);
                 }
                 uploadedBytes += chunkLength;
+                if (budget) {
+                    budget.remaining -= chunkLength;
+                    if (budget.remaining < 0) {
+                        overflowError = budget.overflow();
+                        callback(overflowError);
+                        return;
+                    }
+                }
                 if (chunkLength > 0 && uploadTracker) {
                     uploadTracker.add(chunkLength);
                 }
-                callback(null, chunk as Buffer | Uint8Array | string);
+                if (!budget) {
+                    callback(null, chunk as Buffer | Uint8Array | string);
+                    return;
+                }
+                if (held !== null) this.push(held);
+                held = chunk as Buffer | Uint8Array | string;
+                callback();
+            },
+            flush(callback: TransformCallback) {
+                if (held !== null) this.push(held);
+                held = null;
+                callback();
             },
         });
 
-        // `pipeline` rather than `pipe` plus a hand-rolled 'error' forward: it
-        // keeps an 'error' listener attached to `countingStream` for the whole
-        // lifetime of the stream, and tears down both ends whichever one fails.
-        // The consumer is an object-store upload that may not have subscribed
-        // yet when a client disconnects mid-request, and destroying a Transform
-        // that nobody is listening to raises an unhandled 'error' event — which
-        // ends the process rather than just the request.
-        pipeline(source, countingStream, (error) => {
-            if (error) {
-                console.warn('upload stream ended early:', error.message);
+        // `finished` keeps an 'error' listener attached to `countingStream` for
+        // its whole lifetime: the consumer is an object-store upload that may
+        // not have subscribed yet when a client disconnects mid-request, and an
+        // unheard 'error' ends the process. Any other failure tears down the
+        // source too. An overflow leaves it running and drains it instead, so a
+        // request body (or the multipart parser feeding this part) still
+        // finishes and the request can be answered.
+        source.on('error', (error) => countingStream.destroy(error));
+        finished(countingStream, (error) => {
+            if (!error) return;
+            if (error === overflowError) {
+                source.unpipe(countingStream);
+                source.resume();
+                return;
             }
+            console.warn('upload stream ended early:', error.message);
+            source.destroy(error);
         });
+        source.pipe(countingStream);
 
         return {
             stream: countingStream,
             uploadedSize: () => uploadedBytes,
             contentHashSha256: () => hash.digest('hex'),
+            overflowError: () => overflowError,
         };
     }
 
+    /**
+     * `streamBudget` caps a body of unknown length; one of known length is the
+     * caller's to check against storage before it uploads.
+     */
     async #toUploadBody(
         content: WriteRequest['fileContent'],
         encoding: WriteRequest['encoding'],
         uploadTracker?: UploadProgressTrackerLike,
+        streamBudget?: UploadByteBudget,
     ): Promise<UploadPayload> {
         if (Buffer.isBuffer(content)) {
             const hash = createHash('sha256');
@@ -1547,6 +1684,7 @@ export class FSService extends PuterService {
             const streamPayload = this.#createCountingStream(
                 content,
                 uploadTracker,
+                streamBudget,
             );
             return {
                 body: streamPayload.stream,
@@ -1554,6 +1692,7 @@ export class FSService extends PuterService {
                 contentHashSha256: null,
                 finalizeContentHashSha256: () =>
                     streamPayload.contentHashSha256(),
+                overflowError: streamPayload.overflowError,
             };
         }
         if (this.#isWebReadableStream(content)) {
@@ -1578,6 +1717,7 @@ export class FSService extends PuterService {
             const streamPayload = this.#createCountingStream(
                 Readable.from(asyncIterable),
                 uploadTracker,
+                streamBudget,
             );
             return {
                 body: streamPayload.stream,
@@ -1585,6 +1725,7 @@ export class FSService extends PuterService {
                 contentHashSha256: null,
                 finalizeContentHashSha256: () =>
                     streamPayload.contentHashSha256(),
+                overflowError: streamPayload.overflowError,
             };
         }
         if (content instanceof Blob) {
@@ -1635,6 +1776,8 @@ export class FSService extends PuterService {
         try {
             await this.stores.s3Object.uploadFromServer(input, region);
         } catch (error) {
+            const overflow = uploadBody.overflowError?.();
+            if (overflow) throw overflow;
             // A stream is sent with the caller's declared size as its length,
             // so a body that ends short of it is a bad request.
             if (
@@ -1649,6 +1792,8 @@ export class FSService extends PuterService {
             }
             throw error;
         }
+        const overflow = uploadBody.overflowError?.();
+        if (overflow) throw overflow;
     }
 
     async #cleanupPreparedBatchUploads(
@@ -1701,6 +1846,21 @@ export class FSService extends PuterService {
             console.error(
                 'prodfsv2 failed to clean up batch upload objects',
                 cleanupFailures,
+            );
+        }
+    }
+
+    async #deleteUploadedObject(
+        bucket: string,
+        objectKey: string,
+        region: string,
+    ): Promise<void> {
+        try {
+            await this.stores.s3Object.deleteObject(bucket, objectKey, region);
+        } catch (error) {
+            console.error(
+                "failed to clean up a write's uploaded object",
+                error,
             );
         }
     }
@@ -1964,8 +2124,9 @@ export class FSService extends PuterService {
 
         const storageAllowanceMax =
             storageAllowanceMaxOverride ?? preparedBatch.storageAllowanceMax;
+        const budgetByOwner = new Map<number, UploadByteBudget>();
         for (const [owner, sizeChanges] of sizeChangesByOwner) {
-            await this.#assertStorageAllowanceForBatch(
+            const headroom = await this.#assertStorageAllowanceForBatch(
                 owner,
                 sizeChanges,
                 this.#allowanceOverrideFor(
@@ -1973,6 +2134,22 @@ export class FSService extends PuterService {
                     preparedBatch.userId,
                     storageAllowanceMax,
                 ),
+            );
+            budgetByOwner.set(owner, {
+                remaining: headroom,
+                overflow: storageLimitError,
+            });
+        }
+        // Checked before the uploads: what the owner has left caps them.
+        if (!uploadedItems) {
+            preparedBatch.storageBudgets = new Map(
+                preparedBatch.items.map((item) => [
+                    item.index,
+                    budgetByOwner.get(
+                        owners.get(item.normalizedInput.path) ??
+                            preparedBatch.userId,
+                    )!,
+                ]),
             );
         }
     }
@@ -1991,11 +2168,17 @@ export class FSService extends PuterService {
             );
         }
 
+        const storageBudget = input.preparedBatch.storageBudgets?.get(
+            preparedItem.index,
+        );
+        const declaredSize = preparedItem.normalizedInput.size;
         const uploadBody = await this.#toUploadBody(
             input.fileContent,
             input.encoding,
             input.uploadTracker,
+            streamBudgetFor(declaredSize, storageBudget),
         );
+        drawKnownLength(uploadBody, declaredSize, storageBudget);
 
         await this.#uploadContent(
             {
@@ -2073,10 +2256,7 @@ export class FSService extends PuterService {
                 );
             });
 
-            const fsEntries = await this.stores.fsEntry.batchCreateEntries(
-                createInputs,
-                true,
-            );
+            const fsEntries = await this.#createUploadedEntries(createInputs);
             return preparedBatch.items.map((item, index) => {
                 const fsEntry = fsEntries[index];
                 if (!fsEntry) {
@@ -2144,13 +2324,12 @@ export class FSService extends PuterService {
                     'Failed to resolve directory entry after start write',
                 );
             }
-            const createdDirectoryPathSet = new Set(
-                createdDirectoryEntries.map((entry) => entry.path),
-            );
             return {
                 response: this.#toDirectorySignedWriteResponse(
                     directoryEntry,
-                    createdDirectoryPathSet.has(normalizedInput.path),
+                    createdDirectoryEntries.some(
+                        (entry) => entry.uuid === directoryEntry.uuid,
+                    ),
                 ),
                 createdDirectoryEntries,
             };
@@ -2451,9 +2630,9 @@ export class FSService extends PuterService {
                         item.index,
                         this.#toDirectorySignedWriteResponse(
                             directoryEntry,
-                            createdDirectoryEntriesByPath.has(
-                                item.normalizedInput.path,
-                            ),
+                            createdDirectoryEntriesByPath.get(
+                                directoryEntry.path,
+                            )?.uuid === directoryEntry.uuid,
                         ),
                     );
                 }
@@ -2994,35 +3173,103 @@ export class FSService extends PuterService {
         if (!liveKey || liveKey === session.objectKey) return;
         // The completion was allowed against a path, so that is where the
         // entry has to still be; a move since would put the bytes elsewhere.
+        // The upload may spell the entry's name in another case or form.
         const target =
             await this.stores.fsEntry.getEntryByUuidFromPrimary(liveKey);
-        if (!target || target.path !== session.targetPath) {
+        if (!target || !entryNamesMatch(target.path, session.targetPath)) {
             throw new HttpError(409, 'Upload target has moved', {
                 legacyCode: 'conflict',
             });
         }
+        await this.#moveObjectOntoKey(
+            session.objectKey,
+            liveKey,
+            { bucket, region, size },
+            session.contentType,
+        );
+    }
+
+    async #moveObjectOntoKey(
+        fromKey: string,
+        toKey: string,
+        at: { bucket: string; region: string; size: number },
+        contentType?: string | null,
+    ): Promise<void> {
         await this.stores.s3Object.copyObjectOfAnySize(
             {
-                sourceBucket: bucket,
-                sourceKey: session.objectKey,
-                destinationBucket: bucket,
-                destinationKey: liveKey,
-                contentType: session.contentType,
+                sourceBucket: at.bucket,
+                sourceKey: fromKey,
+                destinationBucket: at.bucket,
+                destinationKey: toKey,
+                ...(contentType ? { contentType } : {}),
                 metadataDirective: 'REPLACE',
             },
-            region,
-            size,
+            at.region,
+            at.size,
         );
         try {
             await this.stores.s3Object.deleteObject(
-                bucket,
-                session.objectKey,
-                region,
+                at.bucket,
+                fromKey,
+                at.region,
             );
         } catch (e) {
-            // The live object is already right; the staged one is only litter.
-            console.warn('[fs] staged overwrite left behind:', e);
+            // The destination is already right; the source is only litter.
+            console.warn('[fs] moved object left behind:', e);
         }
+    }
+
+    /**
+     * Creates the rows for objects already uploaded. A row another writer
+     * created first keeps its uuid, so those bytes move onto that key.
+     */
+    async #createUploadedEntries(
+        inputs: FSEntryCreateInput[],
+    ): Promise<FSEntry[]> {
+        const entries = await this.stores.fsEntry.batchCreateEntries(
+            inputs,
+            true,
+        );
+        const raced = inputs.flatMap((input, index) => {
+            const liveKey = entries[index]?.uuid;
+            return liveKey && liveKey !== input.uuid
+                ? [{ input, index, liveKey }]
+                : [];
+        });
+        if (raced.length === 0) return entries;
+
+        await Promise.all(
+            raced.map(({ input, liveKey }) =>
+                this.#moveObjectOntoKey(
+                    input.uuid,
+                    liveKey,
+                    {
+                        bucket: this.stores.s3Object.resolveBucket(
+                            input.bucket,
+                        ),
+                        region: this.stores.s3Object.resolveRegion(
+                            input.bucketRegion,
+                        ),
+                        size: input.size,
+                    },
+                    input.contentType,
+                ),
+            ),
+        );
+        const adopted = await this.stores.fsEntry.batchCreateEntries(
+            raced.map(({ input, liveKey }) => ({ ...input, uuid: liveKey })),
+            true,
+        );
+        raced.forEach(({ index, liveKey }, i) => {
+            const entry = adopted[i];
+            if (entry?.uuid !== liveKey) {
+                throw new HttpError(409, 'Write target changed mid-write', {
+                    legacyCode: 'conflict',
+                });
+            }
+            entries[index] = entry;
+        });
+        return entries;
     }
 
     async completeUrlWrite(
@@ -3505,11 +3752,15 @@ export class FSService extends PuterService {
             writeRequest.fileMetadata,
             homeRegion,
         );
-        const [resolvedTarget] = await this.#resolveWriteTargets(userId, [
-            {
-                index: 0,
-                normalizedInput,
-            },
+        // The owner is read off the home segment, which deduping never changes.
+        const [[resolvedTarget], storageOwner] = await Promise.all([
+            this.#resolveWriteTargets(userId, [
+                {
+                    index: 0,
+                    normalizedInput,
+                },
+            ]),
+            this.#storageOwnerOf(normalizedInput.path, userId),
         ]);
         if (!resolvedTarget) {
             throw new Error('Failed to resolve write target');
@@ -3521,70 +3772,86 @@ export class FSService extends PuterService {
         normalizedInput.thumbnail = null;
 
         const existingSize = existingEntry?.size ?? 0;
-        const storageOwner = await this.#storageOwnerOf(
-            normalizedInput.path,
-            userId,
-        );
         const ownerAllowanceMax = this.#allowanceOverrideFor(
             storageOwner,
             userId,
             storageAllowanceMax,
         );
-        await this.#assertStorageAllowance(
+        const headroom = await this.#assertStorageAllowance(
             storageOwner,
             normalizedInput.size,
             existingSize,
             ownerAllowanceMax,
         );
+        const storageBudget: UploadByteBudget = {
+            remaining: headroom,
+            overflow: storageLimitError,
+        };
 
         const uploadBody = await this.#toUploadBody(
             writeRequest.fileContent,
             writeRequest.encoding,
             uploadTracker,
+            streamBudgetFor(normalizedInput.size, storageBudget),
         );
+        drawKnownLength(uploadBody, normalizedInput.size, storageBudget);
         const objectKey = existingEntry?.uuid ?? uuidv4();
-        await this.#uploadContent(
-            {
-                bucket: normalizedInput.bucket,
-                objectKey,
-                contentType: normalizedInput.contentType,
-                body: uploadBody.body,
-                ...(uploadBody.contentLength !== undefined
-                    ? { contentLength: uploadBody.contentLength }
-                    : {}),
-                ...(Number.isFinite(normalizedInput.size)
-                    ? { sizeHint: normalizedInput.size }
-                    : {}),
-            },
-            normalizedInput.bucketRegion,
-            uploadBody,
-        );
-
-        const uploadedSize = uploadBody.uploadedSize();
-        if (uploadTracker) {
-            const currentTrackedSize = Number(uploadTracker.progress ?? 0);
-            if (uploadedSize > currentTrackedSize) {
-                uploadTracker.add(uploadedSize - currentTrackedSize);
-            }
-        }
-        if (uploadedSize > normalizedInput.size) {
-            await this.#assertStorageAllowance(
-                storageOwner,
-                uploadedSize,
-                existingSize,
-                ownerAllowanceMax,
+        let contentHashSha256: string | null;
+        let fsEntry: FSEntry | undefined;
+        try {
+            await this.#uploadContent(
+                {
+                    bucket: normalizedInput.bucket,
+                    objectKey,
+                    contentType: normalizedInput.contentType,
+                    body: uploadBody.body,
+                    ...(uploadBody.contentLength !== undefined
+                        ? { contentLength: uploadBody.contentLength }
+                        : {}),
+                    ...(Number.isFinite(normalizedInput.size)
+                        ? { sizeHint: normalizedInput.size }
+                        : {}),
+                },
+                normalizedInput.bucketRegion,
+                uploadBody,
             );
-        }
-        normalizedInput.size = uploadedSize;
-        const contentHashSha256 = uploadBody.finalizeContentHashSha256
-            ? uploadBody.finalizeContentHashSha256()
-            : uploadBody.contentHashSha256;
 
-        const createInput = this.#toCreateInput(normalizedInput, objectKey);
-        const fsEntry = await this.stores.fsEntry.createEntry(
-            createInput,
-            normalizedInput.createMissingParents,
-        );
+            const uploadedSize = uploadBody.uploadedSize();
+            if (uploadTracker) {
+                const currentTrackedSize = Number(uploadTracker.progress ?? 0);
+                if (uploadedSize > currentTrackedSize) {
+                    uploadTracker.add(uploadedSize - currentTrackedSize);
+                }
+            }
+            if (uploadedSize > normalizedInput.size) {
+                await this.#assertStorageAllowance(
+                    storageOwner,
+                    uploadedSize,
+                    existingSize,
+                    ownerAllowanceMax,
+                );
+            }
+            normalizedInput.size = uploadedSize;
+            contentHashSha256 = uploadBody.finalizeContentHashSha256
+                ? uploadBody.finalizeContentHashSha256()
+                : uploadBody.contentHashSha256;
+
+            const createInput = this.#toCreateInput(normalizedInput, objectKey);
+            [fsEntry] = await this.#createUploadedEntries([createInput]);
+            if (!fsEntry) {
+                throw new Error('Failed to create entry');
+            }
+        } catch (error) {
+            // An overwrite's key is the live object; a new key is ours to drop.
+            if (!existingEntry) {
+                await this.#deleteUploadedObject(
+                    normalizedInput.bucket,
+                    objectKey,
+                    normalizedInput.bucketRegion,
+                );
+            }
+            throw error;
+        }
 
         this.#emitFsEvent(
             existingEntry ? 'fs.write.file' : 'fs.create.file',
@@ -3682,17 +3949,18 @@ export class FSService extends PuterService {
                 updates.filter(isValid),
             );
         let next = 0;
-        return updates.map((update): PromiseSettledResult<FSEntry> =>
-            isValid(update)
-                ? stored[next++]
-                : {
-                      status: 'rejected',
-                      reason: new HttpError(
-                          400,
-                          'Invalid file entry identifier for thumbnail update',
-                          { legacyCode: 'bad_request' },
-                      ),
-                  },
+        return updates.map(
+            (update): PromiseSettledResult<FSEntry> =>
+                isValid(update)
+                    ? stored[next++]
+                    : {
+                          status: 'rejected',
+                          reason: new HttpError(
+                              400,
+                              'Invalid file entry identifier for thumbnail update',
+                              { legacyCode: 'bad_request' },
+                          ),
+                      },
         );
     }
 
@@ -3905,7 +4173,7 @@ export class FSService extends PuterService {
                 this.stores.s3Object.resolveRegion(entry.bucketRegion),
             );
         } catch (err) {
-            if (isNoSuchKeyError(err)) {
+            if (isMissingObjectError(err)) {
                 await this.#handleGhostFile(entry, objectKey);
                 throw new HttpError(404, 'File contents are missing', {
                     legacyCode: 'subject_does_not_exist',
@@ -3997,7 +4265,9 @@ export class FSService extends PuterService {
                 parentPath === '/'
                     ? `/${candidate}`
                     : `${parentPath}/${candidate}`;
-            const existing = await repo.getEntryByPath(candidatePath);
+            const existing = await repo.getEntryByPath(candidatePath, {
+                foldedNames: true,
+            });
             if (!existing) return candidate;
         }
         throw new HttpError(
@@ -4064,13 +4334,21 @@ export class FSService extends PuterService {
         // reads as missing; a concurrent create lands in the unique-violation
         // handler below.
         const existingLookup = awaitLater(
-            this.stores.fsEntry.getEntryByPath(targetPath),
+            this.stores.fsEntry.getEntryByPath(targetPath, {
+                foldedNames: true,
+            }),
         );
         const parent = await parentLookup;
 
         let name = pathPosix.basename(targetPath);
         const existing = await existingLookup;
-        if (existing) {
+        if (
+            existing &&
+            holdsFoldedName(existing, childPath(parent.path, name))
+        ) {
+            if (!input.dedupeName) throw foldedNameConflict(name);
+            name = await this.#findDedupedName(parent, name);
+        } else if (existing) {
             if (existing.isDir) {
                 if (input.dedupeName) {
                     name = await this.#findDedupedName(parent, name);
@@ -4117,8 +4395,11 @@ export class FSService extends PuterService {
             // would surface the raw ER_DUP_ENTRY as a 500. Read primary too.
             const raced = await this.stores.fsEntry.getEntryByPath(
                 insertedPath,
-                { useTryHardRead: true },
+                { useTryHardRead: true, foldedNames: true },
             );
+            if (raced && holdsFoldedName(raced, insertedPath)) {
+                throw foldedNameConflict(name);
+            }
             if (raced?.isDir) return raced;
             if (raced) {
                 throw new HttpError(
@@ -4154,7 +4435,15 @@ export class FSService extends PuterService {
             !!input.createMissingParents,
         );
         const name = pathPosix.basename(targetPath);
-        const existing = await this.stores.fsEntry.getEntryByPath(targetPath);
+        const existing = await this.stores.fsEntry.getEntryByPath(targetPath, {
+            foldedNames: true,
+        });
+        if (
+            existing &&
+            holdsFoldedName(existing, childPath(parent.path, name))
+        ) {
+            throw foldedNameConflict(name);
+        }
         if (existing) {
             return this.stores.fsEntry.touchEntryTimestamps(existing.uuid, {
                 setAccessed: input.setAccessed,
@@ -4193,25 +4482,39 @@ export class FSService extends PuterService {
             parentPath === '/' ? `/${newName}` : `${parentPath}/${newName}`;
 
         // Reject if another entry already owns the target path.
-        const collision = await this.stores.fsEntry.getEntryByPath(newPath);
+        const collision = await this.stores.fsEntry.getEntryByPath(newPath, {
+            foldedNames: true,
+        });
+        const taken = (name: string) =>
+            new HttpError(409, `An entry named \`${name}\` already exists`, {
+                legacyCode: 'conflict',
+            });
         if (collision && collision.uuid !== entry.uuid) {
-            throw new HttpError(
-                409,
-                `An entry named \`${newName}\` already exists`,
-                { legacyCode: 'conflict' },
+            throw taken(
+                holdsFoldedName(collision, newPath) ? collision.name : newName,
             );
         }
 
-        const updated = await this.stores.fsEntry.updateEntry(entry.uuid, {
-            name: newName,
-            path: newPath,
-        });
+        let updated: FSEntry;
+        try {
+            updated = await this.stores.fsEntry.updateEntry(entry.uuid, {
+                name: newName,
+                path: newPath,
+            });
+        } catch (err) {
+            // Taken after the probe, or by a sibling it can't see through
+            // another spelling of the folder's path.
+            if (isUniqueViolation(err)) throw taken(newName);
+            throw err;
+        }
 
         if (entry.isDir) {
             await this.stores.fsEntry.updatePathPrefixForUser(
                 entry.userId,
                 entry.path,
                 newPath,
+                undefined,
+                entry.uuid,
             );
         }
         this.#emitFsEvent(
@@ -4247,7 +4550,9 @@ export class FSService extends PuterService {
             input.parent.path === '/'
                 ? `/${name}`
                 : `${input.parent.path}/${name}`;
-        const collision = await this.stores.fsEntry.getEntryByPath(childPath);
+        const collision = await this.stores.fsEntry.getEntryByPath(childPath, {
+            foldedNames: true,
+        });
         if (collision) {
             if (input.dedupeName) {
                 name = await this.#findDedupedName(input.parent, name);
@@ -4618,7 +4923,7 @@ export class FSService extends PuterService {
         try {
             const username = (await this.stores.user.getById(userId))?.username;
             if (!username) return;
-            const path = `/${username}/AppData/${appUid}`;
+            const path = appDataRootPath(username, appUid);
             const root = await this.stores.fsEntry.getEntryByPath(path, {
                 lineage: false,
                 skipCache: true,
@@ -5097,7 +5402,9 @@ export class FSService extends PuterService {
             input.newMetadata,
         );
 
-        const collision = await this.stores.fsEntry.getEntryByPath(targetPath);
+        const collision = await this.stores.fsEntry.getEntryByPath(targetPath, {
+            foldedNames: true,
+        });
         if (collision && collision.uuid !== source.uuid) {
             name = await this.#resolveMoveCollision(
                 userId,
@@ -5149,7 +5456,7 @@ export class FSService extends PuterService {
             if (!isUniqueViolation(err)) throw err;
             const raced = await this.stores.fsEntry.getEntryByPath(
                 pathIn(name),
-                { useTryHardRead: true },
+                { useTryHardRead: true, foldedNames: true },
             );
             if (raced && raced.uuid !== source.uuid) {
                 name = await this.#resolveMoveCollision(
@@ -5172,6 +5479,7 @@ export class FSService extends PuterService {
                 source.path,
                 finalPath,
                 newOwnerId,
+                source.uuid,
             );
         }
 
@@ -5228,7 +5536,11 @@ export class FSService extends PuterService {
         if (opts.intoRestrictedTrash) {
             return this.#findDedupedName(destinationParent, name);
         }
-        if (input.overwrite) {
+        const folded = holdsFoldedName(
+            occupant,
+            childPath(destinationParent.path, name),
+        );
+        if (input.overwrite && !folded) {
             this.#assertNotReplacingAncestor(source, occupant);
             await this.remove(userId, { entry: occupant, recursive: true });
             return name;
@@ -5236,13 +5548,19 @@ export class FSService extends PuterService {
         if (input.dedupeName) {
             return this.#findDedupedName(destinationParent, name);
         }
+        if (folded && input.overwrite) throw foldedNameConflict(name);
         // v1 wire contract: clients (the GUI's move/paste flows among them)
         // key on `item_with_same_name_exists` + `entry_name` to offer a
         // replace/skip prompt.
-        throw new HttpError(409, `An entry named \`${name}\` already exists`, {
-            legacyCode: 'item_with_same_name_exists',
-            fields: { entry_name: name },
-        });
+        const shownName = folded ? occupant.name : name;
+        throw new HttpError(
+            409,
+            `An entry named \`${shownName}\` already exists`,
+            {
+                legacyCode: 'item_with_same_name_exists',
+                fields: { entry_name: shownName },
+            },
+        );
     }
 
     /**
@@ -5304,9 +5622,16 @@ export class FSService extends PuterService {
                 ? `/${name}`
                 : `${destinationParent.path}/${name}`;
 
-        const collision = await this.stores.fsEntry.getEntryByPath(targetPath);
+        const collision = await this.stores.fsEntry.getEntryByPath(targetPath, {
+            foldedNames: true,
+        });
         // Overwriting the source would delete it before it is read.
         const replacesSource = collision?.uuid === source.uuid;
+        const replacesCollision =
+            !!collision &&
+            !!input.overwrite &&
+            !replacesSource &&
+            !holdsFoldedName(collision, targetPath);
 
         // A copy duplicates the bytes for real, so it costs the same against
         // the allowance as writing them. Check before the overwrite below
@@ -5322,14 +5647,14 @@ export class FSService extends PuterService {
         await this.#assertStorageAllowance(
             allowance.ownerId,
             await this.#entryStorageSize(source),
-            collision && input.overwrite && !replacesSource
+            collision && replacesCollision
                 ? await this.#entryStorageSize(collision)
                 : 0,
             allowance.max,
         );
 
         if (collision) {
-            if (input.overwrite && !replacesSource) {
+            if (replacesCollision) {
                 this.#assertNotReplacingAncestor(source, collision);
                 await this.remove(userId, {
                     entry: collision,
@@ -5337,18 +5662,23 @@ export class FSService extends PuterService {
                 });
             } else if (input.dedupeName) {
                 name = await this.#findDedupedName(destinationParent, name);
+            } else if (input.overwrite && !replacesSource) {
+                throw foldedNameConflict(name);
             } else if (input.overwrite) {
                 throw new HttpError(400, 'Cannot copy an item over itself', {
                     legacyCode: 'bad_request',
                 });
             } else {
                 // v1 wire contract, as in move() above.
+                const shownName = holdsFoldedName(collision, targetPath)
+                    ? collision.name
+                    : name;
                 throw new HttpError(
                     409,
-                    `An entry named \`${name}\` already exists`,
+                    `An entry named \`${shownName}\` already exists`,
                     {
                         legacyCode: 'item_with_same_name_exists',
-                        fields: { entry_name: name },
+                        fields: { entry_name: shownName },
                     },
                 );
             }
@@ -5569,7 +5899,7 @@ export class FSService extends PuterService {
         // A ghost file — DB row present with a non-null bucket but its backing
         // S3 object gone. Mirror `readContent`: clean up the orphan and surface
         // a 404 instead of the copy's NoSuchKey.
-        if (isNoSuchKeyError(reason)) {
+        if (isMissingObjectError(reason)) {
             await this.#handleGhostFile(
                 failed.item.source,
                 failed.item.source.uuid,

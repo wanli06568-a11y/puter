@@ -21,11 +21,21 @@
 import { GetObjectCommand } from '@aws-sdk/client-s3';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { existsSync } from 'node:fs';
+import { createServer, type Server } from 'node:http';
+import {
+    createServer as createTcpServer,
+    type AddressInfo,
+    type Server as TcpServer,
+} from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { IConfig } from '../../types';
-import { S3Client, withPresignHeadroom } from './S3Client';
+import {
+    S3_IDLE_SOCKET_TIMEOUT_MS,
+    S3Client,
+    withPresignHeadroom,
+} from './S3Client';
 
 const LOCAL_BUCKET = 'puter-local';
 
@@ -197,6 +207,77 @@ describe('S3Client — remote endpoint configuration', () => {
 
         expect(remote.partSize).toBe(64 * 1024 * 1024);
         expect(remote.maxSingleUploadSize).toBe(128 * 1024 * 1024);
+    });
+});
+
+describe('S3Client — bucket in another region', () => {
+    let server: Server;
+    let client: S3Client;
+    let signedRegions: string[];
+
+    // Answers like a bucket that lives in us-west-2: a request signed for any
+    // other region gets S3's 301 naming the bucket's region.
+    beforeEach(async () => {
+        signedRegions = [];
+        server = createServer((req, res) => {
+            const region =
+                /Credential=[^/]+\/\d{8}\/([^/]+)\//.exec(
+                    req.headers.authorization ?? '',
+                )?.[1] ?? '';
+            signedRegions.push(region);
+            if (region !== 'us-west-2') {
+                res.writeHead(301, {
+                    'content-type': 'application/xml',
+                    'x-amz-bucket-region': 'us-west-2',
+                });
+                res.end(
+                    '<?xml version="1.0" encoding="UTF-8"?><Error><Code>PermanentRedirect</Code><Message>The bucket you are attempting to access must be addressed using the specified endpoint.</Message></Error>',
+                );
+                return;
+            }
+            res.writeHead(200, {
+                'content-type': 'text/plain',
+                'content-length': '5',
+            });
+            res.end('hello');
+        });
+        await new Promise<void>((resolve) =>
+            server.listen(0, '127.0.0.1', resolve),
+        );
+        const { port } = server.address() as AddressInfo;
+        client = new S3Client({
+            port: 0,
+            extensions: [],
+            s3: {
+                s3Config: {
+                    endpoint: `http://127.0.0.1:${port}`,
+                    accessKeyId: 'fakeAccessKeyId',
+                    secretAccessKey: 'fakeSecretAccessKey',
+                    forcePathStyle: true,
+                },
+            },
+        } as unknown as IConfig);
+        await client.onServerStart();
+    });
+
+    afterEach(async () => {
+        await client.onServerShutdown();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    it("retries a read in the bucket's region when S3 redirects it", async () => {
+        const result = await client
+            .get('ap-northeast-2')
+            .send(
+                new GetObjectCommand({
+                    Bucket: 'other-bucket',
+                    Key: 'index.html',
+                }),
+            );
+
+        expect(await result.Body?.transformToString()).toBe('hello');
+        expect(signedRegions).toEqual(['ap-northeast-2', 'us-west-2']);
     });
 });
 
@@ -538,4 +619,73 @@ describe('withPresignHeadroom', () => {
         const left = identity.expiration!.getTime() - Date.now();
         expect(left).toBeGreaterThan(5 * 60 * 1000);
     });
+});
+
+describe('S3Client — pooled connections', () => {
+    let endpoint: TcpServer;
+    let client: S3Client;
+    const seen = { connections: 0, hangUps: 0 };
+
+    // Answers like S3 does: no keep-alive hint, and a request arriving on a
+    // connection idle past the limit gets a hang-up instead of a reply.
+    beforeEach(async () => {
+        const idleLimitMs = S3_IDLE_SOCKET_TIMEOUT_MS + 100;
+        seen.connections = 0;
+        seen.hangUps = 0;
+        endpoint = createTcpServer((socket) => {
+            seen.connections++;
+            let lastActive = Date.now();
+            socket.on('data', (chunk) => {
+                if (!chunk.includes('\r\n\r\n')) return;
+                if (Date.now() - lastActive >= idleLimitMs) {
+                    seen.hangUps++;
+                    socket.end();
+                    return;
+                }
+                socket.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
+                lastActive = Date.now();
+            });
+            socket.on('error', () => undefined);
+        });
+        await new Promise<void>((resolve) =>
+            endpoint.listen(0, '127.0.0.1', resolve),
+        );
+        const { port } = endpoint.address() as AddressInfo;
+        client = new S3Client({
+            port: 0,
+            extensions: [],
+            s3: {
+                s3Config: {
+                    endpoint: `http://127.0.0.1:${port}`,
+                    accessKeyId: 'fakeAccessKeyId',
+                    secretAccessKey: 'fakeSecretAccessKey',
+                    region: 'us-west-2',
+                    forcePathStyle: true,
+                },
+            },
+        } as unknown as IConfig);
+        await client.onServerStart();
+    });
+
+    afterEach(async () => {
+        await client.onServerShutdown();
+        endpoint.close();
+    });
+
+    it('reuses a connection that was used recently', async () => {
+        await client.headBucket('bucket');
+        await client.headBucket('bucket');
+
+        expect(seen).toEqual({ connections: 1, hangUps: 0 });
+    });
+
+    it('opens a new connection rather than reuse one idle long enough for S3 to drop', async () => {
+        await client.headBucket('bucket');
+        await new Promise((resolve) =>
+            setTimeout(resolve, S3_IDLE_SOCKET_TIMEOUT_MS + 300),
+        );
+        await client.headBucket('bucket');
+
+        expect(seen).toEqual({ connections: 2, hangUps: 0 });
+    }, 15_000);
 });

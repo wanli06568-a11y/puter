@@ -1,0 +1,414 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// Most models go through Google's OpenAI-compatible endpoint with the openai
+// SDK; native models and separately priced audio, including a video's audio
+// track, use generateContent.
+import {
+    type GenerateContentResponseUsageMetadata,
+    GoogleGenAI,
+} from '@google/genai';
+import { OpenAI } from 'openai';
+import { HttpError } from '../../../../../core/http/HttpError.js';
+import type { MeteringService } from '../../../../../services/metering/MeteringService.js';
+import type {
+    IChatModel,
+    ICompleteArguments,
+    PuterMessage,
+    UsageDetails,
+} from '../../../interfaces/chat/types.js';
+import type { IChatCompleteResult } from '../../../interfaces/chat/types.js';
+import {
+    parseDataUri,
+    requiredInputModalities,
+} from '../../../interfaces/chat/utils/mediaParts.js';
+import { inlineHttpVideoUrls } from '../../../protocols/openaiCompatible/inlineImages.js';
+import { toolChoiceToWire } from '../../../protocols/openaiCompatible/openaiParams.js';
+import { sdkClientOptions } from '../../../interfaces/chat/utils/sdkClient.js';
+import {
+    type ChatCompletionsClient,
+    type ChatProviderConfig,
+    OpenAICompatProvider,
+    type UsageSource,
+} from '../../../protocols/openaiCompatible/OpenAICompatProvider.js';
+import { usesGoogleGeminiEndpoint } from '../geminiRest.js';
+import { geminiNativeClient } from './geminiNative.js';
+import {
+    GEMINI_AUDIO_MODELS,
+    GEMINI_MODELS,
+    GEMINI_NATIVE_MODELS,
+} from './models.js';
+
+type GroundingContent = { grounding_metadata?: unknown };
+
+/** Some native models have a lower output cap when the response isn't streamed. */
+const nativeOutputCap = (
+    args: ICompleteArguments,
+    model: IChatModel,
+): number | undefined =>
+    args.stream
+        ? undefined
+        : GEMINI_NATIVE_MODELS.get(model.id)?.unaryMaxTokens;
+
+const COMPAT_BASE_URL =
+    'https://generativelanguage.googleapis.com/v1beta/openai/';
+
+/** The catalog without the native models, for a custom `apiBaseUrl`. */
+const COMPAT_ONLY_MODELS = GEMINI_MODELS.filter(
+    (m) => !GEMINI_NATIVE_MODELS.has(m.id),
+);
+
+export class GeminiChatProvider extends OpenAICompatProvider {
+    constructor(config: ChatProviderConfig, meteringService: MeteringService) {
+        const compat = new OpenAI({
+            apiKey: config.apiKey,
+            baseURL: config.apiBaseUrl ?? COMPAT_BASE_URL,
+            ...sdkClientOptions(),
+        });
+        // A custom base URL may be a proxy that only speaks the
+        // OpenAI-compatible API, so native models are left out rather than
+        // sent straight to Google.
+        const native = usesGoogleGeminiEndpoint(config.apiBaseUrl)
+            ? geminiNativeClient(new GoogleGenAI({ apiKey: config.apiKey }))
+            : undefined;
+        const client: ChatCompletionsClient = {
+            chat: {
+                completions: {
+                    create: (params, options) => {
+                        const { model, service_tier } = params as {
+                            model: string;
+                            service_tier?: string;
+                            messages?: PuterMessage[];
+                        };
+                        const modalities = GEMINI_AUDIO_MODELS.has(model)
+                            ? requiredInputModalities(
+                                  (params as { messages?: PuterMessage[] })
+                                      .messages,
+                              )
+                            : [];
+                        if (modalities.includes('audio') && !native) {
+                            throw new HttpError(
+                                400,
+                                'Audio input requires the native Gemini endpoint',
+                                { legacyCode: 'bad_request' },
+                            );
+                        }
+                        // A video's audio track is priced as audio too.
+                        const splitAudio =
+                            !!native &&
+                            (modalities.includes('audio') ||
+                                modalities.includes('video'));
+                        if (
+                            !splitAudio &&
+                            !GEMINI_NATIVE_MODELS.has(model) &&
+                            (service_tier === undefined || !native)
+                        ) {
+                            return compat.chat.completions.create(
+                                params,
+                                options,
+                            );
+                        }
+                        if (!native) {
+                            throw new HttpError(
+                                400,
+                                `Model not found: ${model}`,
+                                { legacyCode: 'bad_request' },
+                            );
+                        }
+                        return native.chat.completions.create(params, options);
+                    },
+                },
+            },
+        };
+        const models: IChatModel[] = native
+            ? GEMINI_MODELS
+            : COMPAT_ONLY_MODELS.map((model) => ({
+                  ...model,
+                  serviceSpeeds: ['standard'],
+              }));
+        super(meteringService, {
+            client,
+            defaultModel: 'gemini-2.5-flash',
+            models: () => models,
+            meteringPrefix: 'gemini',
+            maxTokensParam: 'max_completion_tokens',
+            passthrough: ['temperature'],
+            // Gemini 3.1+ rejects http(s) image URLs on Google's
+            // OpenAI-compatible endpoint (bodiless 400) but accepts data URLs;
+            // inline for every model rather than maintain a version list.
+            inlineImages: 'always',
+        });
+    }
+
+    /** Sizes the credit hold to the same output cap `vendorParams` sends. */
+    requestPricing(
+        args: ICompleteArguments,
+        model: IChatModel,
+    ): { maxTokens?: number } {
+        const maxTokens = nativeOutputCap(args, model);
+        return maxTokens === undefined ? {} : { maxTokens };
+    }
+
+    /** Google fetches no remote video, so it is inlined like images are. */
+    override async complete(
+        args: ICompleteArguments,
+        resolved?: IChatModel,
+        attemptPricingTime?: Date,
+    ): Promise<IChatCompleteResult> {
+        if (Array.isArray(args.messages)) {
+            await inlineHttpVideoUrls(args.messages);
+        }
+        return super.complete(args, resolved, attemptPricingTime);
+    }
+
+    protected override prepareMessages(messages: PuterMessage[]) {
+        return messages.map((message) => {
+            delete message.cache_control;
+            return Array.isArray(message.content)
+                ? { ...message, content: message.content.map(geminiPart) }
+                : message;
+        });
+    }
+
+    protected override vendorParams(
+        params: Record<string, unknown>,
+        args: ICompleteArguments,
+        model: IChatModel,
+    ) {
+        const native = GEMINI_NATIVE_MODELS.get(model.id);
+        if (!native) return params;
+        // Unset leaves the thinking level to Google's per-model default.
+        const effort = args.reasoning_effort ?? args.reasoning?.effort;
+        if (effort !== undefined && !native.reasoningEfforts.has(effort)) {
+            throw new HttpError(
+                400,
+                `reasoning_effort must be one of ${[...native.reasoningEfforts].join(', ')} for ${model.id}`,
+                { legacyCode: 'bad_request' },
+            );
+        }
+        const { temperature, ...shared } = params;
+        const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
+        const outputCap = nativeOutputCap(args, model);
+        const requested = params.max_completion_tokens as number | undefined;
+        return {
+            ...shared,
+            ...(native.temperature && temperature !== undefined
+                ? { temperature }
+                : {}),
+            ...(outputCap !== undefined
+                ? {
+                      max_completion_tokens: Math.min(
+                          requested ?? outputCap,
+                          outputCap,
+                      ),
+                  }
+                : {}),
+            ...(effort ? { reasoning_effort: effort } : {}),
+            ...(hasTools && args.tool_choice
+                ? { tool_choice: toolChoiceToWire(args.tool_choice, 'chat') }
+                : {}),
+        };
+    }
+
+    protected override preservesToolCallOrder(model: IChatModel) {
+        // Gemini expects parallel calls back in order, signature on the first.
+        return GEMINI_NATIVE_MODELS.has(model.id);
+    }
+
+    protected override keepsToolCallExtraContent() {
+        // Carries the thought signature Gemini needs replayed with each call.
+        return true;
+    }
+
+    protected override meteredUsage(source: UsageSource, model: IChatModel) {
+        if (
+            GEMINI_NATIVE_MODELS.has(model.id) ||
+            'promptTokenCount' in (source.usage ?? {})
+        ) {
+            return nativeMeteredUsage(
+                source.usage as unknown as
+                    GenerateContentResponseUsageMetadata | undefined,
+                model.costs.audio_tokens !== undefined,
+            );
+        }
+        // Non-stream grounding metadata lives in choices[0].message; a stream
+        // hands over what its handler accumulated as `extra_content`.
+        const { usage } = source;
+        const choices = source.choices as
+            | Array<{ message?: { extra_content?: GroundingContent } }>
+            | undefined;
+        const extraContent = source.extra_content as
+            GroundingContent | undefined;
+
+        const cached_tokens = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+        // Explicit reasoning counts are included in completions; otherwise Google
+        // reports thoughts only in the total, separate from visible output.
+        const thinking_tokens =
+            usage?.completion_tokens_details?.reasoning_tokens ??
+            Math.max(
+                0,
+                (count(usage?.total_tokens) ?? 0) -
+                    (usage?.prompt_tokens ?? 0) -
+                    (usage?.completion_tokens ?? 0),
+            );
+
+        return {
+            usage: {
+                prompt_tokens: (usage?.prompt_tokens ?? 0) - cached_tokens,
+                completion_tokens: Math.max(
+                    0,
+                    (usage?.completion_tokens ?? 0) -
+                        (usage?.completion_tokens_details?.reasoning_tokens ??
+                            0),
+                ),
+                cached_tokens,
+                thinking_tokens,
+                // Grounding search is a per-request fee not reflected in token counts
+                grounding_requests:
+                    (choices?.[0]?.message?.extra_content?.grounding_metadata ??
+                    extraContent?.grounding_metadata)
+                        ? 1
+                        : 0,
+            },
+        };
+    }
+}
+
+const AUDIO_FORMATS: Record<string, string> = {
+    mpeg: 'mp3',
+    'x-wav': 'wav',
+    wave: 'wav',
+};
+
+/**
+ * A content part as Google reads it: video as a data URL in `image_url`, and
+ * audio as bare base64 with a `wav` or `mp3` format, which an inlined Puter
+ * file isn't.
+ */
+const geminiPart = (part: unknown): unknown => {
+    if (!part || typeof part !== 'object') return part;
+    const { type, video_url, input_audio, ...rest } = part as {
+        type?: unknown;
+        video_url?: { url?: unknown };
+        input_audio?: { data?: unknown; format?: unknown };
+    };
+    if (
+        type === 'video_url' &&
+        typeof video_url?.url === 'string' &&
+        video_url.url.startsWith('data:')
+    ) {
+        return {
+            ...rest,
+            type: 'image_url',
+            image_url: { url: video_url.url },
+        };
+    }
+    if (
+        type === 'input_audio' &&
+        typeof input_audio?.data === 'string' &&
+        typeof input_audio.format === 'string'
+    ) {
+        const uri = input_audio.data.startsWith('data:')
+            ? parseDataUri(input_audio.data)
+            : null;
+        return {
+            ...rest,
+            type,
+            input_audio: {
+                ...input_audio,
+                data: uri?.base64 ? uri.data : input_audio.data,
+                format: AUDIO_FORMATS[input_audio.format] ?? input_audio.format,
+            },
+        };
+    }
+    return part;
+};
+
+const count = (value: number | undefined): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+
+/**
+ * Native `usageMetadata` as metered. Candidates and thoughts are separate
+ * output counts; cached tokens are part of the prompt. Metadata with no counts
+ * meters nothing, so the driver estimates the completion instead.
+ */
+const nativeMeteredUsage = (
+    metadata: GenerateContentResponseUsageMetadata | undefined,
+    splitAudio: boolean,
+): { usage: Record<string, number>; usageDetails?: UsageDetails } => {
+    const prompt = count(metadata?.promptTokenCount);
+    const candidates = count(metadata?.candidatesTokenCount);
+    const thoughts = count(metadata?.thoughtsTokenCount);
+    const cached = count(metadata?.cachedContentTokenCount) ?? 0;
+    // Server-tool prompt tokens; no server tool is ever enabled here.
+    const toolUse = count(metadata?.toolUsePromptTokenCount) ?? 0;
+    if (
+        prompt === undefined &&
+        candidates === undefined &&
+        thoughts === undefined &&
+        !cached &&
+        !toolUse
+    ) {
+        return { usage: {} };
+    }
+    const audioTokens = splitAudio
+        ? (metadata?.promptTokensDetails ?? [])
+              .filter((detail) => detail.modality === 'AUDIO')
+              .reduce(
+                  (total, detail) => total + (count(detail.tokenCount) ?? 0),
+                  0,
+              )
+        : 0;
+    const cachedAudioTokens = splitAudio
+        ? (metadata?.cacheTokensDetails ?? [])
+              .filter((detail) => detail.modality === 'AUDIO')
+              .reduce(
+                  (total, detail) => total + (count(detail.tokenCount) ?? 0),
+                  0,
+              )
+        : 0;
+    const inputTokens = Math.max(0, (prompt ?? 0) - cached);
+    return {
+        usage: {
+            prompt_tokens: Math.max(
+                0,
+                inputTokens - Math.max(0, audioTokens - cachedAudioTokens),
+            ),
+            ...(splitAudio
+                ? {
+                      audio_tokens: Math.max(
+                          0,
+                          audioTokens - cachedAudioTokens,
+                      ),
+                      cached_audio_tokens: cachedAudioTokens,
+                  }
+                : {}),
+            completion_tokens: candidates ?? 0,
+            thinking_tokens: thoughts ?? 0,
+            cached_tokens: Math.max(0, cached - cachedAudioTokens),
+            ...(toolUse ? { tool_use_prompt_tokens: toolUse } : {}),
+        },
+        usageDetails: {
+            inputTokens: inputTokens + toolUse,
+            outputTokens: (candidates ?? 0) + (thoughts ?? 0),
+            reasoningTokens: thoughts ?? 0,
+            ...(cached ? { cacheReadTokens: cached } : {}),
+        },
+    };
+};

@@ -17,33 +17,38 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { event as pdEvent } from '@pagerduty/pdjs';
 import { inspect } from 'node:util';
 import { createHash } from 'node:crypto';
 import type { IConfig, PagerSeverity, SeverityRule } from '../../types';
 import { PuterClient } from '../types';
 import {
     meetsMinSeverity,
+    resolveCallGroup,
     resolveSeverityOverride,
     withinMaxSeverity,
 } from './severity';
+import { createPagerDutyAlertHandler } from './pagerduty';
 import { createSlackAlertHandler } from './slack';
 import type {
     Alarm,
+    AlarmCall,
     AlarmFields,
     AlarmOptions,
+    AlertDelivery,
     AlertHandler,
     AlertPayload,
-    KnownErrorRule,
+    CallHandler,
 } from './types';
 
 export type {
     Alarm,
+    AlarmCall,
     AlarmFields,
     AlarmOptions,
+    AlertDelivery,
     AlertHandler,
     AlertPayload,
-    KnownErrorRule,
+    CallHandler,
 } from './types';
 export type { PagerSeverity } from '../../types';
 
@@ -60,14 +65,6 @@ interface RegisteredHandler {
 
 /** Severity used when neither the call site nor config picks one. */
 const FALLBACK_SEVERITY: PagerSeverity = 'critical';
-/**
- * How many recent occurrences an alarm keeps. A hot alarm repeats for as long
- * as the fault lasts, so retaining every occurrence means retaining every
- * message and field set it was ever raised with, request bodies and actors
- * included. The last few are what a human reads; the rest is only a count, and
- * `count` keeps that.
- */
-const OCCURRENCE_HISTORY_LIMIT = 20;
 /**
  * An alarm that hasn't recurred for this long is forgotten; its next occurrence
  * is a new alarm with a fresh count. Kept far past the chat transport's repeat
@@ -88,6 +85,10 @@ const REPEAT_REPORT_INTERVAL = 500;
 
 const shouldReportRepeat = (count: number): boolean =>
     count <= REPEAT_REPORT_BURST || count % REPEAT_REPORT_INTERVAL === 0;
+/** How often an unreported repeat re-sends its alarm's open call. */
+const CALL_REFRESH_MS = 60 * 1000;
+/** Longest a call waits on transports for links before it goes out without. */
+const CALL_LINK_WAIT_MS = 15 * 1000;
 /** Keeps `info` alarms out of the paging system unless config says otherwise. */
 const DEFAULT_PAGERDUTY_MIN_SEVERITY: PagerSeverity = 'warning';
 /** Slack's ceiling once a pager exists: chat gets what doesn't page. */
@@ -192,16 +193,16 @@ function cleanFields(fields: AlarmFields): Record<string, string> {
  * Manages system alarms and routes them to alert transports by severity.
  *
  * Severity is the routing decision: each transport declares the severity window
- * it accepts, so `critical` pages on-call while `info` only reaches the chat
- * channel. Config can retier or mute any alarm id after the fact — see
- * `pager.severityOverrides` in {@link IConfig}.
+ * it accepts, so `critical` pages on-call while `info` only reaches chat, where
+ * the alarm's `channel` key picks the channel. Config can retier or mute any
+ * alarm id after the fact (`pager.severityOverrides` in {@link IConfig}), and
+ * can mark ids that phone someone (`pager.calls`).
  */
 export class AlarmClient extends PuterClient {
     /** Ordered by last occurrence: a repeat moves its alarm to the back. */
     private alarms = new Map<string, Alarm>();
-    private aliases = new Map<string, Alarm>();
     private alertHandlers: RegisteredHandler[] = [];
-    private knownErrors: KnownErrorRule[] = [];
+    private callHandlers: CallHandler[] = [];
     private draining = false;
     private drainLogged = false;
 
@@ -235,29 +236,15 @@ export class AlarmClient extends PuterClient {
             return false;
         }
 
-        const serverId = this.config.serverId;
         const minSeverity =
             pagerDutyConf.minSeverity ?? DEFAULT_PAGERDUTY_MIN_SEVERITY;
 
         this.addAlertHandler(
-            async (alert) => {
-                await pdEvent({
-                    data: {
-                        routing_key: routingKey,
-                        event_action: 'trigger',
-                        dedup_key: alert.dedupKey,
-                        payload: {
-                            summary: alert.message,
-                            source: alert.source,
-                            severity: alert.severity,
-                            custom_details: {
-                                ...alert.custom,
-                                server_id: serverId,
-                            },
-                        },
-                    },
-                });
-            },
+            createPagerDutyAlertHandler({
+                routingKey,
+                apiToken: pagerDutyConf.apiToken,
+                serverId: this.config.serverId,
+            }),
             { name: 'pagerduty', minSeverity },
         );
 
@@ -271,8 +258,14 @@ export class AlarmClient extends PuterClient {
         const slackConf = this.config.pager?.slack;
         if (!slackConf?.enabled) return;
 
-        if (!slackConf.webhookUrl) {
-            console.warn('[alarm] Slack enabled but no webhookUrl configured');
+        if (!slackConf.botToken && !slackConf.webhookUrl) {
+            console.warn(
+                '[alarm] Slack enabled but no botToken or webhookUrl configured',
+            );
+            return;
+        }
+        if (slackConf.botToken && !slackConf.channel) {
+            console.warn('[alarm] Slack botToken needs a default channel');
             return;
         }
 
@@ -316,7 +309,8 @@ export class AlarmClient extends PuterClient {
      * afterwards, so the value here is the starting point, not the last word.
      *
      * Pass `{ dedup: true }` when repeats of this id are one recurring fault
-     * that should collapse into a single incident — see {@link AlarmOptions}.
+     * that should collapse into a single incident, and `channel` to post it to
+     * the chat channel of the area that owns it — see {@link AlarmOptions}.
      */
     create(
         id: string,
@@ -351,17 +345,17 @@ export class AlarmClient extends PuterClient {
             fields,
             severity,
             dedup: opts.dedup,
+            channel: opts.channel,
+            summary: opts.summary,
             started: Date.now(),
             // `recordOccurrence` below stamps the first occurrence; seeding one
             // here too would report every alarm as one occurrence ahead.
             count: 0,
-            timestamps: [],
-            occurrences: [],
+            lastSeen: 0,
         };
         if (fields.error) alarm.error = fields.error;
 
         this.alarms.set(id, alarm);
-        this.aliases.set(alarm.shortId, alarm);
         this.recordOccurrence(alarm, message, fields);
         this.evict();
         this.handleNew(alarm);
@@ -372,20 +366,14 @@ export class AlarmClient extends PuterClient {
         const alarm = this.alarms.get(id);
         if (!alarm) return;
 
-        this.forget(alarm);
+        this.alarms.delete(id);
         console.log(`[alarm] CLEAR ${displayId(alarm)} :: ${alarm.message}`);
-    }
-
-    /** Look up an alarm by its full ID or short ID. */
-    get(id: string): Alarm | undefined {
-        return this.alarms.get(id) ?? this.aliases.get(id);
     }
 
     /**
      * Register an additional alert handler. Handlers are called for every alarm
-     * that isn't suppressed by a known-error rule or muted by config, and whose
-     * severity falls inside the handler's own `minSeverity`..`maxSeverity`
-     * window (default: everything).
+     * that isn't muted by config and whose severity falls inside the handler's
+     * own `minSeverity`..`maxSeverity` window (default: everything).
      */
     addAlertHandler(
         handler: AlertHandler,
@@ -403,9 +391,13 @@ export class AlarmClient extends PuterClient {
         });
     }
 
-    /** Add rules that can suppress or adjust severity of known errors. */
-    setKnownErrors(rules: KnownErrorRule[]): void {
-        this.knownErrors = rules;
+    /**
+     * Register a handler for alarms `pager.calls.rules` says phone someone. It
+     * runs once the transports that took the alarm settle, with the links they
+     * returned. Call groups aren't resolved until one is registered.
+     */
+    addCallHandler(handler: CallHandler): void {
+        this.callHandlers.push(handler);
     }
 
     // -- Internals ----------------------------------------------------
@@ -417,22 +409,13 @@ export class AlarmClient extends PuterClient {
     private evict(): void {
         const now = Date.now();
         for (const alarm of this.alarms.values()) {
-            const lastSeen = alarm.timestamps.at(-1) ?? alarm.started;
             if (
                 this.alarms.size <= MAX_TRACKED_ALARMS &&
-                now - lastSeen < ALARM_IDLE_TTL_MS
+                now - alarm.lastSeen < ALARM_IDLE_TTL_MS
             ) {
                 return;
             }
-            this.forget(alarm);
-        }
-    }
-
-    private forget(alarm: Alarm): void {
-        this.alarms.delete(alarm.id);
-        // Short ids can collide; leave an alias that now names another alarm.
-        if (this.aliases.get(alarm.shortId) === alarm) {
-            this.aliases.delete(alarm.shortId);
+            this.alarms.delete(alarm.id);
         }
     }
 
@@ -441,86 +424,40 @@ export class AlarmClient extends PuterClient {
         message: string,
         fields: AlarmFields,
     ): void {
-        const now = Date.now();
         alarm.message = message;
         alarm.fields = { ...alarm.fields, ...fields };
         alarm.count++;
+        alarm.lastSeen = Date.now();
         if (fields.error) alarm.error = fields.error;
-
-        alarm.timestamps.push(now);
-        alarm.occurrences.push({ message, fields, timestamp: now });
-
-        if (alarm.timestamps.length > OCCURRENCE_HISTORY_LIMIT) {
-            alarm.timestamps.splice(
-                0,
-                alarm.timestamps.length - OCCURRENCE_HISTORY_LIMIT,
-            );
-            alarm.occurrences.splice(
-                0,
-                alarm.occurrences.length - OCCURRENCE_HISTORY_LIMIT,
-            );
-        }
-    }
-
-    private applyKnownErrors(alarm: Alarm): void {
-        for (const rule of this.knownErrors) {
-            if (!this.ruleMatches(rule, alarm)) continue;
-
-            switch (rule.action.type) {
-                case 'no-alert':
-                    alarm.noAlert = true;
-                    break;
-                case 'severity':
-                    alarm.severity = rule.action.value;
-                    break;
-            }
-        }
-    }
-
-    private ruleMatches(rule: KnownErrorRule, alarm: Alarm): boolean {
-        const { match } = rule;
-        if (match.id !== alarm.id) return false;
-        if (match.message && match.message !== alarm.message) return false;
-        if (match.fields) {
-            for (const [key, value] of Object.entries(match.fields)) {
-                if (alarm.fields[key] !== value) return false;
-            }
-        }
-        return true;
     }
 
     private handleNew(alarm: Alarm): void {
-        this.applyKnownErrors(alarm);
-
         console.error(`[alarm] ACTIVE ${displayId(alarm)} :: ${alarm.message}`);
 
         if (alarm.error) {
             console.error(alarm.error);
         }
 
-        if (alarm.noAlert) return;
-
         this.dispatchAlert(alarm);
     }
 
     private handleRepeat(alarm: Alarm): void {
-        this.applyKnownErrors(alarm);
-
-        if (!shouldReportRepeat(alarm.count)) return;
+        if (!shouldReportRepeat(alarm.count)) {
+            // Too frequent to report, but still firing: keep its call open.
+            if (alarm.call) this.refreshCall(alarm);
+            return;
+        }
 
         console.warn(
             `[alarm] REPEAT ${displayId(alarm)} :: ${alarm.message} (${alarm.count})`,
         );
 
-        if (alarm.noAlert) return;
-
         this.dispatchAlert(alarm);
     }
 
     /**
-     * Call-site severity, then any known-error rule (both already on the
-     * alarm), then the config override — so an operator always has the last
-     * word over what the code asked for.
+     * Call-site severity, then the config override, so an operator always has
+     * the last word over what the code asked for.
      */
     private resolveSeverity(alarm: Alarm): SeverityRule {
         const base =
@@ -558,9 +495,14 @@ export class AlarmClient extends PuterClient {
         }
         alarm.severity = resolved;
 
-        // Build nothing for a severity no transport accepts — the payload
-        // (cleaned fields plus the stack, twice) is the expensive part.
-        if (!this.hasHandlerFor(resolved)) return;
+        const callGroup =
+            this.callHandlers.length > 0
+                ? resolveCallGroup(alarm.id, this.config.pager?.calls?.rules)
+                : undefined;
+
+        // Build nothing for an alarm nothing takes — the payload (cleaned
+        // fields plus the stack, twice) is the expensive part.
+        if (!callGroup && !this.hasHandlerFor(resolved)) return;
 
         const fieldsClean = cleanFields(alarm.fields);
         const repeatCount = alarm.count;
@@ -584,6 +526,9 @@ export class AlarmClient extends PuterClient {
             trace: alarm.error?.stack,
             repeatCount,
             isRepeat: repeatCount > 1,
+            ...(alarm.channel ? { channel: alarm.channel } : {}),
+            ...(alarm.summary ? { summary: alarm.summary } : {}),
+            ...(callGroup ? { callGroup } : {}),
             custom: {
                 fields: fieldsClean,
                 trace: alarm.error?.stack,
@@ -591,15 +536,86 @@ export class AlarmClient extends PuterClient {
             },
         };
 
-        for (const { name, minSeverity, maxSeverity, handler } of this
-            .alertHandlers) {
-            if (!meetsMinSeverity(resolved, minSeverity)) continue;
-            if (!withinMaxSeverity(resolved, maxSeverity)) continue;
-            handler(payload).catch((err) => {
-                console.error(
-                    `[alarm] ${name} alert handler failed: ${err?.message}`,
-                );
-            });
+        const deliveries: Promise<AlertDelivery | undefined>[] = [];
+        for (const registered of this.alertHandlers) {
+            if (!meetsMinSeverity(resolved, registered.minSeverity)) continue;
+            if (!withinMaxSeverity(resolved, registered.maxSeverity)) continue;
+            deliveries.push(deliver(registered, payload));
         }
+
+        if (callGroup)
+            void this.raiseCall(alarm, payload, callGroup, deliveries);
+    }
+
+    /** A throttled repeat returns no link, so the last call's links carry over. */
+    private async raiseCall(
+        alarm: Alarm,
+        alert: AlertPayload,
+        group: string,
+        deliveries: Promise<AlertDelivery | undefined>[],
+    ): Promise<void> {
+        const links: string[] = [];
+        const collected = deliveries.map(async (delivery) => {
+            const url = (await delivery)?.url;
+            if (url) links.push(url);
+        });
+        let timer: NodeJS.Timeout | undefined;
+        await Promise.race([
+            Promise.all(collected),
+            new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, CALL_LINK_WAIT_MS);
+                timer.unref?.();
+            }),
+        ]);
+        clearTimeout(timer);
+
+        const call: AlarmCall = {
+            group,
+            alert,
+            links: links.length > 0 ? [...links] : (alarm.call?.links ?? []),
+        };
+        alarm.call = call;
+        await this.notifyCallHandlers(alarm, call);
+    }
+
+    private refreshCall(alarm: Alarm): void {
+        const { call, callAt = 0 } = alarm;
+        if (!call || Date.now() - callAt < CALL_REFRESH_MS) return;
+        void this.notifyCallHandlers(alarm, {
+            ...call,
+            alert: { ...call.alert, repeatCount: alarm.count, isRepeat: true },
+        });
+    }
+
+    private async notifyCallHandlers(
+        alarm: Alarm,
+        call: AlarmCall,
+    ): Promise<void> {
+        alarm.callAt = Date.now();
+        await Promise.all(
+            this.callHandlers.map(async (handler) => {
+                try {
+                    await handler(call);
+                } catch (err) {
+                    console.error(
+                        `[alarm] call handler failed for ${displayId(alarm)}: ${(err as Error)?.message}`,
+                    );
+                }
+            }),
+        );
+    }
+}
+
+/** Run one transport; a failure is logged and never reaches the others. */
+async function deliver(
+    { name, handler }: RegisteredHandler,
+    payload: AlertPayload,
+): Promise<AlertDelivery | undefined> {
+    try {
+        return (await handler(payload)) as AlertDelivery | undefined;
+    } catch (err) {
+        console.error(
+            `[alarm] ${name} alert handler failed: ${(err as Error)?.message}`,
+        );
     }
 }

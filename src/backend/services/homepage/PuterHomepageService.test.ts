@@ -63,7 +63,7 @@ describe('app browser embed shell', () => {
         const html = service.renderAppBrowserEmbed();
         const configJson = html.match(/id="app-browser-config">(.*?)<\/script>/)![1];
         expect(JSON.parse(configJson)).toEqual({
-            apiOrigin: 'https://api.deployment.test', sdkUrl, guestApps: [],
+            apiOrigin: 'https://api.deployment.test', sdkUrl, guestApps: [], hostOrigin: null,
         });
         expect(html).toContain('/dist/apps-embed.min.js');
         expect(html).not.toContain('/dist/bundle.min.js');
@@ -105,6 +105,37 @@ describe('app browser embed shell', () => {
         const configJson = html.match(/id="app-browser-config">(.*?)<\/script>/)![1];
         expect(JSON.parse(configJson).guestApps).toEqual(guestApps);
     });
+
+    it('names the page framing it', () => {
+        const html = makeService({}).renderAppBrowserEmbed({ hostOrigin: 'https://notes.deployment.test' });
+        const configJson = html.match(/id="app-browser-config">(.*?)<\/script>/)![1];
+        expect(JSON.parse(configJson).hostOrigin).toBe('https://notes.deployment.test');
+    });
+});
+
+describe('feedback embed shell', () => {
+    it('carries the framing page and API origin, and loads only its own script', () => {
+        const html = makeService({
+            api_base_url: 'https://api.deployment.test',
+            gui_bundle: '/static/bundle.min.js?v=42',
+        }).renderFeedbackEmbed({ hostOrigin: 'https://notes.deployment.test' });
+        const configJson = html.match(/id="feedback-embed-config">(.*?)<\/script>/)![1];
+        expect(JSON.parse(configJson)).toEqual({
+            apiOrigin: 'https://api.deployment.test',
+            hostOrigin: 'https://notes.deployment.test',
+        });
+        expect(html).toContain('<script defer src="/static/feedback-embed.min.js?v=42"></script>');
+        expect(html).toContain('<link rel="stylesheet" href="/css/feedback-embed.css">');
+        expect(html).toContain('<main id="feedback-embed"></main>');
+        expect(html).not.toContain('bundle.min.js');
+        expect(html).not.toContain('apps-embed');
+    });
+
+    it('carries no framing page when none is allowed', () => {
+        const html = makeService({}).renderFeedbackEmbed({ hostOrigin: null });
+        const configJson = html.match(/id="feedback-embed-config">(.*?)<\/script>/)![1];
+        expect(JSON.parse(configJson).hostOrigin).toBeNull();
+    });
 });
 
 /** Capture what the service sends, and return the rendered HTML. */
@@ -112,7 +143,6 @@ const render = async (
     service: PuterHomepageService,
     req: Request = makeReq(),
     meta: Record<string, unknown> = { title: 'Puter' },
-    launchOptions: Record<string, unknown> = {},
     actor: unknown = null,
 ): Promise<string> => {
     let sent = '';
@@ -124,7 +154,6 @@ const render = async (
     await service.send(
         { req, res, actor } as never,
         meta as never,
-        launchOptions as never,
     );
     return sent;
 };
@@ -267,7 +296,6 @@ describe('PuterHomepageService — gui() parameters', () => {
             asset_dir: '/dist',
             title: 'Editor',
             app: { name: 'editor' },
-            launch_options: {},
         });
         // No `config.origin`: fall back to the request's protocol + domain.
         expect(params.app_origin).toBe('http://puter.test');
@@ -284,6 +312,18 @@ describe('PuterHomepageService — gui() parameters', () => {
         const service = makeService({ domain: undefined });
         const params = guiParamsOf(await render(service));
         expect(params.app_origin).toBe('http://req-host.test');
+    });
+
+    it('names the configured AuthMe relays', async () => {
+        expect(
+            guiParamsOf(await render(makeService())).authmeRelayOrigins,
+        ).toEqual([]);
+        const service = makeService({
+            authmeRelayOrigins: ['https://relay.puter.test'],
+        });
+        expect(guiParamsOf(await render(service)).authmeRelayOrigins).toEqual([
+            'https://relay.puter.test',
+        ]);
     });
 
     it('reports captcha requirements from config', async () => {
@@ -313,7 +353,7 @@ describe('PuterHomepageService — gui() parameters', () => {
 
         const staff = { user: { id: 7, email: 'j@puter.com' } };
         expect(
-            guiParamsOf(await render(service, makeReq(), undefined, {}, staff))
+            guiParamsOf(await render(service, makeReq(), undefined, staff))
                 .teams_ui,
         ).toBe(true);
         expect(teamsAvailableTo).toHaveBeenCalledWith(7, 'j@puter.com');
@@ -324,7 +364,7 @@ describe('PuterHomepageService — gui() parameters', () => {
         teamsAvailableTo.mockResolvedValueOnce(false);
         expect(
             guiParamsOf(
-                await render(service, makeReq(), undefined, {}, {
+                await render(service, makeReq(), undefined, {
                     user: { id: 9, email: 'x@gmail.com' },
                 }),
             ).teams_ui,
@@ -394,22 +434,6 @@ describe('PuterHomepageService — gui() parameters', () => {
         const html = await render(service);
         expect(html).toContain('\\u003c/script>');
         expect(guiParamsOf(html).injected).toBe('</script><img src=x>');
-    });
-
-    it('passes launch options straight through', async () => {
-        const params = guiParamsOf(
-            await render(
-                makeService(),
-                makeReq(),
-                { title: 'Puter' },
-                {
-                    on_initialized: [{ do: 'thing' }],
-                },
-            ),
-        );
-        expect(params.launch_options).toEqual({
-            on_initialized: [{ do: 'thing' }],
-        });
     });
 });
 

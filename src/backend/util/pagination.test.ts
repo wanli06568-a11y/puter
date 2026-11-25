@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+    clampLimit,
     decodeCursor,
     encodeCursor,
     keysetPage,
@@ -7,6 +8,8 @@ import {
     normalizeOffset,
     openCursor,
     openIdCursor,
+    pageEnvelope,
+    parsePageQuery,
     sealCursor,
     unsealCursor,
 } from './pagination';
@@ -150,6 +153,14 @@ describe('pagination util', () => {
             expect(() => normalizeLimit(-5)).toThrowError(HttpError);
             expect(() => normalizeLimit('abc')).toThrowError(HttpError);
         });
+
+        it('throws 400 on a fraction that floors to zero', () => {
+            expect(() => normalizeLimit(0.5)).toThrowError(
+                'limit must be a positive number',
+            );
+            expect(() => normalizeLimit('0.99')).toThrowError(HttpError);
+            expect(normalizeLimit(1.5)).toBe(1);
+        });
     });
 
     describe('normalizeOffset', () => {
@@ -210,6 +221,24 @@ describe('pagination util', () => {
         it('refuses an unreadable cursor either way', () => {
             expect(() => openIdCursor('!!!', secret)).toThrowError(HttpError);
         });
+
+        it('reads only an integer or a digit string as the id', () => {
+            expect(openIdCursor({ id: '12' }, secret)).toBe(12);
+            for (const id of [null, [7], true, '7x', 1.5]) {
+                expect(openIdCursor({ id }, secret)).toBeNull();
+                expect(() =>
+                    openIdCursor({ id }, secret, { strict: true }),
+                ).toThrowError(HttpError);
+            }
+        });
+
+        it('refuses a cursor that is neither a string nor an object', () => {
+            for (const cursor of [5, true, ['x']]) {
+                expect(() =>
+                    openIdCursor(cursor as never, secret),
+                ).toThrowError(HttpError);
+            }
+        });
     });
 
     describe('keysetPage', () => {
@@ -235,5 +264,68 @@ describe('pagination util', () => {
             );
             expect(decodeCursor(page.cursor)).toEqual({ appUid: 'a' });
         });
+    });
+});
+
+describe('clampLimit', () => {
+    const opts = { fallback: 50, cap: 200 };
+
+    it('defaults a missing, zero or unreadable limit', () => {
+        expect(clampLimit(undefined, opts)).toBe(50);
+        expect(clampLimit(null, opts)).toBe(50);
+        expect(clampLimit(0, opts)).toBe(50);
+        expect(clampLimit('abc', opts)).toBe(50);
+    });
+
+    it('floors and keeps the limit within [1, cap]', () => {
+        expect(clampLimit('12.9', opts)).toBe(12);
+        expect(clampLimit(-5, opts)).toBe(1);
+        expect(clampLimit(10_000, opts)).toBe(200);
+    });
+});
+
+describe('parsePageQuery', () => {
+    it('reads limit, cursor and includeTotal', () => {
+        expect(
+            parsePageQuery(
+                { limit: '500', cursor: 'abc', includeTotal: 'true' },
+                { cap: 100 },
+            ),
+        ).toEqual({ limit: 100, cursor: 'abc', includeTotal: true });
+    });
+
+    it('leaves absent or non-string values out', () => {
+        expect(parsePageQuery({ cursor: ['a'], includeTotal: '1' })).toEqual({
+            limit: undefined,
+            cursor: undefined,
+            includeTotal: false,
+        });
+        expect(parsePageQuery(undefined)).toEqual({
+            limit: undefined,
+            cursor: undefined,
+            includeTotal: false,
+        });
+    });
+
+    it('refuses a bad limit', () => {
+        expect(() => parsePageQuery({ limit: '-1' })).toThrow(HttpError);
+    });
+});
+
+describe('pageEnvelope', () => {
+    it('includes cursor and total only when set', () => {
+        expect(pageEnvelope({ items: [1, 2] })).toEqual({ items: [1, 2] });
+        expect(
+            pageEnvelope({ items: [1], cursor: 'next', total: 0 }),
+        ).toEqual({ items: [1], cursor: 'next', total: 0 });
+        expect(pageEnvelope({ items: [], cursor: null })).toEqual({
+            items: [],
+        });
+    });
+
+    it('maps items when given a mapper', () => {
+        expect(
+            pageEnvelope({ items: [{ id: 1 }], cursor: 'c' }, (row) => row.id),
+        ).toEqual({ items: [1], cursor: 'c' });
     });
 });

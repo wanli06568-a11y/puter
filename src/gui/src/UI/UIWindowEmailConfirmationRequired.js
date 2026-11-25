@@ -19,13 +19,28 @@
 
 import UIWindow from './UIWindow.js';
 import UIAlert from './UIAlert.js';
+import UIWindowCardVerificationRequired from './UIWindowCardVerificationRequired.js';
+import UIWindowPhoneVerificationRequired from './UIWindowPhoneVerificationRequired.js';
+import postUserProtected from '../helpers/postUserProtected.js';
 
+/**
+ * Asks for the code sent to the user's email.
+ *
+ * @returns {Promise<boolean>} True once the email is confirmed, false when the
+ *   window closes without it. A logout, from its footer or anywhere else,
+ *   leaves it unsettled, so a gate that reopens it on false doesn't race the
+ *   logout.
+ */
 function UIWindowEmailConfirmationRequired (options) {
     return new Promise(async (resolve) => {
         options = options ?? {};
         options.window_options = options.window_options ?? {};
         let final_code = '';
         let is_checking_code = false;
+        let logging_out = false;
+        let submit_timer = null;
+        let code_sent = false;
+        let close_after_check = false;
 
         const submit_btn_txt = 'Confirm Email';
 
@@ -55,8 +70,35 @@ function UIWindowEmailConfirmationRequired (options) {
               </fieldset>`;
         h += `<button type="submit" class="button button-block button-primary email-confirm-btn" style="margin-top:10px;" disabled>${submit_btn_txt}</button>`;
         h += '</form>';
+        // A dead or mistyped address can be replaced by a dormant account that
+        // proves the number it had before; the server decides.
+        h += '<form class="email-change-form" style="display:none;" novalidate>';
+        h += '<div class="error email-change-error"></div>';
+        h += `<label for="email-change-new">${i18n('new_email')}</label>`;
+        h += '<input id="email-change-new" class="email-change-new" type="email" autocomplete="email" autocapitalize="off" spellcheck="false" style="width:100%; box-sizing:border-box;" />';
+        if ( ! window.user?.oidc_only ) {
+            h += `<label for="email-change-password" style="margin-top:10px; display:block;">${i18n('account_password')}</label>`;
+            h += '<input id="email-change-password" class="email-change-password" type="password" autocomplete="current-password" style="width:100%; box-sizing:border-box;" />';
+        }
+        if ( window.user?.otp ) {
+            h += `<label for="email-change-code" style="margin-top:10px; display:block;">${i18n('confirm_code_2fa_instruction')}</label>`;
+            h += '<input id="email-change-code" class="email-change-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" style="width:100%; box-sizing:border-box;" />';
+        }
+        h += `<button type="submit" class="button button-block button-primary email-change-submit" style="margin-top:14px;">${i18n('change_email')}</button>`;
+        h += '</form>';
+        h += '<div class="email-change-sent" style="display:none; text-align:center;">';
+        h += '<div class="error email-change-error"></div>';
+        h += `<p class="email-change-sent-msg">${i18n('email_change_confirmation_sent')}</p>`;
+        h += `<button type="button" class="button button-block button-primary email-change-continue">${i18n('continue')}</button>`;
+        h += '</div>';
         h += '<div style="text-align:center; padding:10px; font-size:14px; margin-top:10px;">';
         h += `<span class="send-conf-email">${i18n('resend_confirmation_code')}</span>`;
+        // Off where the window opens before this browser's session cookie is
+        // the gated account's: the change authenticates with that cookie.
+        if ( options.change_address !== false ) {
+            h += '<span class="send-conf-email-sep"> &bull; </span>';
+            h += `<span class="change-conf-email">${i18n('email_confirm_change_address')}</span>`;
+        }
         if ( options.logout_in_footer ) {
             h += ' &bull; ';
             h += `<span class="conf-email-log-out">${i18n('log_out')}</span>`;
@@ -92,6 +134,20 @@ function UIWindowEmailConfirmationRequired (options) {
             window_css: {
                 height: 'initial',
             },
+            // A code on its way to the server answers for the window, so the
+            // window waits for it. One not sent yet isn't sent.
+            on_before_exit: () => {
+                if ( code_sent && ! logging_out ) {
+                    close_after_check = true;
+                    return false;
+                }
+                clearTimeout(submit_timer);
+                return true;
+            },
+            // A no-op after a confirmation, which resolves first.
+            on_close: () => {
+                if ( ! logging_out && window.auth_token ) resolve(false);
+            },
             body_css: {
                 padding: '30px',
                 width: 'initial',
@@ -122,7 +178,8 @@ function UIWindowEmailConfirmationRequired (options) {
             // set animation
             $(el_window).find('.email-confirm-btn').html('<svg style="width:20px; margin-top: 5px;" xmlns="http://www.w3.org/2000/svg" height="24" width="24" viewBox="0 0 24 24"><title>circle anim</title><g fill="#fff" class="nc-icon-wrapper"><g class="nc-loop-circle-24-icon-f"><path d="M12 24a12 12 0 1 1 12-12 12.013 12.013 0 0 1-12 12zm0-22a10 10 0 1 0 10 10A10.011 10.011 0 0 0 12 2z" fill="#eee" opacity=".4"></path><path d="M24 12h-2A10.011 10.011 0 0 0 12 2V0a12.013 12.013 0 0 1 12 12z" data-color="color-2"></path></g><style>.nc-loop-circle-24-icon-f{--animation-duration:0.5s;transform-origin:12px 12px;animation:nc-loop-circle-anim var(--animation-duration) infinite linear}@keyframes nc-loop-circle-anim{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}</style></g></svg>');
 
-            setTimeout(() => {
+            submit_timer = setTimeout(() => {
+                code_sent = true;
                 $.ajax({
                     url: `${window.api_origin }/confirm-email`,
                     type: 'POST',
@@ -141,11 +198,15 @@ function UIWindowEmailConfirmationRequired (options) {
                     },
                     success: function (res) {
                         if ( res.email_confirmed ) {
+                            // Callers check window.user next, before the refresh lands.
+                            if ( window.user ) window.user.email_confirmed = true;
+                            resolve(true);
+                            code_sent = false;
+                            close_after_check = false;
                             $(el_window).close();
                             window.refresh_user_data(window.auth_token);
-                            resolve(true);
                         } else {
-                            $(el_window).find('.error').html('Invalid confirmation code.');
+                            $(el_window).find('.error').not('.email-change-error').html('Invalid confirmation code.');
                             $(el_window).find('.error').fadeIn();
                             $(el_window).find('.digit-input').val('');
                             $(el_window).find('.digit-input').first().focus();
@@ -155,7 +216,8 @@ function UIWindowEmailConfirmationRequired (options) {
                         }
                     },
                     error: function (res) {
-                        $(el_window).find('.error').html(html_encode(res.responseJSON.error));
+                        // A network failure has no body to read.
+                        $(el_window).find('.error').not('.email-change-error').html(html_encode(res.responseJSON?.error ?? i18n('error_unknown_cause')));
                         $(el_window).find('.error').fadeIn();
                         $(el_window).find('.digit-input').val('');
                         $(el_window).find('.digit-input').first().focus();
@@ -165,6 +227,8 @@ function UIWindowEmailConfirmationRequired (options) {
                     },
                     complete: function () {
                         is_checking_code = false;
+                        code_sent = false;
+                        if ( close_after_check ) $(el_window).close();
                     },
                 });
             }, 1000);
@@ -172,6 +236,7 @@ function UIWindowEmailConfirmationRequired (options) {
 
         // send email confirmation
         $(el_window).find('.send-conf-email').on('click', function (e) {
+            $(el_window).find('.error').hide();
             $.ajax({
                 url: `${window.api_origin }/send-confirm-email`,
                 type: 'POST',
@@ -194,19 +259,118 @@ function UIWindowEmailConfirmationRequired (options) {
                     });
                     $(el_window).find('.digit-input').first().focus();
                 },
-                complete: function () {
+                error: function (res) {
+                    $(el_window).find('.error').not('.email-change-error').html(html_encode(res.responseJSON?.error ?? i18n('error_unknown_cause')));
+                    $(el_window).find('.error').fadeIn();
                 },
             });
         });
 
+        // -- Replacing the address --
+        let changing = false;
+        const $codeForm = $(el_window).find('form').first();
+        const $changeForm = $(el_window).find('.email-change-form');
+        const $changeSent = $(el_window).find('.email-change-sent');
+        const showChangeError = ($in, msg) => {
+            $in.find('.email-change-error').html(html_encode(msg)).fadeIn();
+        };
+        const showCodeStep = () => {
+            $changeForm.hide();
+            $changeSent.hide();
+            $codeForm.show();
+            $(el_window).find('.send-conf-email, .send-conf-email-sep').show();
+            $(el_window).find('.change-conf-email').text(i18n('email_confirm_change_address', [], false));
+            $(el_window).find('.digit-input').first().focus();
+        };
+        $(el_window).find('.change-conf-email').on('click', function () {
+            if ( changing ) return;
+            if ( $changeForm.is(':visible') || $changeSent.is(':visible') ) {
+                showCodeStep();
+                return;
+            }
+            $codeForm.hide();
+            $(el_window).find('.send-conf-email, .send-conf-email-sep').hide();
+            $changeForm.find('.email-change-error').hide();
+            $changeForm.show();
+            $(this).text(i18n('back', [], false));
+            $changeForm.find('.email-change-new').focus();
+        });
+
+        // A phone or card step the account still owes; resolves whether it cleared.
+        const clearPendingGate = async (data) => {
+            const gate_options = {
+                stay_on_top: true,
+                has_head: false,
+                window_options: { is_draggable: true },
+            };
+            // The phone window reads which number the code goes to.
+            await window.refresh_user_data(window.auth_token);
+            return Boolean(data.code === 'card_verification_required'
+                ? await UIWindowCardVerificationRequired(gate_options)
+                : await UIWindowPhoneVerificationRequired(gate_options));
+        };
+
+        $changeForm.on('submit', async function (e) {
+            e.preventDefault();
+            if ( changing ) return;
+            $changeForm.find('.email-change-error').hide();
+            const new_email = String($changeForm.find('.email-change-new').val() ?? '').trim();
+            const password = $changeForm.find('.email-change-password').val() || undefined;
+            const code = $changeForm.find('.email-change-code').val() || undefined;
+            if ( ! new_email || (! window.user?.oidc_only && ! password) ) {
+                showChangeError($changeForm, i18n('all_fields_required', [], false));
+                return;
+            }
+            if ( new_email.toLowerCase() === String(window.user?.email).toLowerCase() ) {
+                showChangeError($changeForm, i18n('email_unchanged', [], false));
+                return;
+            }
+            changing = true;
+            $changeForm.find('.email-change-submit').prop('disabled', true);
+            try {
+                const submit = () => postUserProtected('change-email', { new_email, code }, { password });
+                let result = await submit();
+                if ( ! result.ok && ['phone_verification_required', 'card_verification_required'].includes(result.data.code) ) {
+                    if ( ! await clearPendingGate(result.data) ) return;
+                    result = await submit();
+                }
+                if ( ! result.ok ) {
+                    // Nothing on the account from before vouches for the change.
+                    showChangeError($changeForm, result.data.code === 'email_confirmation_required'
+                        ? i18n('email_change_needs_code', [], false)
+                        : result.message);
+                    return;
+                }
+                $changeForm.hide();
+                $changeSent.find('.email-change-error').hide();
+                $changeSent.show();
+            } finally {
+                changing = false;
+                $changeForm.find('.email-change-submit').prop('disabled', false);
+            }
+        });
+
+        // The emailed link confirms the new address; this checks it was followed.
+        $changeSent.find('.email-change-continue').on('click', async function () {
+            $changeSent.find('.email-change-error').hide();
+            await window.refresh_user_data(window.auth_token);
+            if ( window.user?.email_confirmed || ! window.user?.requires_email_confirmation ) {
+                resolve(true);
+                $(el_window).close();
+                return;
+            }
+            showChangeError($changeSent, i18n('email_change_not_confirmed', [], false));
+        });
+
         // logout
         $(el_window).find('.conf-email-log-out').on('click', function (e) {
+            logging_out = true;
             window.logout();
             $(el_window).close();
         });
 
         // Elements
-        const numberCodeForm = document.querySelector('[data-number-code-form]');
+        const numberCodeForm = $(el_window).find('[data-number-code-form]').get(0);
         const numberCodeInputs = [...numberCodeForm.querySelectorAll('[data-number-code-input]')];
 
         // Event listeners

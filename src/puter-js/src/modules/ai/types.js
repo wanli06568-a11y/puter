@@ -35,6 +35,13 @@
  */
 
 /**
+ * A tool the model's provider runs itself, such as web search.
+ *
+ * @typedef {Object} BuiltInTool
+ * @property {'web_search'} type
+ */
+
+/**
  * One message in a chat conversation.
  *
  * @typedef {Object} ChatMessage
@@ -55,6 +62,12 @@
  */
 
 /**
+ * Preferred service speed for a chat completion.
+ *
+ * @typedef {'standard' | 'fast' | 'ultrafast'} ServiceSpeed
+ */
+
+/**
  * Options for a chat completion request.
  *
  * @typedef {Object} ChatOptions
@@ -64,12 +77,19 @@
  * @property {number} [temperature] Sampling temperature between 0 and 2. Lower values are more focused
  * and deterministic, higher values more random. Defaults to the model's own default.
  * @property {number} [max_tokens]
- * @property {boolean} [vision]
+ * @property {boolean} [vision] Deprecated and ignored. Passing an image sets it automatically.
  * @property {string} [driver]
  * @property {string} [provider] The provider to route the request through.
+ * @property {'fast' | 'standard'} [speed] Claude inference speed. Faster service may cost more.
+ * An explicit serviceSpeed takes precedence.
+ * @property {ServiceSpeed} [serviceSpeed] Preferred service speed. Falls back to
+ * fast, then standard when the requested speed is unavailable. Faster service may cost more.
  * @property {boolean} [fallback] Set to `false` to fail the request when the first provider tried
  * fails, instead of retrying it on another provider that serves the same model.
- * @property {Tool[]} [tools] Function/tool definitions the model can call. See Function Calling.
+ * @property {boolean} [refusalFallback] Claude only. Set to `false` to get a declined request's
+ * refusal as it is, instead of an answer from another Claude model.
+ * @property {(Tool | BuiltInTool)[]} [tools] Function definitions the model can call, or a built-in
+ * tool such as `{ type: 'web_search' }`. See Function Calling.
  * @property {boolean} [normalize] Response-format control for non-streaming results. `true` returns the
  * OpenAI-style shape regardless of provider or release date (`message.content` as a string,
  * `message.tool_calls`, a mapped `finish_reason`); `false` forces the provider's native shape. Left
@@ -148,9 +168,21 @@
  * @property {number} [webSearchRequests]
  * @property {number} [webFetchRequests]
  * @property {'fast' | 'standard'} [speed]
+ * @property {ServiceSpeed} [serviceSpeed]
  * @property {string} [serviceTier]
+ * @property {string} [fallbackModel] The model that produced the response, when a declined request
+ * ran again on a model other than the requested one (Claude).
  * @property {Array<{ type: string, model?: string, inputTokens: number, outputTokens: number, cacheReadTokens?: number, cacheWrite5mTokens?: number, cacheWrite30mTokens?: number, cacheWrite1hTokens?: number, cacheWrite12hTokens?: number }>} [iterations]
  * Per-pass breakdown when the upstream ran several passes (compaction, an advisor sub-call).
+ */
+
+/**
+ * A handoff of a declined request from one model to another.
+ *
+ * @typedef {Object} RefusalFallback
+ * @property {{ model: string }} from The model that declined.
+ * @property {{ model: string }} to The model that took over.
+ * @property {{ type: string, category: string | null }} trigger Why `from` declined.
  */
 
 /**
@@ -174,6 +206,8 @@
  * @property {string | null} [stopSequence] The stop sequence that ended generation, when one did.
  * @property {Record<string, unknown> | null} [stopDetails] Extra detail on why generation stopped
  * (e.g. a refusal classification). Provider-specific.
+ * @property {RefusalFallback[]} [refusalFallbacks] One entry per switch, in order, when a declined
+ * request ran again on another model (Claude).
  * @property {Record<string, number>} [usage] Token counts under provider-specific keys, plus `cost`:
  * what the request was charged, in microcents ($0.01 = 1,000,000).
  * @property {UsageDetails} [usageDetails] Provider-neutral usage breakdown — prefer this over `usage`
@@ -187,7 +221,8 @@
  * @typedef {Object} ChatResponseChunk
  * @property {string} type The kind of chunk: `"text"`, `"reasoning"`, `"reasoning_start"`,
  * `"reasoning_detail"`, `"image"`, `"tool_use"`, `"tool_use_start"`, `"tool_input_delta"`,
- * `"server_tool"`, `"safeguard_results"`, `"compaction"`, `"extra_content"`, `"usage"`, or `"error"`.
+ * `"server_tool"`, `"safeguard_results"`, `"refusal_fallback"`, `"compaction"`, `"extra_content"`,
+ * `"usage"`, or `"error"`.
  * @property {string} [text] Text delta. Present on `"text"` chunks.
  * @property {string} [reasoning] Reasoning/thinking delta. Present on `"reasoning"` chunks.
  * @property {string} [format] Reasoning artifact format (currently only `"anthropic"`). Present on
@@ -210,6 +245,12 @@
  * @property {unknown[]} [results] Dangerous-tool-use classifier verdicts, keyed by the `tool_use` id
  * they judged. Present on `"safeguard_results"` chunks — Claude only, and only when the upstream
  * actually sent them.
+ * @property {{ model: string }} [from] The model that declined. Present on `"refusal_fallback"`
+ * chunks.
+ * @property {{ model: string }} [to] The model the request runs again on. Present on
+ * `"refusal_fallback"` chunks.
+ * @property {{ type: string, category: string | null }} [trigger] Why `from` declined. Present on
+ * `"refusal_fallback"` chunks.
  * @property {string} [encrypted_content] Opaque/encrypted compaction summary. Present on
  * `"compaction"` chunks — the same shape regardless of which provider served the request. Resend it in
  * `messages` on the next turn in place of the summarized history.
@@ -276,12 +317,12 @@
  * default applies: `'gpt-image-2.6-flare'` (OpenAI, preferred when no provider is given),
  * `'gemini-3.1-flash-image'` (Gemini), `'@cf/black-forest-labs/flux-1-schnell'` (Cloudflare),
  * `'grok-imagine-image'` (xAI), `'black-forest-labs/flux-schnell'` (Replicate),
- * `'seedream-5-0-lite-260128'` (BytePlus), or `'kling-v3'` (Kling).
+ * `'seedream-5-0-lite-260128'` (BytePlus).
  * @property {string} [quality] Image quality / output size tier. Interpretation is provider- and
  * model-specific: OpenAI GPT models take `'high'` | `'medium'` | `'low'` (default `'low'`),
  * `gpt-image-2` also accepts `'auto'`, and the `gpt-image-2.5-*` / `gpt-image-2.6-*` models also
  * accept `'xhigh'` | `'max'` | `'auto'`; Gemini takes an output size tier `'512'` | `'1K'` | `'2K'` |
- * `'4K'` (availability varies by model); Kling takes `'1k'` (default) | `'2k'`, and `'4k'` on `kling-v3-omni`.
+ * `'4K'` (availability varies by model).
  * @property {string} [resolution] xAI output resolution: `'1k'` (default) or `'2k'`; model-specific resolution tier on Replicate.
  * On `grok-imagine-image-2.0`, `quality` independently accepts `'low'`, `'medium'`, or `'auto'`.
  * The older xAI models also accept the resolution through `quality` for compatibility.
@@ -289,13 +330,12 @@
  * Puter file path, or Blob or File. A Blob, File or data URI over 1 MiB is uploaded to a temporary
  * Puter file for the call and deleted afterwards.
  * @property {Array<string | Blob>} [input_images] Reference images, in any form `input_image` takes.
- * Model support varies. xAI accepts up to 5; Kling Omni and O1 up to 10; Together, Cloudflare and the
- * other Kling models accept one.
+ * Model support varies. xAI accepts up to 5; Together and Cloudflare accept one.
  * @property {string} [input_image_mime_type] MIME type of the input image(s), e.g. `'image/png'`. Used
  * as a fallback when the type cannot be auto-detected (Gemini).
  * @property {string} [driver] Legacy driver ID, e.g. `'xai-image-generation'`.
  * @property {string} [provider] Provider name: `'openai'`, `'gemini'`, `'together'`, `'cloudflare'`,
- * `'xai'`, `'replicate'`, `'byteplus'`, or `'kling'`. Full `*-image-generation` IDs also work.
+ * `'xai'`, `'replicate'`, or `'byteplus'`. Full `*-image-generation` IDs also work.
  * Prefers this provider when it offers the model; otherwise a known model selects its provider.
  * Routes excluded by data policy reject with `bad_request`; Together image routes are currently excluded.
  * @property {string} [service] Ignored; retained for compatibility. Use `provider` or `driver` to select a provider.
@@ -377,18 +417,15 @@
  * PNG, JPEG or WebP image up to 5 MiB.
  * @property {string | Blob} [last_frame] Last-frame image, same formats as `input_reference`.
  * @property {string | Blob} [inputVideo] Source video to edit, described by the prompt: a URL, Puter
- * file path, Blob or File of at most 32 MiB (200 MiB on Kling), or a data URI. A Blob, File or data
+ * file path, Blob or File of at most 32 MiB, or a data URI. A Blob, File or data
  * URI over 1 MiB is uploaded to a temporary Puter file for the call and deleted afterwards. Only
  * `'gemini-omni-1.1-flash'` (MP4, QuickTime or WebM, up to 10 seconds),
- * `'togetherai:black-forest-labs/flux-3'`, `'kling-3.0-omni'` and `'kling-o1'` (MP4 or QuickTime,
- * 3 to 15.5 or 10 seconds, no data URI) accept it. Can't be combined with frame images.
+ * and `'togetherai:black-forest-labs/flux-3'` accept it. Can't be combined with frame images.
  * @property {Array<string | Blob>} [reference_images] Subject/style reference images, same formats as
- * `input_reference`. Seedance 2.0: up to 9; Seedance 2.5: up to 30; Kling Omni and O1: up to 7 (4 with
- * `inputVideo`); Together: model-dependent.
+ * `input_reference`. Seedance 2.0: up to 9; Seedance 2.5: up to 30; Together: model-dependent.
  * @property {string} [negative_prompt] What to keep out of the video (Together).
  * @property {boolean} [generate_audio] Generate a soundtrack on models that support audio (Seedance 2.x,
- * Kling and Together models with audio). Defaults to `true` on Seedance and `false` on Kling. On a Kling
- * edit, `false` drops the source video's sound.
+ * Together models with audio). Defaults to `true` on Seedance. Kling models always include audio.
  * @property {number} [seed] Random seed (Together, Seedance 1.x).
  * @property {number} [width] Output width in pixels on Together models sized in pixels; with `height`,
  * selects the aspect ratio on Seedance and Wan 2.7. Filled in from `size` when omitted. On Gemini
@@ -412,17 +449,16 @@
  * Options for `txt2speech()`.
  *
  * @typedef {Object} Txt2SpeechOptions
- * @property {string} [text] Text to synthesize. At most 3000 characters, or 1000 on Kling.
+ * @property {string} [text] Text to synthesize. At most 3000 characters.
  * @property {string} [language] Language code. For AWS Polly defaults to `'en-US'`; for xAI a BCP-47
- * code defaulting to `'en'` (supports `'auto'`); for Kling `'en'` or `'zh'`, defaulting to the voice's
- * first language.
+ * code defaulting to `'en'` (supports `'auto'`).
  * @property {string} [voice] Voice ID used for synthesis (provider-specific). Defaults to `'Joanna'`
  * (aws-polly), `'alloy'` (openai), `'21m00Tcm4TlvDq8ikWAM'` (elevenlabs), `'Kore'` (gemini), `'eve'`
- * (xai), `'geffen_32'` (speechify), `'oversea_male1'` (kling).
+ * (xai), `'geffen_32'` (speechify).
  * @property {string} [engine] AWS Polly synthesis engine: `'standard'` (default), `'neural'`,
  * `'long-form'`, or `'generative'`.
  * @property {string} [provider] TTS provider: `'aws-polly'` (default), `'openai'`, `'elevenlabs'`,
- * `'gemini'`, `'xai'`, `'speechify'`, or `'kling'`. Common aliases (`'eleven'`, `'google'`, `'grok'`, `'polly'`,
+ * `'gemini'`, `'xai'`, `'speechify'`. Common aliases (`'eleven'`, `'google'`, `'grok'`, `'polly'`,
  * `'simba'`, …) resolve to these.
  * @property {string} [model] Model identifier (provider-specific).
  * @property {string} [response_format] OpenAI output format: `'mp3'` (default), `'wav'`, `'opus'`,
@@ -432,7 +468,7 @@
  * @property {string} [instructions] Natural-language guidance for voice style such as tone, speed, and
  * mood (OpenAI and Gemini). At most 3000 characters for Gemini.
  * @property {Record<string, unknown>} [voice_settings] ElevenLabs voice tuning options (e.g. stability,
- * similarity boost, speed). Kling reads only `speed`, from 0.8 to 2.0.
+ * similarity boost, speed).
  * @property {boolean} [ssml] When `true`, AWS Polly treats `text` as SSML markup.
  * @property {boolean} [test_mode] When `true`, returns a sample audio without using credits.
  */
@@ -602,7 +638,7 @@ export {};
 /**
  * Session settings for a live conversation.
  *
- * @typedef {Object} ConvoSessionOptions
+ * @typedef {Object} RealtimeSessionOptions
  * @property {string} [instructions] Instructions, up to 8192 characters.
  * @property {('text' | 'audio')[]} [output] Defaults to audio. Audio includes transcript events.
  * @property {string} [voice] OpenAI voice identifier, up to 128 characters.
@@ -611,12 +647,12 @@ export {};
 /**
  * Options for preparing a conversation.
  *
- * @typedef {ConvoSessionOptions & { model?: string }} ConvoOptions
+ * @typedef {RealtimeSessionOptions & { model?: string }} RealtimeOptions
  */
 /**
  * How much of an assistant audio item a custom player has played.
  *
- * @typedef {Object} ConvoPlaybackPosition
+ * @typedef {Object} RealtimePlaybackPosition
  * @property {string} itemId Assistant message item ID.
  * @property {number} contentIndex Audio content index.
  * @property {number} playedMs Played duration in milliseconds.
@@ -624,24 +660,24 @@ export {};
 /**
  * Built-in speaker options.
  *
- * @typedef {Object} ConvoSpeakerOptions
+ * @typedef {Object} RealtimeSpeakerOptions
  * @property {boolean} [bargeIn] Stop replies when user speech is detected. Defaults to true.
  */
 
 /**
- * @typedef {{ type: 'text'; delta: string; responseId: string }} ConvoTextEvent */
+ * @typedef {{ type: 'text'; delta: string; responseId: string }} RealtimeTextEvent */
 /**
- * @typedef {{ type: 'audio'; pcm: Int16Array; sampleRate: number; responseId: string; itemId: string; contentIndex: number }} ConvoAudioEvent */
+ * @typedef {{ type: 'audio'; pcm: Int16Array; sampleRate: number; responseId: string; itemId: string; contentIndex: number }} RealtimeAudioEvent */
 /**
- * @typedef {{ type: 'transcript'; role: 'user' | 'assistant'; text: string; final: boolean }} ConvoTranscriptEvent */
+ * @typedef {{ type: 'transcript'; role: 'user' | 'assistant'; text: string; final: boolean }} RealtimeTranscriptEvent */
 /**
- * @typedef {{ type: 'interrupted'; source: 'manual' | 'speech'; responseId: string }} ConvoInterruptedEvent */
+ * @typedef {{ type: 'interrupted'; source: 'manual' | 'speech'; responseId: string }} RealtimeInterruptedEvent */
 /**
  * A finished reply. `usage` and `status` are OpenAI's, unchanged.
- * @typedef {{ type: 'turn.done'; responseId: string | undefined; usage: unknown; status: unknown }} ConvoTurnDoneEvent */
+ * @typedef {{ type: 'turn.done'; responseId: string | undefined; usage: unknown; status: unknown }} RealtimeTurnDoneEvent */
 /**
  * An OpenAI `error` event, or an SDK media failure, which also carries `code` and `message` at the
  * top level.
- * @typedef {{ type: 'error'; error: { code?: string; message?: string } & Record<string, unknown>; code?: string; message?: string }} ConvoErrorEvent */
+ * @typedef {{ type: 'error'; error: { code?: string; message?: string } & Record<string, unknown>; code?: string; message?: string }} RealtimeErrorEvent */
 /** Native provider events retain their provider-owned fields.
- * @typedef {Record<string, RealtimeServerEvent> & { text: ConvoTextEvent; audio: ConvoAudioEvent; transcript: ConvoTranscriptEvent; interrupted: ConvoInterruptedEvent; 'turn.done': ConvoTurnDoneEvent; error: ConvoErrorEvent; ready: { type: 'ready'; model: string; provider: 'openai'; reconnected?: boolean }; reconnecting: { type: 'reconnecting'; code: number; reason: string }; context_trimmed: { type: 'context_trimmed'; omittedItems: number }; close: { type: 'close'; code: number; reason: string } }} ConvoEventMap */
+ * @typedef {Record<string, RealtimeServerEvent> & { text: RealtimeTextEvent; audio: RealtimeAudioEvent; transcript: RealtimeTranscriptEvent; interrupted: RealtimeInterruptedEvent; 'turn.done': RealtimeTurnDoneEvent; error: RealtimeErrorEvent; ready: { type: 'ready'; model: string; provider: 'openai'; reconnected?: boolean }; reconnecting: { type: 'reconnecting'; code: number; reason: string }; context_trimmed: { type: 'context_trimmed'; omittedItems: number }; close: { type: 'close'; code: number; reason: string } }} RealtimeEventMap */

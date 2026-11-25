@@ -6,6 +6,7 @@ import {
     describe,
     expect,
     it,
+    onTestFinished,
     vi,
 } from 'vitest';
 import murmurhash from 'murmurhash';
@@ -20,13 +21,11 @@ import {
     UNLIMITED_SUBSCRIPTION,
     DEFAULT_TEMP_SUBSCRIPTION,
     GLOBAL_APP_KEY,
-    METRICS_PREFIX,
     METRICS_V2_PREFIX,
     OTHER_USAGE_TYPE,
     PERIOD_ESCAPE,
     POLICY_PREFIX,
     USAGE_DETAIL_SHARD_COUNT,
-    V1_CLAIM_THROUGH_MONTH,
     isFreeSubscription,
     subscriptionOverride,
 } from './consts.ts';
@@ -36,9 +35,8 @@ import type { UsageInput } from './types.ts';
 import { detailShardOf } from './usageDetail.ts';
 import { toMicroCents } from './utils.ts';
 
-/** A month whose recurring-charge claim still uses the v1 key. */
+/** A month before `OCTOBER_MONTH_ISO`. */
 const SEPTEMBER_MONTH_ISO = '2026-09-25T12:00:00Z';
-/** A month whose claim uses the v2 key like everything else. */
 const OCTOBER_MONTH_ISO = '2026-10-15T12:00:00Z';
 
 const escape = (usageType: string) => usageType.replace(/\./g, PERIOD_ESCAPE);
@@ -228,9 +226,9 @@ describe('MeteringService', () => {
             expect(await target.getActorSubscription(defaulted)).toMatchObject({
                 id: 'generous-default',
             });
-            expect(await target.actorHasPaidSubscription(defaulted)).toBe(
-                false,
-            );
+            expect(
+                (await target.getActorSubscriptionStatus(defaulted)).paid,
+            ).toBe(false);
         });
 
         it('calls the same plan paid once something subscribed the actor to it', async () => {
@@ -248,9 +246,9 @@ describe('MeteringService', () => {
                     id: 'bought-plan',
                 },
             );
-            expect(await target.actorHasPaidSubscription(subscribed)).toBe(
-                true,
-            );
+            expect(
+                (await target.getActorSubscriptionStatus(subscribed)).paid,
+            ).toBe(true);
         });
 
         it('counts unlimited as paid, so a deployment that turned it on keeps its caps', async () => {
@@ -264,9 +262,9 @@ describe('MeteringService', () => {
                 expect((await target.getActorSubscription(anyone)).id).toBe(
                     UNLIMITED_SUBSCRIPTION,
                 );
-                expect(await target.actorHasPaidSubscription(anyone)).toBe(
-                    true,
-                );
+                expect(
+                    (await target.getActorSubscriptionStatus(anyone)).paid,
+                ).toBe(true);
             } finally {
                 cfg.unlimitedMetering = saved;
             }
@@ -289,9 +287,9 @@ describe('MeteringService', () => {
             expect((await target.getActorSubscription(actorOnGhost)).id).toBe(
                 'registered-default',
             );
-            expect(await target.actorHasPaidSubscription(actorOnGhost)).toBe(
-                false,
-            );
+            expect(
+                (await target.getActorSubscriptionStatus(actorOnGhost)).paid,
+            ).toBe(false);
         });
 
         it('calls a free plan unpaid even when it was subscribed to', async () => {
@@ -299,7 +297,9 @@ describe('MeteringService', () => {
                 async () => ORG_SEAT_FREE_SUBSCRIPTION,
             );
             const seat = makeActor();
-            expect(await target.actorHasPaidSubscription(seat)).toBe(false);
+            expect(
+                (await target.getActorSubscriptionStatus(seat)).paid,
+            ).toBe(false);
         });
 
         it('counts a plan registered as free as free wherever free-ness is asked', async () => {
@@ -315,7 +315,9 @@ describe('MeteringService', () => {
             expect((await target.getActorSubscription(holder)).id).toBe(
                 'registered-free',
             );
-            expect(await target.actorHasPaidSubscription(holder)).toBe(false);
+            expect(
+                (await target.getActorSubscriptionStatus(holder)).paid,
+            ).toBe(false);
             expect(isFreeSubscription('registered-free')).toBe(true);
             expect(subscriptionSatisfies('registered-free', true)).toBe(false);
             expect(
@@ -1009,6 +1011,39 @@ describe('MeteringService', () => {
             expect(record).toMatchObject({ cost: 100, units: 2, count: 1 });
         });
 
+        it('settles the allowance without waiting for the detail write', async () => {
+            const totalsKey = `${METRICS_V2_PREFIX}:actor:${actor.user.uuid}:${currentMonthString()}`;
+            let releaseDetail!: () => void;
+            const detailGate = new Promise<void>((resolve) => {
+                releaseDetail = resolve;
+            });
+            const buffer = server.stores.meteringBuffer;
+            const original = buffer.incr.bind(buffer);
+            let settled = false;
+            const spy = vi
+                .spyOn(buffer, 'incr')
+                .mockImplementation(async (input) => {
+                    if (input.key.includes(':detail:')) await detailGate;
+                    if (
+                        input.key === totalsKey &&
+                        'allowanceUsed' in input.pathAndAmountMap
+                    ) {
+                        settled = true;
+                    }
+                    return original(input);
+                });
+            try {
+                const pending = target.incrementUsage(actor, 'kv:read', 2, 50);
+                await waitFor(() => expect(settled).toBe(true));
+                releaseDetail();
+                const result = await pending;
+                expect(result['kv:read']).toMatchObject({ cost: 50, units: 2 });
+            } finally {
+                releaseDetail();
+                spy.mockRestore();
+            }
+        });
+
         it('accumulates across calls', async () => {
             await target.incrementUsage(actor, 'kv:read', 1, 10);
             const second = await target.incrementUsage(actor, 'kv:read', 3, 20);
@@ -1079,6 +1114,7 @@ describe('MeteringService', () => {
                 expect.stringContaining(actor.user!.email!),
                 expect.objectContaining({ usageType: 'kv:read' }),
                 'info',
+                { channel: 'billing' },
             );
             alarmSpy.mockRestore();
         });
@@ -1100,7 +1136,10 @@ describe('MeteringService', () => {
             });
             await target.incrementUsage(appActor, 'kv:read', 1, 100);
             await waitFor(async () => {
-                const u = await target.getActorAppUsage(appActor, 'my-app');
+                const u = await target.getActorCurrentMonthAppUsageDetails(
+                    appActor,
+                    'my-app',
+                );
                 expect(u.total).toBe(100);
             });
         });
@@ -1616,6 +1655,7 @@ describe('MeteringService', () => {
                 expect.stringContaining(actor.user!.email!),
                 expect.objectContaining({ usageType: 'kv:read' }),
                 'info',
+                { channel: 'billing' },
             );
             alarmSpy.mockRestore();
         });
@@ -1706,7 +1746,7 @@ describe('MeteringService', () => {
             expect(mine.usage.total).toBe(3);
             expect(theirs.usage.total).toBe(4);
             await waitFor(async () => {
-                const appUsage = await target.getActorAppUsage(
+                const appUsage = await target.getActorCurrentMonthAppUsageDetails(
                     appActor,
                     'app-1',
                 );
@@ -1762,7 +1802,8 @@ describe('MeteringService', () => {
                 expect(spy).toHaveBeenCalledTimes(
                     concurrency * 3 * (usageWriteCalls(['egress:bytes']) + 1),
                 );
-                expect(peak).toBeLessThanOrEqual(concurrency);
+                // A bucket's detail write overlaps its allowance settle.
+                expect(peak).toBeLessThanOrEqual(concurrency * 2);
             } finally {
                 spy.mockRestore();
             }
@@ -2181,11 +2222,12 @@ describe('MeteringService', () => {
         });
     });
 
-    // ── getActorAppUsage ─────────────────────────────────────────────
-
-    describe('getActorAppUsage', () => {
+    describe('getActorCurrentMonthAppUsageDetails with an explicit app', () => {
         it('returns zero for an app the user has no usage in', async () => {
-            const result = await target.getActorAppUsage(actor, 'untouched');
+            const result = await target.getActorCurrentMonthAppUsageDetails(
+                actor,
+                'untouched',
+            );
             expect(result.total).toBe(0);
         });
 
@@ -2195,13 +2237,19 @@ describe('MeteringService', () => {
                 app: { uid: 'mine', id: 1 },
             });
             await expect(
-                target.getActorAppUsage(appActor, 'theirs'),
+                target.getActorCurrentMonthAppUsageDetails(
+                    appActor,
+                    'theirs',
+                ),
             ).rejects.toMatchObject({ statusCode: 403 });
         });
 
         it('rejects an actor with no user uuid', async () => {
             await expect(
-                target.getActorAppUsage({ user: { uuid: '' } }, 'app'),
+                target.getActorCurrentMonthAppUsageDetails(
+                    { user: { uuid: '' } },
+                    'app',
+                ),
             ).rejects.toMatchObject({ statusCode: 403 });
         });
 
@@ -2217,7 +2265,7 @@ describe('MeteringService', () => {
             await target.incrementUsage(appActor, 'kv:write', 1, 3);
             await server.stores.meteringBuffer.flushCycle();
 
-            const appUsage = await target.getActorAppUsage(
+            const appUsage = await target.getActorCurrentMonthAppUsageDetails(
                 appActor,
                 'count-app',
             );
@@ -2244,7 +2292,7 @@ describe('MeteringService', () => {
 
     // ── allowance / credits ──────────────────────────────────────────
 
-    describe('getRemainingUsage / getAllowedUsage / hasAnyUsage / hasEnoughCredits', () => {
+    describe('getRemainingUsage / getAllowedUsage / hasEnoughCredits', () => {
         it('a fresh user has the full subscription allowance remaining', async () => {
             const allowed = await target.getAllowedUsage(actor);
             expect(allowed.remaining).toBe(allowed.monthUsageAllowance);
@@ -2296,18 +2344,6 @@ describe('MeteringService', () => {
             );
             const remaining = await target.getRemainingUsage(actor);
             expect(remaining).toBe(0);
-        });
-
-        it('hasAnyUsage tracks remaining', async () => {
-            const sub = await target.getActorSubscription(actor);
-            expect(await target.hasAnyUsage(actor)).toBe(true);
-            await target.incrementUsage(
-                actor,
-                'kv:read',
-                1,
-                sub.monthUsageAllowance,
-            );
-            expect(await target.hasAnyUsage(actor)).toBe(false);
         });
 
         it('does not double-charge same-month overage against remaining (usage total + consumed credits)', async () => {
@@ -2765,7 +2801,7 @@ describe('MeteringService', () => {
                 }
             ).creditRefreshes;
 
-        it('answers the same as hasAnyUsage', async () => {
+        it('turns false once the allowance is spent', async () => {
             const sub = await target.getActorSubscription(actor);
             expect(await target.hasAnyUsageCached(actor)).toBe(true);
 
@@ -3098,6 +3134,103 @@ describe('MeteringService', () => {
             }
         });
 
+        // A balance read right after a credits change is left as read, so
+        // these let that window pass first.
+        const pastCreditsChange = () => {
+            const { FORCE_EXACT_READ_MS: windowMs } =
+                target.constructor as typeof MeteringService;
+            const later = Date.now() + windowMs + 1;
+            return vi.spyOn(Date, 'now').mockImplementation(() => later);
+        };
+
+        // The last batch runs past the allowance and into purchased credit.
+        it('reports what is left to spend each time usage settles', async () => {
+            target.registerPolicy({
+                id: 'balance-paid',
+                monthUsageAllowance: toMicroCents(10),
+                monthlyStorageAllowance: 1024 * 1024 * 1024,
+            });
+            target.registerSubscriptionResolver(async () => 'balance-paid');
+            await target.updateAddonCredit(actor.user.uuid!, toMicroCents(1));
+
+            const seen = vi.fn();
+            server.clients.event.on('metering.balance', seen);
+            const dateNow = pastCreditsChange();
+            try {
+                for (const dollars of [4, 4, 2.5]) {
+                    await target.incrementUsage(
+                        actor,
+                        'kv:read',
+                        1,
+                        toMicroCents(dollars),
+                    );
+                }
+                await waitFor(() =>
+                    expect(seen.mock.calls.map(([, event]) => event)).toEqual(
+                        [7, 3, 0.5].map((dollars) => ({
+                            userUuid: actor.user.uuid,
+                            remaining: toMicroCents(dollars),
+                            subscriptionId: 'balance-paid',
+                        })),
+                    ),
+                );
+            } finally {
+                dateNow.mockRestore();
+                server.clients.event.off('metering.balance', seen);
+            }
+        });
+
+        const onGatePlan = async () => {
+            target.registerPolicy({
+                id: 'gate-paid',
+                monthUsageAllowance: toMicroCents(10),
+                monthlyStorageAllowance: 1024 * 1024 * 1024,
+            });
+            target.registerSubscriptionResolver(async () => 'gate-paid');
+            await target.updateAddonCredit(actor.user.uuid!, toMicroCents(1));
+        };
+
+        it('closes the credit gate on the batch that spends the last purchased credit', async () => {
+            await onGatePlan();
+            const dateNow = pastCreditsChange();
+            try {
+                await target.incrementUsage(
+                    actor,
+                    'kv:read',
+                    1,
+                    toMicroCents(11),
+                );
+                expect(creditCache().get(actor.user.uuid!)!.hasCredits).toBe(
+                    false,
+                );
+            } finally {
+                dateNow.mockRestore();
+            }
+        });
+
+        // The purchased credit the batch read may predate the change, so its
+        // own draw is not counted against it.
+        it('keeps the credit gate open for a batch settling right after a credits change', async () => {
+            await onGatePlan();
+            await target.incrementUsage(actor, 'kv:read', 1, toMicroCents(11));
+            expect(creditCache().get(actor.user.uuid!)!.hasCredits).toBe(true);
+        });
+
+        it('reports no balance for a plan guessed from a failed lookup', async () => {
+            target.registerSubscriptionResolver(async () => {
+                throw new Error('store down');
+            });
+            const seen = vi.fn();
+            server.clients.event.on('metering.balance', seen);
+            try {
+                await target.incrementUsage(actor, 'kv:read', 1, 1_000);
+                await new Promise((r) => setTimeout(r, 20));
+                expect(seen).not.toHaveBeenCalled();
+            } finally {
+                server.clients.event.off('metering.balance', seen);
+            }
+        });
+
         // Otherwise every later call waits on the failing store.
         it('fails open with a short fallback answer when refreshing a stale entry errors', async () => {
             const sub = await target.getActorSubscription(actor);
@@ -3327,6 +3460,54 @@ describe('MeteringService', () => {
 
             const now = await settledGlobalUsage();
             expect(now.total - before.total).toBe(300);
+        });
+
+        it('reads another month when given one', async () => {
+            const month = '1999-01';
+            const shards = (target.constructor as typeof MeteringService)
+                .GLOBAL_SHARD_COUNT;
+            for (let shard = 0; shard < shards; shard++) {
+                await server.stores.kv.set({
+                    key: `${METRICS_V2_PREFIX}:puter:${shard}:${month}`,
+                    value: { total: shard + 1 },
+                });
+            }
+            expect((await target.getGlobalUsage(month)).total).toBe(
+                (shards * (shards + 1)) / 2,
+            );
+            expect((await target.getGlobalUsage('1999-02')).total).toBe(0);
+        });
+
+        it('sums every month in one listing, across pages', async () => {
+            const ctor = target.constructor as typeof MeteringService;
+            const pageItems = ctor.SHARD_SWEEP_PAGE_ITEMS;
+            ctor.SHARD_SWEEP_PAGE_ITEMS = 3;
+            onTestFinished(() => {
+                ctor.SHARD_SWEEP_PAGE_ITEMS = pageItems;
+            });
+            const months = ['1998-01', '1998-02', '1998-03'];
+            for (const [i, month] of months.entries()) {
+                for (let shard = 0; shard < ctor.GLOBAL_SHARD_COUNT; shard++) {
+                    await server.stores.kv.set({
+                        key: `${METRICS_V2_PREFIX}:puter:${shard}:${month}`,
+                        value: { total: 10 ** i },
+                    });
+                }
+            }
+            // Under the prefix, but not a shard.
+            await server.stores.kv.set({
+                key: `${METRICS_V2_PREFIX}:puter:notes:1998-01`,
+                value: { total: 5000 },
+            });
+            const list = vi.spyOn(server.stores.kv, 'list');
+
+            const totals = await target.getGlobalUsageByMonth();
+
+            expect(months.map((month) => totals.get(month))).toEqual(
+                [1, 10, 100].map((each) => each * ctor.GLOBAL_SHARD_COUNT),
+            );
+            expect(list.mock.calls.length).toBeGreaterThan(1);
+            list.mockRestore();
         });
 
         it('returns total only, with no per-model breakdown', async () => {
@@ -3633,13 +3814,7 @@ describe('MeteringService', () => {
             const month = `${now.getUTCFullYear()}-${String(
                 now.getUTCMonth() + 1,
             ).padStart(2, '0')}`;
-            // The claim shim: September (and earlier) still claims on the v1
-            // key; later months claim on v2 like everything else.
-            const prefix =
-                month <= V1_CLAIM_THROUGH_MONTH
-                    ? METRICS_PREFIX
-                    : METRICS_V2_PREFIX;
-            return `${prefix}:actor:${chargeActor.user!.uuid}:${month}`;
+            return `${METRICS_V2_PREFIX}:actor:${chargeActor.user!.uuid}:${month}`;
         };
 
         // A claim taken by this code holds a random token at least this big.
@@ -3703,6 +3878,33 @@ describe('MeteringService', () => {
                 units: 1,
                 count: 1,
             });
+        });
+
+        it('asks the charge listeners together and applies every share', async () => {
+            let secondStarted = false;
+            let firstSawSecond = false;
+            listen(async (_key, data) => {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                firstSawSecond = secondStarted;
+                data.charges.push({
+                    usageType: 'workers:monthly',
+                    usageAmount: 1,
+                    costOverride: 300,
+                });
+            });
+            listen(async (_key, data) => {
+                secondStarted = true;
+                data.charges.push({
+                    usageType: 'domains:monthly',
+                    usageAmount: 1,
+                    costOverride: 200,
+                });
+            });
+
+            const usage = await target.incrementUsage(actor, 'kv:read', 1, 100);
+
+            expect(firstSawSecond).toBe(true);
+            expect(usage.total).toBe(600);
         });
 
         it('applies the charge on a read when the read comes first', async () => {
@@ -4061,144 +4263,39 @@ describe('MeteringService', () => {
             );
         });
 
-        // The v1 → v2 claim shim: September's claim stays on the v1 key so a
-        // user already charged before the switch is never charged twice, and
-        // every month after reads the claim off the v2 totals record like
-        // everything else.
-        describe('v1 → v2 claim shim', () => {
-            beforeEach(() => {
-                vi.useFakeTimers({ toFake: ['Date'] });
-            });
-            afterEach(() => {
-                vi.useRealTimers();
-            });
+        it('two concurrent claims settle exactly one charge (two-node race)', async () => {
+            const raceActor = makeActor();
+            const listener = chargeOnce(450);
+            const month = currentMonthString();
 
-            it('does not charge again a user whose v1 September key already claimed', async () => {
-                vi.setSystemTime(SEPTEMBER_MONTH_ISO);
-                const septActor = makeActor();
-                await server.stores.kv.incr({
-                    key: monthKey(septActor),
-                    pathAndAmountMap: { monthlyChargesApplied: 1 },
-                });
+            // Bypasses the in-process `claimsInFlight` guard on purpose —
+            // that guard only protects one node against itself; this
+            // exercises the KV-level race two separate nodes would hit.
+            const privateTarget = target as unknown as {
+                claimAndCharge: (
+                    a: Actor,
+                    userId: string,
+                    month: string,
+                ) => Promise<unknown>;
+            };
+            const [first, second] = await Promise.all([
+                privateTarget.claimAndCharge(
+                    raceActor,
+                    raceActor.user!.uuid!,
+                    month,
+                ),
+                privateTarget.claimAndCharge(
+                    raceActor,
+                    raceActor.user!.uuid!,
+                    month,
+                ),
+            ]);
 
-                const listener = chargeOnce(999);
-                const usage = await target.incrementUsage(
-                    septActor,
-                    'kv:read',
-                    1,
-                    10,
-                );
-
-                expect(listener).not.toHaveBeenCalled();
-                expect(usage.total).toBe(10);
-                expect(await claimOf(septActor)).toBe(1);
-            });
-
-            it('charges a user with no v1 September claim exactly once', async () => {
-                vi.setSystemTime(SEPTEMBER_MONTH_ISO);
-                const septActor = makeActor();
-                const listener = chargeOnce(500);
-
-                const first = await target.incrementUsage(
-                    septActor,
-                    'kv:read',
-                    1,
-                    10,
-                );
-                expect(listener).toHaveBeenCalledTimes(1);
-                expect(first.total).toBe(510);
-
-                // Simulates another node (or this one restarted): no memory
-                // of the claim, so it has to ask the v1 key again — and must
-                // still see it as already settled rather than charge again.
-                forgetSettled();
-                const second = await target.incrementUsage(
-                    septActor,
-                    'kv:read',
-                    1,
-                    10,
-                );
-                expect(listener).toHaveBeenCalledTimes(1);
-                expect(second.total).toBe(520);
-                expect(await claimOf(septActor)).toBeGreaterThanOrEqual(
-                    CLAIM_TOKEN_MIN,
-                );
-            });
-
-            it('claims on the v2 key in October and charges exactly once', async () => {
-                vi.setSystemTime(OCTOBER_MONTH_ISO);
-                const octActor = makeActor();
-                const listener = chargeOnce(500);
-
-                const first = await target.incrementUsage(
-                    octActor,
-                    'kv:read',
-                    1,
-                    10,
-                );
-                expect(listener).toHaveBeenCalledTimes(1);
-                expect(first.total).toBe(510);
-
-                const second = await target.incrementUsage(
-                    octActor,
-                    'kv:read',
-                    1,
-                    10,
-                );
-                expect(listener).toHaveBeenCalledTimes(1);
-                expect(second.total).toBe(520);
-
-                const v2Key = `${METRICS_V2_PREFIX}:actor:${octActor.user!.uuid}:2026-10`;
-                const { res: v2Record } = await server.stores.kv.get({
-                    key: v2Key,
-                });
-                expect(
-                    (v2Record as { monthlyChargesApplied?: number } | null)
-                        ?.monthlyChargesApplied,
-                ).toBeGreaterThanOrEqual(CLAIM_TOKEN_MIN);
-
-                // Nothing this month ever touches the v1 key.
-                const v1Key = `${METRICS_PREFIX}:actor:${octActor.user!.uuid}:2026-10`;
-                const { res: v1Record } = await server.stores.kv.get({
-                    key: v1Key,
-                });
-                expect(v1Record).toBeNull();
-            });
-
-            it('two concurrent claims on the v1 key settle exactly one charge (old-node/new-node race)', async () => {
-                vi.setSystemTime(SEPTEMBER_MONTH_ISO);
-                const raceActor = makeActor();
-                const listener = chargeOnce(450);
-
-                // Bypasses the in-process `claimsInFlight` guard on purpose —
-                // that guard only protects one node against itself; this
-                // exercises the KV-level race two separate nodes would hit.
-                const privateTarget = target as unknown as {
-                    claimAndCharge: (
-                        a: Actor,
-                        userId: string,
-                        month: string,
-                    ) => Promise<unknown>;
-                };
-                const [first, second] = await Promise.all([
-                    privateTarget.claimAndCharge(
-                        raceActor,
-                        raceActor.user!.uuid!,
-                        '2026-09',
-                    ),
-                    privateTarget.claimAndCharge(
-                        raceActor,
-                        raceActor.user!.uuid!,
-                        '2026-09',
-                    ),
-                ]);
-
-                expect([first, second].filter(Boolean)).toHaveLength(1);
-                expect(listener).toHaveBeenCalledTimes(1);
-                expect(await claimOf(raceActor)).toBeGreaterThanOrEqual(
-                    CLAIM_TOKEN_MIN,
-                );
-            });
+            expect([first, second].filter(Boolean)).toHaveLength(1);
+            expect(listener).toHaveBeenCalledTimes(1);
+            expect(await claimOf(raceActor)).toBeGreaterThanOrEqual(
+                CLAIM_TOKEN_MIN,
+            );
         });
     });
 
@@ -4290,6 +4387,48 @@ describe('MeteringService', () => {
         });
     });
 
+    describe('reserveCredits within a headroom', () => {
+        it('admits one of two holds sized from the same read of the headroom', async () => {
+            const headroom = await target.getUsageHeadroom(actor, {
+                versioned: true,
+            });
+            const amount = headroom.balance - headroom.held;
+
+            const holds = await Promise.all([
+                target.reserveCredits(actor, amount, { within: headroom }),
+                target.reserveCredits(actor, amount, { within: headroom }),
+            ]);
+
+            expect(holds.filter((hold) => hold !== null)).toHaveLength(1);
+            expect(await target.getOutstandingHolds(actor)).toBe(amount);
+            await Promise.all(holds.map((hold) => hold?.release()));
+        });
+
+        it('refuses a hold sized from a balance that has been spent since', async () => {
+            const headroom = await target.getUsageHeadroom(actor, {
+                versioned: true,
+            });
+            await target.incrementUsage(actor, 'kv:read', 1, 1000);
+
+            expect(
+                await target.reserveCredits(actor, 1000, { within: headroom }),
+            ).toBe('stale');
+            expect(await target.getOutstandingHolds(actor)).toBe(0);
+        });
+
+        it('takes a hold that fits', async () => {
+            const headroom = await target.getUsageHeadroom(actor, {
+                versioned: true,
+            });
+            const hold = await target.reserveCredits(actor, 1000, {
+                within: headroom,
+            });
+
+            expect(await target.getOutstandingHolds(actor)).toBe(1000);
+            await hold!.release();
+        });
+    });
+
     describe('reserveCreditsIfAffordable', () => {
         const BUDGET = 20_000_000;
         const HOLD = 16_200_000;
@@ -4324,6 +4463,53 @@ describe('MeteringService', () => {
             expect(holds.filter((h) => h !== null)).toHaveLength(1);
             expect(await target.getOutstandingHolds(actor)).toBe(HOLD);
             await Promise.all(holds.map((h) => h?.release()));
+        });
+
+        it('holds on a second try when a listener tops the actor up at the moment of refusal', async () => {
+            await withBalance(BUDGET);
+            const refill = vi.fn(
+                async (_key: string, refusal: { refilled: boolean }) => {
+                    await target.updateAddonCredit(actor.user.uuid!, BUDGET);
+                    refusal.refilled = true;
+                },
+            );
+            server.clients.event.on('metering.out-of-credits', refill as never);
+            try {
+                const hold = await target.reserveCreditsIfAffordable(
+                    actor,
+                    BUDGET + 1,
+                );
+                expect(hold).not.toBeNull();
+                expect(await target.getOutstandingHolds(actor)).toBe(
+                    BUDGET + 1,
+                );
+                await hold?.release();
+                // Affordable now, so nobody is asked again.
+                await (
+                    await target.reserveCreditsIfAffordable(actor, BUDGET)
+                )?.release();
+                expect(refill).toHaveBeenCalledTimes(1);
+                expect(refill.mock.calls[0][1]).toMatchObject({ actor });
+            } finally {
+                server.clients.event.off(
+                    'metering.out-of-credits',
+                    refill as never,
+                );
+            }
+        });
+
+        it('refuses once when no listener tops the actor up', async () => {
+            await withBalance(BUDGET);
+            const asked = vi.fn();
+            server.clients.event.on('metering.out-of-credits', asked);
+            try {
+                expect(
+                    await target.reserveCreditsIfAffordable(actor, BUDGET + 1),
+                ).toBeNull();
+                expect(asked).toHaveBeenCalledTimes(1);
+            } finally {
+                server.clients.event.off('metering.out-of-credits', asked);
+            }
         });
 
         it('compares against the gross balance, counting live holds once', async () => {
@@ -4575,6 +4761,211 @@ describe('MeteringService', () => {
                     consistentRead: true,
                 });
                 expect(addons.consumedPurchaseCredits).toBe(5);
+            });
+        });
+    });
+
+    describe('settling when a balance read fails', () => {
+        const monthKey = (a: Actor) =>
+            `${METRICS_V2_PREFIX}:actor:${a.user!.uuid}:${currentMonthString()}`;
+
+        /** Rejects the next `times` reads `match` picks; the rest go through. */
+        const failReads = (
+            match: (args: {
+                key: unknown;
+                consistentRead?: boolean;
+            }) => boolean,
+            times = Infinity,
+        ) => {
+            const kv = server.stores.kv;
+            const realGet = kv.get.bind(kv);
+            let left = times;
+            return vi
+                .spyOn(kv, 'get')
+                .mockImplementation(
+                    async (...args: Parameters<typeof realGet>) => {
+                        if (left > 0 && match(args[0] as never)) {
+                            left--;
+                            throw new Error(
+                                'ProvisionedThroughputExceededException',
+                            );
+                        }
+                        return realGet(...args);
+                    },
+                );
+        };
+        const isAddonsRead = ({ key }: { key: unknown }) =>
+            typeof key === 'string' && key.endsWith(':addons');
+
+        const pools = async (a: Actor) => {
+            await server.stores.meteringBuffer.flushCycle();
+            const { usage } = await target.getActorCurrentMonthUsageDetails(a);
+            const addons = await target.getActorAddons(a, {
+                consistentRead: true,
+            });
+            return {
+                total: usage.total,
+                allowanceUsed: usage.allowanceUsed ?? 0,
+                consumed: addons.consumedPurchaseCredits ?? 0,
+            };
+        };
+
+        it('charges the allowance when the purchased-credit read fails', async () => {
+            await target.updateAddonCredit(actor.user.uuid!, 1_000_000);
+            await target.incrementUsage(actor, 'ai:chat', 1, 1000);
+            const before = await target.getAllowedUsage(actor);
+
+            const get = failReads(isAddonsRead);
+            const result = await target.incrementUsage(
+                actor,
+                'ai:chat',
+                1,
+                5000,
+            );
+            get.mockRestore();
+
+            expect(result.total).toBe(6000);
+            expect(await pools(actor)).toEqual({
+                total: 6000,
+                allowanceUsed: 6000,
+                consumed: 0,
+            });
+            const after = await target.getAllowedUsage(actor);
+            expect(before.remaining - after.remaining).toBe(5000);
+        });
+
+        it('charges only the allowance share past the allowance, and nothing later charges the rest', async () => {
+            const { monthUsageAllowance: allowance } =
+                await target.getActorSubscription(actor);
+            await target.updateAddonCredit(actor.user.uuid!, 1_000_000);
+            await target.incrementUsage(actor, 'ai:chat', 1, allowance - 100);
+            expect(await target.hasAnyUsageCached(actor)).toBe(true);
+
+            const alarm = vi.spyOn(server.clients.alarm, 'create');
+            const emit = vi.spyOn(server.clients.event, 'emit');
+            const get = failReads(isAddonsRead);
+            await target.incrementUsage(actor, 'ai:chat', 1, 1000);
+            get.mockRestore();
+
+            // 100 fits the allowance; the 900 credit would cover isn't drawn.
+            expect(await pools(actor)).toEqual({
+                total: allowance + 900,
+                allowanceUsed: allowance,
+                consumed: 0,
+            });
+            expect(alarm).toHaveBeenCalledWith(
+                'metering_settle_read_failed',
+                expect.any(String),
+                expect.objectContaining({
+                    userId: actor.user.uuid,
+                    unchargedCost: 900,
+                }),
+                'info',
+                { channel: 'billing' },
+            );
+            expect(
+                alarm.mock.calls.some(([id]) =>
+                    String(id).startsWith('metering service error'),
+                ),
+            ).toBe(false);
+            // The unread credit isn't taken as spent.
+            expect(
+                emit.mock.calls.some(
+                    ([name]) => name === 'metering.credit-state',
+                ),
+            ).toBe(false);
+            expect(await target.hasAnyUsageCached(actor)).toBe(true);
+            alarm.mockRestore();
+            emit.mockRestore();
+
+            // The next settle charges its own cost once, and only that.
+            await target.incrementUsage(actor, 'ai:chat', 1, 700);
+            expect(await pools(actor)).toEqual({
+                total: allowance + 1600,
+                allowanceUsed: allowance,
+                consumed: 700,
+            });
+        });
+
+        it('charges the allowance from the buffered total when the exact read fails', async () => {
+            const Service = target.constructor as typeof MeteringService;
+            const interval = Service.EXACT_READ_MIN_INTERVAL_MS;
+            Service.EXACT_READ_MIN_INTERVAL_MS = 0;
+            try {
+                const { monthUsageAllowance: allowance } =
+                    await target.getActorSubscription(actor);
+                await target.incrementUsage(
+                    actor,
+                    'ai:chat',
+                    1,
+                    allowance - 3000,
+                );
+                await server.stores.meteringBuffer.flushCycle();
+
+                const key = monthKey(actor);
+                const alarm = vi.spyOn(server.clients.alarm, 'create');
+                const get = failReads(
+                    (args) => args.key === key && !!args.consistentRead,
+                );
+                const result = await target.incrementUsage(
+                    actor,
+                    'ai:chat',
+                    1,
+                    1000,
+                );
+                const failedReads = get.mock.calls.length;
+                get.mockRestore();
+
+                expect(failedReads).toBeGreaterThan(0);
+                expect(result.total).toBe(allowance - 2000);
+                expect(await pools(actor)).toEqual({
+                    total: allowance - 2000,
+                    allowanceUsed: allowance - 2000,
+                    consumed: 0,
+                });
+                expect(alarm).toHaveBeenCalledWith(
+                    'metering_settle_read_failed',
+                    expect.any(String),
+                    expect.objectContaining({ unchargedCost: 0 }),
+                    'info',
+                    { channel: 'billing' },
+                );
+                alarm.mockRestore();
+            } finally {
+                Service.EXACT_READ_MIN_INTERVAL_MS = interval;
+            }
+        });
+
+        it('charges each of two racing calls once when one of their reads fails', async () => {
+            await target.updateAddonCredit(actor.user.uuid!, 1_000_000);
+            await target.incrementUsage(actor, 'ai:chat', 1, 1000);
+
+            const get = failReads(isAddonsRead, 1);
+            await Promise.all([
+                target.incrementUsage(actor, 'ai:chat', 1, 2000),
+                target.incrementUsage(actor, 'ai:chat', 1, 3000),
+            ]);
+            get.mockRestore();
+
+            expect(await pools(actor)).toEqual({
+                total: 6000,
+                allowanceUsed: 6000,
+                consumed: 0,
+            });
+        });
+
+        it('charges a failed call and the calls after it exactly once each', async () => {
+            await target.updateAddonCredit(actor.user.uuid!, 1_000_000);
+            const costs = [1000, 2000, 3000, 4000];
+            for (const [i, cost] of costs.entries()) {
+                const get = failReads(isAddonsRead, i % 2 === 0 ? 1 : 0);
+                await target.incrementUsage(actor, 'ai:chat', 1, cost);
+                get.mockRestore();
+            }
+            expect(await pools(actor)).toEqual({
+                total: 10_000,
+                allowanceUsed: 10_000,
+                consumed: 0,
             });
         });
     });

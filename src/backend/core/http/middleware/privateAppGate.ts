@@ -25,6 +25,7 @@ import {
 } from '../../../services/auth/AuthService';
 import type { AppStore } from '../../../stores/app/AppStore.js';
 import type { IConfig } from '../../../types';
+import { normalizeHost } from '../../../util/hosts.js';
 import { isAccessTokenActor, isAccountContext, type Actor } from '../../actor';
 
 /**
@@ -66,6 +67,8 @@ export interface PrivateHostingConfig {
      */
     staticDomainsRaw: string[];
     privateDomainsRaw: string[];
+    /** `staticDomains` and `privateDomains`, longest first. */
+    hostingDomains: string[];
     /** Configured protocol (e.g. `http` in dev, `https` in prod). */
     protocol: string;
 }
@@ -86,6 +89,10 @@ export interface PrivateIdentity {
     hasValidPrivateCookie?: boolean;
 }
 
+type PublicCookieClaims = Awaited<
+    ReturnType<AuthService['verifyHostedAssetToken']>
+>;
+
 interface SubdomainLike {
     user_id?: number | null;
 }
@@ -102,30 +109,23 @@ interface AppLike {
 
 // -- Host helpers ----------------------------------------------------
 
-export function normalizeHost(value: string | undefined | null): string | null {
-    if (typeof value !== 'string') return null;
-    const trimmed = value.trim().toLowerCase().replace(/^\./, '');
-    if (!trimmed) return null;
-    return trimmed.split(':')[0] || null;
-}
-
-/** Like `normalizeHost` but preserves port when present. */
-export function normalizeHostRaw(
-    value: string | undefined | null,
-): string | null {
-    if (typeof value !== 'string') return null;
-    const trimmed = value.trim().toLowerCase().replace(/^\./, '');
-    return trimmed || null;
-}
-
 export function buildHostingConfig(config: IConfig): PrivateHostingConfig {
+    const staticDomains = [
+        normalizeHost(config.static_hosting_domain),
+        normalizeHost(config.static_hosting_domain_alt),
+    ].filter((d): d is string => !!d);
+    const privateDomains = [
+        normalizeHost(config.private_app_hosting_domain),
+        normalizeHost(config.private_app_hosting_domain_alt),
+    ].filter((d): d is string => !!d);
+    const keepPort = { keepPort: true };
     const staticRaw = [
-        normalizeHostRaw(config.static_hosting_domain),
-        normalizeHostRaw(config.static_hosting_domain_alt),
+        normalizeHost(config.static_hosting_domain, keepPort),
+        normalizeHost(config.static_hosting_domain_alt, keepPort),
     ].filter((d): d is string => !!d);
     const privateRaw = [
-        normalizeHostRaw(config.private_app_hosting_domain),
-        normalizeHostRaw(config.private_app_hosting_domain_alt),
+        normalizeHost(config.private_app_hosting_domain, keepPort),
+        normalizeHost(config.private_app_hosting_domain_alt, keepPort),
     ].filter((d): d is string => !!d);
     const rawProtocol =
         typeof config.protocol === 'string'
@@ -133,16 +133,11 @@ export function buildHostingConfig(config: IConfig): PrivateHostingConfig {
             : '';
     return {
         domain: normalizeHost(config.domain),
-        staticDomains: [
-            normalizeHost(config.static_hosting_domain),
-            normalizeHost(config.static_hosting_domain_alt),
-        ].filter((d): d is string => !!d),
-        privateDomains: [
-            normalizeHost(config.private_app_hosting_domain),
-            normalizeHost(config.private_app_hosting_domain_alt),
-        ].filter((d): d is string => !!d),
+        staticDomains,
+        privateDomains,
         staticDomainsRaw: staticRaw,
         privateDomainsRaw: privateRaw,
+        hostingDomains: longestFirst([...staticDomains, ...privateDomains]),
         protocol: rawProtocol || 'https',
     };
 }
@@ -156,14 +151,18 @@ export function hostMatchesPrivateDomain(
 
 // -- Subdomain extraction from a hosted request ---------------------
 
+// Longest-first so `foo.bar.puter.app` matches `bar.puter.app` before
+// falling back to `puter.app`.
+function longestFirst(domains: string[]): string[] {
+    return [...domains].sort((a, b) => b.length - a.length);
+}
+
+/** `hostingDomains` as `buildHostingConfig` orders them: longest first. */
 export function subdomainFromHost(
     host: string,
     hostingDomains: string[],
 ): string {
-    // Longest-first so `foo.bar.puter.app` matches `bar.puter.app` before
-    // falling back to `puter.app`.
-    const sorted = [...hostingDomains].sort((a, b) => b.length - a.length);
-    for (const d of sorted) {
+    for (const d of hostingDomains) {
         const suffix = `.${d}`;
         if (host === d) return '';
         if (host.endsWith(suffix)) {
@@ -180,8 +179,7 @@ export function subdomainFromHost(
  * Resolve "what app does the subdomain owner run on this host?" by matching
  * apps owned by `site.user_id` against the request's host variants. Used by the
  * puter-site middleware to decide whether the request hits a private app (gate)
- * or a public app (sticky cookie), and by the subdomain driver to populate the
- * `associated_app` field in API responses.
+ * or a public app (sticky cookie).
  *
  * Ownership-anchored on `apps.owner_user_id = site.user_id` so a subdomain can
  * never "claim" an app belonging to a different user. The `subdomains` row's
@@ -195,7 +193,6 @@ export async function resolveOwnedAppForHostedSite(opts: {
     site: SubdomainLike;
     appStore: Pick<AppStore, 'listOwnedByIndexUrlCandidates'>;
     config: PrivateHostingConfig;
-    requirePrivate?: boolean;
     /** Match against this hosting-domain host instead of the request's. */
     host?: string;
 }): Promise<AppLike | null> {
@@ -204,10 +201,7 @@ export async function resolveOwnedAppForHostedSite(opts: {
     const host = normalizeHost(opts.host ?? opts.req.hostname);
     if (!host) return null;
 
-    const hostedSubdomain = subdomainFromHost(host, [
-        ...opts.config.staticDomains,
-        ...opts.config.privateDomains,
-    ]);
+    const hostedSubdomain = subdomainFromHost(host, opts.config.hostingDomains);
     if (!hostedSubdomain) return null;
 
     // Build host variants with AND without port, then cross each with both
@@ -253,7 +247,6 @@ export async function resolveOwnedAppForHostedSite(opts: {
     const rows = await opts.appStore.listOwnedByIndexUrlCandidates(
         opts.site.user_id,
         uniqueCandidates,
-        { requirePrivate: opts.requirePrivate },
     );
     if (rows.length === 0) return null;
     if (rows.length > 1) {
@@ -396,7 +389,7 @@ export async function resolvePrivateIdentity(opts: {
         return {
             source: 'session-cookie',
             userUid: existingActor.user.uuid,
-            sessionUuid: existingActor.session?.uid,
+            sessionUuid: boundSessionUid(existingActor),
         };
     }
 
@@ -415,7 +408,7 @@ export async function resolvePrivateIdentity(opts: {
                 return {
                     source: 'session-cookie',
                     userUid: actor.user.uuid,
-                    sessionUuid: actor.session?.uid,
+                    sessionUuid: boundSessionUid(actor),
                 };
             }
         } catch {
@@ -437,7 +430,7 @@ export async function resolvePrivateIdentity(opts: {
                 return {
                     source: bootstrap.source,
                     userUid: actor.user.uuid,
-                    sessionUuid: actor.session?.uid,
+                    sessionUuid: boundSessionUid(actor),
                 };
             }
         } catch {
@@ -462,17 +455,28 @@ export async function resolvePrivateIdentity(opts: {
  * as a plain session on any private host.
  *
  * A scoped access token (a read URL, whoever issued it) is never the account
- * here: the hosted cookie minted from it would outlive the token's revocation.
+ * here. A full-access one is, when it names its own session row: the hosted
+ * cookie minted from it is bound to that row, so it ends with the token.
  */
 function actorMatchesExpectedApp(
     actor: Actor,
     expectedAppUid: string | undefined,
 ): boolean {
-    if (isAccessTokenActor(actor) && !isAccountContext(actor)) return false;
+    if (
+        isAccessTokenActor(actor) &&
+        (!isAccountContext(actor) || !actor.accessToken?.sessionUid)
+    ) {
+        return false;
+    }
     if (!expectedAppUid) return true;
     const app = actor.effectiveApp;
     if (!app) return true;
     return app.uid === expectedAppUid;
+}
+
+/** The session row a hosted cookie minted for `actor` is bound to. */
+function boundSessionUid(actor: Actor): string | undefined {
+    return actor.session?.uid ?? actor.accessToken?.sessionUid;
 }
 
 /**
@@ -507,7 +511,7 @@ export async function resolvePublicHostedIdentity(opts: {
         return {
             source: 'session-cookie',
             userUid: existingActor.user.uuid,
-            sessionUuid: existingActor.session?.uid,
+            sessionUuid: boundSessionUid(existingActor),
         };
     }
 
@@ -525,28 +529,7 @@ export async function resolvePublicHostedIdentity(opts: {
                 return {
                     source: 'session-cookie',
                     userUid: actor.user.uuid,
-                    sessionUuid: actor.session?.uid,
-                };
-            }
-        } catch {
-            /* fall through */
-        }
-    }
-
-    const bootstrap = getBootstrapToken(req);
-    if (bootstrap) {
-        try {
-            const actor = await authService.authenticateFromToken(
-                bootstrap.token,
-            );
-            if (
-                actor?.user?.uuid &&
-                actorMatchesExpectedApp(actor, expectedAppUid)
-            ) {
-                return {
-                    source: bootstrap.source,
-                    userUid: actor.user.uuid,
-                    sessionUuid: actor.session?.uid,
+                    sessionUuid: boundSessionUid(actor),
                 };
             }
         } catch {
@@ -563,27 +546,75 @@ export async function resolvePublicHostedIdentity(opts: {
         (typeof cookies?.[publicCookieNameLegacy] === 'string'
             ? cookies[publicCookieNameLegacy]
             : null);
-    if (publicCookieToken) {
+    let publicCookieClaims: Promise<PublicCookieClaims | null> | undefined;
+    const verifyPublicCookie = () =>
+        (publicCookieClaims ??= (async () => {
+            if (!publicCookieToken) return null;
+            try {
+                return await authService.verifyHostedAssetToken(
+                    'public',
+                    publicCookieToken,
+                    {
+                        appUid: expectedAppUid,
+                        subdomain: expectedSubdomain,
+                        host: expectedHost,
+                    },
+                );
+            } catch {
+                // v1-signed cookies land here and get re-minted.
+                return null;
+            }
+        })());
+    const publicCookieIdentity = (claims: PublicCookieClaims) => ({
+        source: 'public-cookie' as const,
+        userUid: claims.userUid,
+        sessionUuid: claims.sessionUuid,
+        hasValidPublicCookie: true,
+    });
+
+    const bootstrap = getBootstrapToken(req);
+    if (bootstrap) {
+        // A launched app's own assets carry its launch token in the Referer.
+        // When that token names the cookie's user and session, the cookie
+        // already stands for it and nothing needs re-authenticating or minting.
+        if (
+            bootstrap.source === 'referrer' &&
+            publicCookieToken &&
+            expectedAppUid
+        ) {
+            const named = authService.signedSessionClaims(bootstrap.token);
+            if (named && (!named.appUid || named.appUid === expectedAppUid)) {
+                const claims = await verifyPublicCookie();
+                if (
+                    claims &&
+                    claims.userUid === named.userUid &&
+                    claims.sessionUuid === named.sessionUuid
+                ) {
+                    return publicCookieIdentity(claims);
+                }
+            }
+        }
         try {
-            const claims = await authService.verifyHostedAssetToken(
-                'public',
-                publicCookieToken,
-                {
-                    appUid: expectedAppUid,
-                    subdomain: expectedSubdomain,
-                    host: expectedHost,
-                },
+            const actor = await authService.authenticateFromToken(
+                bootstrap.token,
             );
-            return {
-                source: 'public-cookie',
-                userUid: claims.userUid,
-                sessionUuid: claims.sessionUuid,
-                hasValidPublicCookie: true,
-            };
+            if (
+                actor?.user?.uuid &&
+                actorMatchesExpectedApp(actor, expectedAppUid)
+            ) {
+                return {
+                    source: bootstrap.source,
+                    userUid: actor.user.uuid,
+                    sessionUuid: boundSessionUid(actor),
+                };
+            }
         } catch {
-            /* fall through — v1-signed cookies land here and get re-minted */
+            /* fall through */
         }
     }
+
+    const claims = await verifyPublicCookie();
+    if (claims) return publicCookieIdentity(claims);
 
     return { source: 'none' };
 }
@@ -651,10 +682,7 @@ export function buildPrivateHostRedirect(
     if (!privateDomain) return null;
     const host = normalizeHost(req.hostname);
     if (!host) return null;
-    const subdomain = subdomainFromHost(host, [
-        ...config.staticDomains,
-        ...config.privateDomains,
-    ]);
+    const subdomain = subdomainFromHost(host, config.hostingDomains);
     if (!subdomain) return null;
     try {
         const protocol = config.protocol || req.protocol || 'https';
@@ -682,10 +710,7 @@ export function buildPublicHostRedirect(
     if (!publicDomain) return null;
     const host = normalizeHost(req.hostname);
     if (!host) return null;
-    const subdomain = subdomainFromHost(host, [
-        ...config.staticDomains,
-        ...config.privateDomains,
-    ]);
+    const subdomain = subdomainFromHost(host, config.hostingDomains);
     if (!subdomain) return null;
     try {
         const protocol = config.protocol || req.protocol || 'https';
@@ -716,10 +741,10 @@ export function buildAppCenterFallback(
 // -- Login bootstrap HTML --------------------------------------------
 
 /**
- * Minimal HTML page that prompts the visitor to sign in with Puter. Uses
- * puter.js's `auth.signIn` to get a token, then redirects back to the same URL
- * with `?puter.auth.token=…` so the middleware can resolve identity on the next
- * request.
+ * Minimal HTML page that prompts the visitor to sign in with Puter. Takes the
+ * token a desktop-opened tab is handed, a stored one, or one from puter.js's
+ * `auth.signIn`, sends it to the same URL in a header so the middleware sets
+ * its cookie, then loads the URL the tab was opened at.
  *
  * Kept inline (no template engine dependency). Ported from v1's
  * `respondPrivateLoginBootstrap` with non-essential bells removed.
@@ -772,41 +797,94 @@ const status = document.getElementById('status');
 const loginBtn = document.getElementById('loginButton');
 const retryBtn = document.getElementById('retryButton');
 const storageKey = 'puter.privateAppBootstrap.lastAttemptedToken';
+const headerKey = 'puter.privateAppBootstrap.lastHeaderTry';
+// Read before puter.js clears a tab launch's params from the address bar.
+const launchUrl = location.href;
+// In a tab the desktop opened, settles once the desktop has handed over its
+// token. Signing in with that token keeps the opened item for the app's page.
+const keepLaunch = t => Promise.resolve(globalThis.puter?.keepTabLaunchForNextPage_?.(t)).catch(() => {});
+// A URL that differs only in its hash would just scroll, so reload instead.
+const openLaunchUrl = () => {
+if (location.href.split('#')[0] === launchUrl.split('#')[0]) location.reload();
+else location.replace(launchUrl);
+};
+let continuing = false;
 const setStatus = m => { status.textContent = m; };
 const getStored = () => globalThis.puter?.authToken || localStorage.getItem('auth_token') || localStorage.getItem('puter.auth.token');
 const redirectWithToken = t => {
-if (typeof t !== 'string' || !t) throw new Error('missing_auth_token');
-sessionStorage.setItem(storageKey, t);
-const u = new URL(location.href);
+const u = new URL(launchUrl);
 u.searchParams.set('puter.auth.token', t);
 location.replace(u.toString());
 };
-const tryStored = () => {
-const u = new URL(location.href);
+// The token goes in a header, keeping it out of the address bar and history.
+// The response sets this host's cookie, then the app loads. The token goes in
+// the URL instead when the host redirects (no access) or the request fails, so
+// the browser follows it; on a click after a header try with it just now
+// didn't get the app to load; and when the URL already has a token, which the
+// host reads first.
+const launchUrlHasToken = ['puter.auth.token', 'auth_token'].some(k => new URL(launchUrl).searchParams.has(k));
+const viaUrl = t => {
+sessionStorage.setItem(storageKey, t);
+redirectWithToken(t);
+};
+const triedHeaderJustNow = t => {
+try {
+const last = JSON.parse(sessionStorage.getItem(headerKey) || 'null');
+return last?.t === t && Date.now() - last.at < 60000;
+} catch (e) {
+return false;
+}
+};
+const continueWith = async t => {
+if (typeof t !== 'string' || !t) throw new Error('missing_auth_token');
+continuing = true;
+loginBtn.disabled = true;
+await keepLaunch(t);
+if (launchUrlHasToken || triedHeaderJustNow(t)) return viaUrl(t);
+sessionStorage.setItem(headerKey, JSON.stringify({ t, at: Date.now() }));
+let res = null;
+try {
+res = await fetch(launchUrl, { headers: { 'X-Puter-Auth-Token': t }, credentials: 'same-origin', redirect: 'manual', cache: 'no-store' });
+} catch (e) {
+console.error(e);
+}
+if (res && res.type !== 'opaqueredirect') openLaunchUrl();
+else viaUrl(t);
+};
+const tryStored = auto => {
+if (continuing) return true;
+const u = new URL(launchUrl);
 if (u.searchParams.get('puter.auth.token')) return false;
 const t = getStored();
 if (!t) return false;
 const last = sessionStorage.getItem(storageKey);
 if (last === t) return false;
+// Without a click, never fall back to putting the token in the URL.
+if (auto && triedHeaderJustNow(t)) return false;
 setStatus('Using saved Puter session...');
-redirectWithToken(t);
+continueWith(t).catch(e => console.error(e));
 return true;
 };
 loginBtn.addEventListener('click', async () => {
+if (continuing) return;
 loginBtn.disabled = true;
 setStatus('Authenticating with Puter...');
 try {
-if (tryStored()) return;
+// The desktop's token, if it's on its way, rather than an older stored one.
+await keepLaunch();
+if (tryStored(false)) return;
 const r = await globalThis.puter.auth.signIn();
-redirectWithToken(r?.token || getStored());
+await continueWith(r?.token || getStored());
 } catch (e) {
 console.error(e);
 loginBtn.disabled = false;
 setStatus('Sign in was not completed. Click to try again.');
 }
 });
-retryBtn.addEventListener('click', () => location.reload());
-if (tryStored()) return;
+retryBtn.addEventListener('click', openLaunchUrl);
+// A tab the desktop opened is handed a token a moment after load, newer than
+// a stored one.
+keepLaunch().then(() => tryStored(true));
 })();
 </script>
 </body>

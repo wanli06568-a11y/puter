@@ -23,7 +23,10 @@ import jQuery from '../../lib/jquery-3.6.1/jquery-3.6.1.min.js';
 
 // The tab's window and dialog plumbing isn't what these tests exercise.
 vi.mock('../UIWindow.js', () => ({ default: vi.fn() }));
-vi.mock('../UIAlert.js', () => ({ default: vi.fn() }));
+vi.mock('./UIDashboardDialog.js', async (importOriginal) => ({
+    ...(await importOriginal()),
+    default: vi.fn(),
+}));
 vi.mock('../UIWindowProgress.js', () => ({ default: vi.fn() }));
 vi.mock('../UIContextMenu.js', () => ({ default: vi.fn() }));
 vi.mock('../../helpers/generateFileContextMenu.js', () => ({ default: vi.fn(async () => []) }));
@@ -94,6 +97,28 @@ describe('TabFiles emptying the Trash', () => {
         expect(footer()).toContain('0 items');
     });
 
+    it('asks in the dashboard\'s own dialog and empties only on confirm', async () => {
+        mountListing(['a.txt']);
+        const { default: UIDashboardDialog } = await import('./UIDashboardDialog.js');
+        const answers = [];
+        window.empty_trash = vi.fn(async ({ confirm }) => {
+            answers.push(await confirm());
+        });
+
+        UIDashboardDialog.mockClear();
+        UIDashboardDialog.mockResolvedValueOnce(false);
+        await TabFiles.emptyTrash();
+        UIDashboardDialog.mockResolvedValueOnce(true);
+        await TabFiles.emptyTrash();
+
+        expect(UIDashboardDialog).toHaveBeenCalledWith(expect.objectContaining({
+            tone: 'danger',
+            $container: TabFiles.$el_window,
+        }));
+        expect(UIDashboardDialog.mock.calls[0][0].message).toMatch(/permanently delete the items in Trash/);
+        expect(answers).toEqual([false, true]);
+    });
+
     it('leaves a Trash the user chose not to empty as it was', async () => {
         mountListing(['a.txt']);
         window.empty_trash = vi.fn(async () => {});
@@ -116,6 +141,133 @@ describe('TabFiles emptying the Trash', () => {
     });
 });
 
+describe('TabFiles restoring from the Trash', () => {
+    beforeEach(() => {
+        window.trash_path = TRASH;
+        window.byte_format = bytes => `${bytes} B`;
+        window.refresh_trash_state = vi.fn(async () => {});
+        window.puter = { fs: { move: vi.fn(async () => ({})) } };
+    });
+
+    afterEach(() => vi.restoreAllMocks());
+
+    it('says in the user\'s language when an item has no record of where it came from', async () => {
+        const { default: UIDashboardDialog } = await import('./UIDashboardDialog.js');
+        UIDashboardDialog.mockClear();
+        mountListing(['uid-1']);
+        const row = $('.files .row')[0];
+        row.setAttribute('data-name', 'notes.txt');
+        row.setAttribute('data-uid', 'uid-1');
+
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        await TabFiles.restoreRows([row]);
+
+        expect(puter.fs.move).not.toHaveBeenCalled();
+        expect(UIDashboardDialog).toHaveBeenCalledWith(expect.objectContaining({
+            message: '“notes.txt” can’t be restored because where it was deleted from isn’t known.',
+        }));
+        expect($('.files .row')).toHaveLength(1);
+    });
+});
+
+describe('TabFiles New menu creates', () => {
+    const menuItem = (pattern, folder) => TabFiles.generateFolderContextMenu(folder)
+        .find(item => item && item.items).items.find(item => item && pattern.test(item.html));
+    let uploads;
+
+    beforeEach(() => {
+        mountListing([], '/alice/Documents');
+        window.user = { username: 'alice' };
+        window.trash_path = TRASH;
+        window.shared_path = '/alice/Shared';
+        window.file_templates = [];
+        window.sites = [];
+        window.actions_history = [];
+        window.activate_item_name_editor = vi.fn();
+        vi.spyOn(TabFiles, 'pushNavHistory').mockImplementation(() => {});
+        uploads = [];
+        window.puter = { fs: { upload: vi.fn((file, dirname) => new Promise(resolve => {
+            uploads.push(() => resolve({ uid: `u${uploads.length}`, name: file.name, path: `${dirname}/${file.name}` }));
+        })) } };
+        vi.spyOn(TabFiles, 'acceptsNewItemsHere').mockReturnValue(true);
+        vi.spyOn(TabFiles, 'acceptsNewItems').mockReturnValue(true);
+        vi.spyOn(TabFiles, 'renderItem').mockResolvedValue();
+        TabFiles.loadingFolder = false;
+        TabFiles._creatingItem = 0;
+        TabFiles.trashedNames ??= new Map();
+        TabFiles.deferredAdds ??= [];
+    });
+
+    afterEach(() => vi.restoreAllMocks());
+
+    it('puts the real create_file back when two overlap, whichever finishes first', async () => {
+        const real = vi.fn();
+        window.create_file = real;
+
+        const first = menuItem(/text_document|Text/).onClick();
+        const second = menuItem(/html_document|HTML/).onClick();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(uploads).toHaveLength(2);
+        uploads[0]();
+        await first;
+        uploads[1]();
+        await second;
+
+        expect(window.create_file).toBe(real);
+        expect(TabFiles._creatingItem).toBe(0);
+
+        const third = menuItem(/text_document|Text/).onClick();
+        const fourth = menuItem(/html_document|HTML/).onClick();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        uploads[3]();
+        await fourth;
+        uploads[2]();
+        await third;
+
+        expect(window.create_file).toBe(real);
+        expect(TabFiles._creatingItem).toBe(0);
+    });
+
+    it('leaves a listing the user moved to alone when the upload lands after', async () => {
+        window.create_file = vi.fn();
+        vi.spyOn(TabFiles, 'renderDirectory').mockResolvedValue();
+        const created = menuItem(/text_document|Text/).onClick();
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        // The user opened Pictures; its listing is still loading.
+        TabFiles.loadingFolder = true;
+        uploads[0]();
+        await created;
+        expect(TabFiles.renderItem).not.toHaveBeenCalled();
+        expect(TabFiles.renderDirectory).not.toHaveBeenCalled();
+        expect(window.activate_item_name_editor).not.toHaveBeenCalled();
+    });
+
+    it('does not pull the user back once they are in another folder', async () => {
+        window.create_file = vi.fn();
+        vi.spyOn(TabFiles, 'renderDirectory').mockResolvedValue();
+        const created = menuItem(/text_document|Text/).onClick();
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        TabFiles.currentPath = '/alice/Pictures';
+        uploads[0]();
+        await created;
+        expect(TabFiles.renderDirectory).not.toHaveBeenCalled();
+        expect(TabFiles.renderItem).not.toHaveBeenCalled();
+    });
+
+    it('still goes to the folder whose menu made the file', async () => {
+        window.create_file = vi.fn();
+        vi.spyOn(TabFiles, 'renderDirectory').mockResolvedValue();
+        const created = menuItem(/text_document|Text/, '/alice/Videos').onClick();
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        uploads[0]();
+        await created;
+        expect(TabFiles.renderDirectory).toHaveBeenCalledWith('/alice/Videos', { consistency: 'strong' });
+    });
+});
+
 describe('failedUploadsMessage', () => {
     it('puts each failed item on its own line', () => {
         const message = failedUploadsMessage({ failedItems: [
@@ -123,7 +275,7 @@ describe('failedUploadsMessage', () => {
             { name: 'b.txt' },
             { requestIndex: 3 },
         ] });
-        // UIAlert keeps <br> and encodes the rest; a "\n" would collapse into a space.
+        // A "\n" would collapse into a space in the dialog's HTML.
         expect(message.split('<br>').slice(1)).toEqual([
             '- /alice/a.txt (Too large)',
             '- b.txt',
@@ -288,6 +440,61 @@ describe('TabFiles opening a folder that fails to list', () => {
     });
 });
 
+describe('TabFiles beside a file picker', () => {
+    beforeEach(() => {
+        window.user = { username: 'alice', directories: {} };
+        window.home_path = '/alice';
+        window.trash_path = TRASH;
+        window.shared_path = 'puter://shared';
+        window.puter = { fs: { readdir: vi.fn(async () => []) } };
+        window.dashboard_nav_history = ['/alice/Documents'];
+        window.dashboard_nav_history_current_position = 0;
+        $.fn.droppable ??= function () {
+            return this;
+        };
+    });
+
+    it('leaves the picker\'s crumbs and selection alone, though they share its markup', async () => {
+        mountListing(['a.txt'], '/alice/Documents');
+        $('.window').first().find('.files-tab').prepend('<div class="path-breadcrumbs"></div>');
+        $('body').append(`
+            <div class="window window-filedialog">
+                <div class="files-tab">
+                    <div class="path-breadcrumbs">picker crumbs</div>
+                    <div class="files"><div class="row item selected" data-uid="p1"></div></div>
+                </div>
+            </div>`);
+        TabFiles.renderingDirectory = false;
+        TabFiles.trashedNames ??= new Map();
+
+        await TabFiles.renderDirectory('/alice/Pictures');
+
+        expect($('.window-filedialog .path-breadcrumbs').text()).toBe('picker crumbs');
+        expect($('.window-filedialog .row').hasClass('selected')).toBe(true);
+        expect($('.window').first().find('.path-breadcrumbs .dirname').last().text()).toBe('Pictures');
+    });
+
+    it('leaves the keyboard on the picker\'s crumb when the Files tab lists its folder again', async () => {
+        mountListing(['a.txt'], '/alice/Documents');
+        $('.window').first().find('.files-tab').prepend('<div class="path-breadcrumbs"></div>');
+        $('body').append(`
+            <div class="window window-filedialog">
+                <div class="files-tab">
+                    <div class="path-breadcrumbs"><span class="dirname" tabindex="0" data-path="/alice/Desktop">Desktop</span></div>
+                </div>
+            </div>`);
+        TabFiles.renderingDirectory = false;
+        TabFiles.trashedNames ??= new Map();
+        const pickerCrumb = $('.window-filedialog .dirname')[0];
+        pickerCrumb.focus();
+        expect(pickerCrumb.matches(':focus-visible')).toBe(true);
+
+        await TabFiles.renderDirectory('/alice/Pictures');
+
+        expect(document.activeElement).toBe(pickerCrumb);
+    });
+});
+
 describe('TabFiles opening a folder during a refresh', () => {
     beforeEach(() => {
         window.user = { username: 'alice', directories: {} };
@@ -389,8 +596,8 @@ describe('TabFiles New Folder', () => {
     });
 
     it('says so when the network fails, rather than vanishing', async () => {
-        const { default: UIAlert } = await import('../UIAlert.js');
-        UIAlert.mockClear();
+        const { default: UIDashboardDialog } = await import('./UIDashboardDialog.js');
+        UIDashboardDialog.mockClear();
         mountListing([], '/alice/Documents');
         TabFiles.renderingDirectory = false;
         TabFiles._creatingItem = 0;
@@ -402,7 +609,7 @@ describe('TabFiles New Folder', () => {
         await TabFiles.createFolderInstant('/alice/Documents');
 
         expect($('.files .row')).toHaveLength(0);
-        expect(UIAlert).toHaveBeenCalledWith('An unknown error occurred.');
+        expect(UIDashboardDialog).toHaveBeenCalledWith(expect.objectContaining({ message: 'An unknown error occurred.' }));
     });
 
     it('is made, not dropped, while the folder is refreshing', async () => {
@@ -667,10 +874,10 @@ describe('TabFiles image preview', () => {
         expect($('.image-preview-popover')).toHaveLength(0);
     });
 
-    it('reads the image rather than spending an access token on it, typed so an SVG shows', async () => {
-        mountListing(['logo.svg'], '/alice/Pictures');
-        $('.files .row').attr({ 'data-uid': 'u1', 'data-name': 'logo.svg', 'data-is_dir': '0' });
-        window.puter = { fs: { read: vi.fn(async () => new Blob(['<svg/>'])), getReadURL: vi.fn() } };
+    it('reads the image rather than spending an access token on it, from a typed blob: URL', async () => {
+        mountListing(['photo.PNG'], '/alice/Pictures');
+        $('.files .row').attr({ 'data-uid': 'u1', 'data-name': 'photo.PNG', 'data-is_dir': '0' });
+        window.puter = { fs: { read: vi.fn(async () => new Blob(['x'])), getReadURL: vi.fn() } };
         const created = [];
         URL.createObjectURL = vi.fn((blob) => {
             created.push(blob);
@@ -681,11 +888,63 @@ describe('TabFiles image preview', () => {
         await TabFiles.showImagePreview($('.files .row'));
 
         expect(window.puter.fs.getReadURL).not.toHaveBeenCalled();
-        expect(created[0].type).toBe('image/svg+xml');
+        expect(created[0].type).toBe('image/png');
         expect($('.image-preview-popover img').attr('src')).toBe('blob:preview');
 
         TabFiles.closeImagePreview();
         expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:preview');
+    });
+
+    it('shows an SVG from a data: URL, never a blob: URL on this origin', async () => {
+        mountListing(['logo.SVG'], '/alice/Pictures');
+        $('.files .row').attr({ 'data-uid': 'u1', 'data-name': 'logo.SVG', 'data-is_dir': '0' });
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg"/>';
+        window.puter = { fs: { read: vi.fn(async () => new Blob([svg])), getReadURL: vi.fn() } };
+        URL.createObjectURL = vi.fn(() => 'blob:preview');
+        URL.revokeObjectURL = vi.fn();
+
+        await TabFiles.showImagePreview($('.files .row'));
+
+        expect(URL.createObjectURL).not.toHaveBeenCalled();
+        expect($('.image-preview-popover img').attr('src'))
+            .toBe(`data:image/svg+xml;base64,${btoa(svg)}`);
+        expect(TabFiles.previewOpen).toBe(true);
+        TabFiles.closeImagePreview();
+    });
+
+    it('drops an SVG that a newer preview supersedes while it encodes', async () => {
+        mountListing(['a.svg', 'b.png'], '/alice/Pictures');
+        const $rows = $('.files .row');
+        $rows.eq(0).attr({ 'data-uid': 'u1', 'data-name': 'a.svg', 'data-is_dir': '0' });
+        $rows.eq(1).attr({ 'data-uid': 'u2', 'data-name': 'b.png', 'data-is_dir': '0' });
+        window.puter = { fs: { read: vi.fn(async () => new Blob(['<svg/>'])) } };
+        URL.createObjectURL = vi.fn(() => 'blob:b');
+        URL.revokeObjectURL = vi.fn();
+        const RealFileReader = globalThis.FileReader;
+        let finishEncode;
+        globalThis.FileReader = class {
+            readAsDataURL () {
+                finishEncode = () => {
+                    this.result = 'data:image/svg+xml;base64,';
+                    this.onload();
+                };
+            }
+        };
+
+        try {
+            const first = TabFiles.showImagePreview($rows.eq(0));
+            await vi.waitFor(() => expect(finishEncode).toBeDefined());
+            await TabFiles.showImagePreview($rows.eq(1));
+            finishEncode();
+            await first;
+        } finally {
+            globalThis.FileReader = RealFileReader;
+        }
+
+        expect($('.image-preview-popover')).toHaveLength(1);
+        expect($('.image-preview-popover').attr('data-uid')).toBe('u2');
+        expect($('.image-preview-popover img').attr('src')).toBe('blob:b');
+        TabFiles.closeImagePreview();
     });
 
     it('closes, rather than showing the last image, when the next one fails to load', async () => {
@@ -1013,28 +1272,51 @@ describe('TabFiles permanent delete', () => {
     });
 
     it('asks about "this item" for one row and "these items" for several', async () => {
-        const { default: UIAlert } = await import('../UIAlert.js');
-        UIAlert.mockClear();
-        UIAlert.mockResolvedValue('delete');
+        const { default: UIDashboardDialog } = await import('./UIDashboardDialog.js');
+        UIDashboardDialog.mockClear();
+        UIDashboardDialog.mockResolvedValue(true);
         mountListing(['a', 'b'], TRASH);
         const rows = $('.files .row').toArray();
 
         await TabFiles.deleteRowsPermanently([rows[0]]);
-        expect(UIAlert.mock.calls[0][0].message).toMatch(/this item/);
+        expect(UIDashboardDialog.mock.calls[0][0].message).toMatch(/this item/);
         expect(window.delete_item).toHaveBeenCalledTimes(1);
 
         await TabFiles.deleteRowsPermanently(rows);
-        expect(UIAlert.mock.calls[1][0].message).toMatch(/these items/);
+        expect(UIDashboardDialog.mock.calls[1][0].message).toMatch(/these items/);
         expect(window.delete_item).toHaveBeenCalledTimes(3);
     });
 
     it('deletes nothing when cancelled', async () => {
-        const { default: UIAlert } = await import('../UIAlert.js');
-        UIAlert.mockResolvedValue('cancel');
+        const { default: UIDashboardDialog } = await import('./UIDashboardDialog.js');
+        UIDashboardDialog.mockResolvedValue(false);
         mountListing(['a'], TRASH);
 
         await TabFiles.deleteRowsPermanently($('.files .row').toArray());
         expect(window.delete_item).not.toHaveBeenCalled();
+    });
+});
+
+describe('TabFiles name conflict', () => {
+    it('leaves the item where it is when the dialog is dismissed', async () => {
+        const { default: UIDashboardDialog } = await import('./UIDashboardDialog.js');
+        UIDashboardDialog.mockResolvedValue(false);
+
+        expect(await TabFiles.askNameConflict('a.txt', false)).toBe('cancel');
+        expect(await TabFiles.askNameConflict('a.txt', true)).toBe('skip');
+    });
+
+    it('offers Replace all and Skip only for a batch', async () => {
+        const { default: UIDashboardDialog } = await import('./UIDashboardDialog.js');
+        UIDashboardDialog.mockClear();
+        UIDashboardDialog.mockResolvedValue('replace');
+
+        expect(await TabFiles.askNameConflict('a.txt', false)).toBe('replace');
+        await TabFiles.askNameConflict('a.txt', true);
+
+        const values = call => UIDashboardDialog.mock.calls[call][0].buttons.map(b => b.value);
+        expect(values(0)).toEqual(['cancel', 'keep_both', 'replace']);
+        expect(values(1)).toEqual(['skip', 'keep_both', 'replace_all', 'replace']);
     });
 });
 
@@ -1083,6 +1365,57 @@ describe('TabFiles names in a narrow listing', () => {
         TabFiles.fitItemNames($('.files .item-name'));
 
         expect($('.files .item-name').text()).toBe(name);
+    });
+});
+
+describe('TabFiles names in an auto-width name column', () => {
+    const mountNames = (names) => {
+        document.body.innerHTML = `
+            <div class="window"><div class="files-tab">
+                <div class="header"><div class="columns"></div></div>
+                <div class="files files-list-view">${names.map(name => `
+                    <div class="row item" data-name="${name}">
+                        <div class="item-name-wrapper" style="padding: 0 40px 0 0"><pre class="item-name" style="padding: 0 8px"></pre></div>
+                    </div>`).join('')}
+                </div>
+            </div></div>`;
+        TabFiles.$el_window = $('.window');
+        TabFiles.currentView = 'list';
+        TabFiles.appliedColumnWidths = { name: null, sharedBy: 160, size: 60, modified: 80 };
+    };
+
+    beforeEach(() => {
+        // 10px a character; jsdom has no canvas.
+        vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({ measureText: text => ({ width: text.length * 10 }) });
+    });
+
+    afterEach(() => vi.restoreAllMocks());
+
+    it('cut a long name in the middle to the room its wrapper leaves, keeping the end', () => {
+        const long = `${'x'.repeat(60)} (1).txt`;
+        mountNames([long, 'short.txt']);
+        // 256px wrapper, less its 40px and the name's 16px of padding: 200px, 20 characters.
+        vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(256);
+
+        TabFiles.fitItemNames($('.files .item-name'));
+
+        const [$long, $short] = $('.files .item-name').toArray().map(el => $(el));
+        expect($long.text().length).toBeLessThanOrEqual(20);
+        expect($long.text().length).toBeGreaterThan(15);
+        expect($long.text()).toMatch(/^x+…x* \(1\)\.txt$/);
+        expect($long.attr('title')).toBe(long);
+        expect($short.text()).toBe('short.txt');
+        expect($short.attr('title') ?? '').toBe('');
+    });
+
+    it('show the full name while the listing has no width yet', () => {
+        const long = 'y'.repeat(80);
+        mountNames([long]);
+        vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(0);
+
+        TabFiles.fitItemNames($('.files .item-name'));
+
+        expect($('.files .item-name').text()).toBe(long);
     });
 });
 
@@ -1369,6 +1702,22 @@ describe('TabFiles keyboard', () => {
         expect(selected()).toEqual(['/alice/Documents/a.txt']);
     });
 
+    it('leaves Alt and Cmd arrows to the browser', () => {
+        mountKeyboard(['a.txt', 'b.txt']);
+        $('.files .row').first().addClass('selected');
+
+        const back = new KeyboardEvent('keydown', { key: 'ArrowLeft', which: 37, keyCode: 37, altKey: true, bubbles: true, cancelable: true });
+        document.body.dispatchEvent(back);
+        const down = new KeyboardEvent('keydown', { key: 'ArrowDown', which: 40, keyCode: 40, metaKey: true, bubbles: true, cancelable: true });
+        document.body.dispatchEvent(down);
+
+        expect(back.defaultPrevented).toBe(false);
+        expect(down.defaultPrevented).toBe(false);
+        expect(selected()).toEqual(['/alice/Documents/a.txt']);
+        press(document.body, 'ArrowDown', { which: 40, keyCode: 40 });
+        expect(selected()).toEqual(['/alice/Documents/b.txt']);
+    });
+
     it('takes a space typed into a name as part of it', () => {
         mountKeyboard(['my notes.txt', 'my zebra.txt']);
         for ( const key of ['m', 'y', ' ', 'z'] ) press(document.body, key, { which: key.toUpperCase().charCodeAt(0) });
@@ -1475,10 +1824,38 @@ describe('TabFiles listSharedView', () => {
         });
         expect(rows[1].holder_team).toEqual(team);
     });
+
+    it('merges the grants on one item into a single row', async () => {
+        const team = { uid: 't-1', name: 'Acme', handle: 'acme' };
+        const grant = { entryUid: 'u-1', name: 'a.txt', path: '/bob/u-1/a.txt', isDir: false, owner: 'bob' };
+        window.puter = {
+            fs: {
+                listShared: vi.fn(async () => ({
+                    items: [
+                        { ...grant, mode: 'read', issuer: 'bob', holderTeam: team },
+                        { ...grant, mode: 'manage', issuer: 'bob' },
+                        { ...grant, mode: 'read', issuer: 'carol' },
+                    ],
+                })),
+            },
+        };
+
+        const rows = await TabFiles.listSharedView();
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+            uid: 'u-1',
+            share_mode: 'manage',
+            shared_by: 'bob',
+            shared_by_all: ['bob', 'carol'],
+            also_team_share: true,
+        });
+        expect(rows[0].holder_team).toBeUndefined();
+    });
 });
 
 describe('TabFiles path field', () => {
-    let UIAlert;
+    let UIDashboardDialog;
 
     /** The tab's real header and an empty listing, its listeners bound. */
     const mountHeader = (currentPath = '/alice/Documents') => {
@@ -1502,8 +1879,8 @@ describe('TabFiles path field', () => {
     const keydown = (el, key) => el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
 
     beforeEach(async () => {
-        ({ default: UIAlert } = await import('../UIAlert.js'));
-        UIAlert.mockClear();
+        ({ default: UIDashboardDialog } = await import('./UIDashboardDialog.js'));
+        UIDashboardDialog.mockClear();
         window.user = { username: 'alice', directories: {} };
         window.home_path = '/alice';
         window.trash_path = TRASH;
@@ -1592,7 +1969,7 @@ describe('TabFiles path field', () => {
             expect(TabFiles.currentPath).toBe('/');
         }
         expect(window.puter.fs.stat).not.toHaveBeenCalled();
-        expect(UIAlert).not.toHaveBeenCalled();
+        expect(UIDashboardDialog).not.toHaveBeenCalled();
     });
 
     it('opens a typed file\'s folder with the file selected', async () => {
@@ -1632,30 +2009,27 @@ describe('TabFiles path field', () => {
         TabFiles.openPathEditor();
         editor().value = '/alice/Gone';
         // The alert takes the focus, which must not close the field.
-        UIAlert.mockImplementation(async ({ window_options }) => {
+        UIDashboardDialog.mockImplementation(async () => {
             editor().blur();
-            window_options.on_close();
             return true;
         });
 
         await TabFiles.submitPathEditor();
 
-        expect(UIAlert.mock.calls[0][0].message).toContain('/alice/Gone');
+        expect(UIDashboardDialog.mock.calls[0][0].message).toContain('/alice/Gone');
         expect(render).not.toHaveBeenCalled();
         expect(editing()).toBe(true);
         expect(editor().getAttribute('aria-invalid')).toBe('true');
         expect(document.activeElement).toBe(editor());
     });
 
-    it('takes the field back when the alert is closed without its button', async () => {
+    it('takes the field back when the alert is dismissed', async () => {
         mountHeader();
         TabFiles.openPathEditor();
         editor().value = '/alice/Gone';
-        // Escape removes the alert, and what UIAlert returns never settles.
-        UIAlert.mockImplementation(({ window_options }) => {
+        UIDashboardDialog.mockImplementation(async () => {
             editor().blur();
-            window_options.on_close();
-            return new Promise(() => {});
+            return false;
         });
 
         await TabFiles.submitPathEditor();
@@ -1669,12 +2043,12 @@ describe('TabFiles path field', () => {
         mountHeader();
         TabFiles.openPathEditor();
         editor().value = '/alice/Gone';
-        UIAlert.mockImplementation(async ({ window_options }) => window_options.on_close());
+        UIDashboardDialog.mockResolvedValue(true);
 
         await Promise.all([TabFiles.submitPathEditor(), TabFiles.submitPathEditor()]);
 
         expect(window.puter.fs.stat).toHaveBeenCalledTimes(1);
-        expect(UIAlert).toHaveBeenCalledTimes(1);
+        expect(UIDashboardDialog).toHaveBeenCalledTimes(1);
     });
 
     it('calls off a lookup on Escape, and takes a new path at once', async () => {
@@ -1696,7 +2070,7 @@ describe('TabFiles path field', () => {
         await calledOff;
 
         expect(render.mock.calls).toEqual([['/alice/Pictures']]);
-        expect(UIAlert).not.toHaveBeenCalled();
+        expect(UIDashboardDialog).not.toHaveBeenCalled();
     });
 
     it('leaves Enter and Escape to an IME composing a name', () => {

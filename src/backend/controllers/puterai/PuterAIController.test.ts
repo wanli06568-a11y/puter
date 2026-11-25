@@ -27,7 +27,7 @@
  * controller (the unit under test) and provider/driver internals
  * (which have their own tests). Tests cover route registration,
  * actor gating, body validation, response shape (non-stream and SSE),
- * model-listing endpoints, and the HMAC-gated video proxy guards.
+ * and model-listing endpoints.
  */
 
 import { Readable } from 'node:stream';
@@ -49,8 +49,8 @@ import type { RouteOptions } from '../../core/http/index.js';
 import {
     COUNT_TOKENS,
     type ChatCompletionDriver,
-} from '../../drivers/ai-chat/ChatCompletionDriver.js';
-import { AI_CONCURRENT, AI_RATE_LIMIT } from '../../drivers/util/aiLimits.js';
+} from '../../drivers/ai/interfaces/chat/ChatCompletionDriver.js';
+import { AI_CONCURRENT, AI_RATE_LIMIT } from '../../drivers/ai/shared/aiLimits.js';
 import { PuterServer } from '../../server.js';
 import { inRequestScope, setupTestServer } from '../../testUtil.js';
 import { PuterAIController } from './PuterAIController.js';
@@ -199,7 +199,6 @@ describe('PuterAIController.registerRoutes', () => {
                 'get /puterai/image/models/details',
                 'get /puterai/video/models',
                 'get /puterai/video/models/details',
-                'get /puterai/video/proxy',
             ]),
         );
 
@@ -322,9 +321,7 @@ describe('PuterAIController.registerRoutes', () => {
         controller.registerRoutes(router as never);
 
         // The catalogue is fetched before a client has any reason to
-        // authenticate, and the proxy streams a video the account already
-        // paid to generate to whoever holds the signed link — neither has a
-        // plan to read, let alone one to charge for.
+        // authenticate, so it has no plan to read.
         const openPaths = [
             '/puterai/chat/models',
             '/puterai/chat/models/details',
@@ -332,7 +329,6 @@ describe('PuterAIController.registerRoutes', () => {
             '/puterai/image/models/details',
             '/puterai/video/models',
             '/puterai/video/models/details',
-            '/puterai/video/proxy',
             '/puterai/anthropic/v1/models',
             '/puterai/anthropic/v1/models/:id',
         ];
@@ -1115,6 +1111,46 @@ describe('PuterAIController.anthropicMessages', () => {
         expect(seen).toBe(true);
     });
 
+    it('returns the answer of the model a declined request was rerun on', async () => {
+        const marker = {
+            type: 'fallback',
+            from: { model: 'claude-opus-5-5' },
+            to: { model: 'claude-opus-4-8' },
+            trigger: { type: 'refusal', category: 'cyber' },
+        };
+        const completeSpy = stubChatComplete({
+            message: {
+                type: 'message',
+                content: [{ type: 'text', text: 'answer' }],
+            },
+            finish_reason: 'stop',
+            stopReason: 'end_turn',
+            refusalFallbacks: [marker],
+            usageDetails: {
+                inputTokens: 4,
+                outputTokens: 2,
+                fallbackModel: 'claude-opus-4-8',
+            },
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-opus-5-5',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        expect(completeSpy.mock.calls[0]![0].refusalFallback).toBeUndefined();
+        const body = captured.body as Record<string, unknown>;
+        expect(body.model).toBe('claude-opus-4-8');
+        expect(body.content).toEqual([marker, { type: 'text', text: 'answer' }]);
+    });
+
     it('shapes a non-stream completion as an Anthropic message envelope', async () => {
         const completeSpy = stubChatComplete({
             message: { role: 'assistant', content: 'hi there' },
@@ -1371,194 +1407,6 @@ describe('PuterAIController model listing', () => {
     });
 });
 
-// ── Video proxy (HMAC-gated) ────────────────────────────────────────
-
-describe('PuterAIController videoProxy', () => {
-    const captureProxyHandler = (): ((
-        req: Request,
-        res: Response,
-    ) => Promise<void>) => {
-        let handler: ((req: Request, res: Response) => Promise<void>) | null =
-            null;
-        const router = {
-            post: vi.fn(),
-            get: vi.fn((path: string, _opts: unknown, h: never) => {
-                if (path === '/puterai/video/proxy') {
-                    handler = h;
-                }
-            }),
-        };
-        controller.registerRoutes(router as never);
-        if (!handler)
-            throw new Error('did not capture /puterai/video/proxy handler');
-        return handler;
-    };
-
-    it('rejects requests with an invalid fileId character', async () => {
-        const handler = captureProxyHandler();
-        const { res, captured } = makeRes();
-        await handler(
-            makeReq({
-                query: {
-                    fileId: 'has spaces!',
-                    expires: '9999999999',
-                    signature: 'abc',
-                },
-            }),
-            res,
-        );
-        expect(captured.statusCode).toBe(400);
-    });
-
-    it('rejects requests missing expires/signature with 403', async () => {
-        const handler = captureProxyHandler();
-        const { res, captured } = makeRes();
-        await handler(makeReq({ query: { fileId: 'abc' } }), res);
-        expect(captured.statusCode).toBe(403);
-    });
-
-    it('rejects expired signatures with 403', async () => {
-        const handler = captureProxyHandler();
-        const { res, captured } = makeRes();
-        await handler(
-            makeReq({
-                query: {
-                    fileId: 'abc',
-                    expires: '1',
-                    signature: '00',
-                },
-            }),
-            res,
-        );
-        expect(captured.statusCode).toBe(403);
-    });
-
-    it('rejects an invalid signature with 403 once expiry/format checks pass', async () => {
-        const handler = captureProxyHandler();
-        // The default test config provides a signature secret, so a
-        // bogus signature with a future expiry should reach the
-        // timingSafeEqual gate and fail with 403. (The secret-missing
-        // 500 branch is unreachable when running against the default
-        // wired config.)
-        const { res, captured } = makeRes();
-        await handler(
-            makeReq({
-                query: {
-                    fileId: 'abc',
-                    expires: String(Math.floor(Date.now() / 1000) + 60),
-                    signature: 'deadbeef',
-                },
-            }),
-            res,
-        );
-        expect(captured.statusCode).toBe(403);
-    });
-
-    it('500s when url_signature_secret is not configured', async () => {
-        // Temporarily blank the secret so the controller hits the
-        // 500 branch instead of the constant-time-compare gate.
-        const cfg = (
-            controller as unknown as { config: Record<string, unknown> }
-        ).config;
-        const orig = cfg.url_signature_secret;
-        cfg.url_signature_secret = undefined;
-        try {
-            const handler = captureProxyHandler();
-            const { res, captured } = makeRes();
-            await handler(
-                makeReq({
-                    query: {
-                        fileId: 'abc',
-                        expires: String(Math.floor(Date.now() / 1000) + 60),
-                        signature: 'deadbeef',
-                    },
-                }),
-                res,
-            );
-            expect(captured.statusCode).toBe(500);
-        } finally {
-            cfg.url_signature_secret = orig;
-        }
-    });
-
-    it('rejects unsupported providers with 400 after passing the HMAC gate', async () => {
-        // Hit the post-signature `provider !== 'gemini'` branch by
-        // computing a valid signature for a known fileId/expires combo
-        // and then sending a different provider in the query.
-        const cfg = (
-            controller as unknown as { config: Record<string, unknown> }
-        ).config;
-        const secret = cfg.url_signature_secret as string;
-        const fileId = 'abc-123';
-        const expires = String(Math.floor(Date.now() / 1000) + 60);
-        const crypto = await import('node:crypto');
-        const signature = crypto
-            .createHash('sha256')
-            .update(`${fileId}/video-proxy/${secret}/${expires}`)
-            .digest('hex');
-
-        const handler = captureProxyHandler();
-        const { res, captured } = makeRes();
-        await handler(
-            makeReq({
-                query: {
-                    fileId,
-                    expires,
-                    signature,
-                    provider: 'not-gemini',
-                },
-            }),
-            res,
-        );
-        expect(captured.statusCode).toBe(400);
-    });
-
-    it('500s when provider=gemini but no Gemini API key is configured', async () => {
-        const cfg = (
-            controller as unknown as {
-                config: Record<string, unknown> & {
-                    providers?: Record<
-                        string,
-                        Record<string, unknown> | undefined
-                    >;
-                };
-            }
-        ).config;
-        const secret = cfg.url_signature_secret as string;
-        const fileId = 'gemini-no-key';
-        const expires = String(Math.floor(Date.now() / 1000) + 60);
-        const crypto = await import('node:crypto');
-        const signature = crypto
-            .createHash('sha256')
-            .update(`${fileId}/video-proxy/${secret}/${expires}`)
-            .digest('hex');
-
-        const origProviders = cfg.providers;
-        // Wipe out the gemini-video-generation key for the call.
-        cfg.providers = { ...(origProviders ?? {}) };
-        delete cfg.providers['gemini-video-generation'];
-
-        try {
-            const handler = captureProxyHandler();
-            const { res, captured } = makeRes();
-            await handler(
-                makeReq({
-                    query: {
-                        fileId,
-                        expires,
-                        signature,
-                        provider: 'gemini',
-                    },
-                }),
-                res,
-            );
-            expect(captured.statusCode).toBe(500);
-        } finally {
-            cfg.providers = origProviders;
-        }
-    });
-});
-
 // ── /openai/v1/completions streaming ────────────────────────────────
 
 describe('PuterAIController.openaiCompletions streaming + edges', () => {
@@ -1784,6 +1632,84 @@ describe('PuterAIController.openaiResponses streaming + edges', () => {
         expect(out).toContain('"id":"fc_upstream"');
     });
 
+    it('puts the streamed arguments on the finished function_call items', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'tool_use_start', id: 'call_a', name: 'lookup' },
+                {
+                    type: 'tool_input_delta',
+                    id: 'call_a',
+                    partialJson: '{"q":',
+                },
+                { type: 'tool_use_start', id: 'call_b', name: 'fetch' },
+                {
+                    type: 'tool_input_delta',
+                    id: 'call_a',
+                    partialJson: '"hi"}',
+                },
+                {
+                    type: 'tool_input_delta',
+                    id: 'call_b',
+                    partialJson: '{"n":2}',
+                },
+                {
+                    type: 'tool_use',
+                    id: 'call_a',
+                    name: 'lookup',
+                    input: { q: 'hi' },
+                },
+                {
+                    type: 'tool_use',
+                    id: 'call_b',
+                    name: 'fetch',
+                    input: { n: 2 },
+                },
+                {
+                    type: 'usage',
+                    usage: { prompt_tokens: 1, completion_tokens: 1 },
+                    finish_reason: 'tool_calls',
+                },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'tool me', stream: true },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await vi.waitFor(() =>
+            expect(captured.written.join('')).toContain('response.completed'),
+        );
+
+        const events = captured.written
+            .join('')
+            .split('\n\n')
+            .map((frame) =>
+                frame.split('\n').find((l) => l.startsWith('data: ')),
+            )
+            .filter((line) => line && line !== 'data: [DONE]')
+            .map((line) => JSON.parse(line!.slice('data: '.length)));
+        const argumentsOf = (items: { arguments: string }[]) =>
+            items.map((item) => item.arguments);
+        const done = events
+            .filter((event) => event.type === 'response.output_item.done')
+            .map((event) => event.item);
+        const completed = events.find(
+            (event) => event.type === 'response.completed',
+        );
+
+        expect(argumentsOf(done)).toEqual(['{"q":"hi"}', '{"n":2}']);
+        expect(argumentsOf(completed.response.output)).toEqual([
+            '{"q":"hi"}',
+            '{"n":2}',
+        ]);
+    });
+
     it('emits a `response.error`-shaped SSE frame when the source stream errors', async () => {
         const errStream = new Readable({
             read() {
@@ -1956,6 +1882,44 @@ describe('PuterAIController.anthropicMessages streaming + helpers', () => {
         expect(stop).toBeGreaterThan(delta);
         expect(out).toContain('"text":"one"');
         expect(out).toContain('"text":"two"');
+    });
+
+    it('writes a streamed fallback marker as a fallback content block', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                {
+                    type: 'refusal_fallback',
+                    from: { model: 'claude-opus-5-5' },
+                    to: { model: 'claude-opus-4-8' },
+                    trigger: { type: 'refusal', category: null },
+                },
+                { type: 'text', text: 'answer' },
+                { type: 'usage', usage: {} },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-opus-5-5',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        const block = out.indexOf(
+            '"content_block":{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":null}}',
+        );
+        expect(block).toBeGreaterThan(out.indexOf('event: message_start'));
+        expect(out.indexOf('"text":"answer"')).toBeGreaterThan(block);
     });
 
     it('translates a streamed tool_use into content_block_start/delta/stop with type=tool_use', async () => {

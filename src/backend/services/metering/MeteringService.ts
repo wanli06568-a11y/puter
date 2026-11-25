@@ -18,6 +18,7 @@
  */
 
 import { randomInt } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import murmurhash from 'murmurhash';
 import type { Actor } from '../../core/actor';
 import { isSystemActor } from '../../core/actor';
@@ -37,7 +38,6 @@ import {
     POLICY_PREFIX,
     UNLIMITED_SUBSCRIPTION,
     USAGE_DETAIL_SHARD_COUNT,
-    V1_CLAIM_THROUGH_MONTH,
     isFreeSubscription,
     registerFreeSubscription,
 } from './consts';
@@ -49,7 +49,8 @@ import type {
     UsageByType,
     UsageInput,
 } from './types';
-import { NO_CREDIT_HOLD } from './types';
+import { creditsRefilled } from './enforcement';
+import { NO_CREDIT_HOLD, type UsageHeadroom } from './types';
 import {
     addUsageDetail,
     decodeUsageDetail,
@@ -63,6 +64,7 @@ import type { RecursiveRecord } from '../../stores/systemKv/SystemKVStore';
 import { LOCAL_UNLIMITED_USER } from '../../data/subPolicies/localUnlimitedUserPolicy.js';
 import { SUB_POLICIES } from '../../data/subPolicies/index.js';
 import { REGISTERED_USER_FREE } from '../../data/subPolicies/registeredUserFreePolicy.js';
+import { BoundedTtlMap } from '../../util/boundedTtlMap.js';
 import { runWithConcurrencyLimitSettled } from '../../util/concurrency.js';
 
 // -- Types ------------------------------------------------------------
@@ -87,7 +89,10 @@ export interface ActorSubscriptionStatus {
 
 /** A `provisional` answer wins but is cached only for the fallback window. */
 export type SubscriptionAnswer =
-    string | { id: string | null; provisional: boolean } | null | undefined;
+    | string
+    | { id: string | null; provisional: boolean }
+    | null
+    | undefined;
 
 export type SubscriptionResolver = (
     actor: Actor,
@@ -103,13 +108,23 @@ type TypeAmounts = { units: number; cost: number; count: number };
 /**
  * What the write path hands back to the caller: the actor month's running view
  * (as `stores.kv.incr` returns it) plus the decoded per-type detail this call
- * actually touched. `exactUsageNearAllowance` reads `res`/`exact` only.
+ * actually touched. The detail is still being written when this resolves, so
+ * settling doesn't wait on it; it never rejects.
  */
 type UsageWriteResult = {
     res: RecursiveRecord<number>;
     exact: boolean;
-    detail?: FlatUsageDetail;
+    detail: Promise<FlatUsageDetail>;
 };
+
+/** Every month's global shard sits under this, as `<shard>:<YYYY-MM>`. */
+const GLOBAL_USAGE_PREFIX = `${METRICS_V2_PREFIX}:puter:`;
+const GLOBAL_SHARD_KEY_RE = /^\d+:(\d{4}-\d{2})$/;
+/**
+ * Read units a sweep of the global shards draws per second. Their partition
+ * serves 3,000 and every request's metering reads share it.
+ */
+const SHARD_SWEEP_READ_UNITS_PER_SECOND = 1000;
 
 /** Compares fleet-wide spend against `maxGlobalUsagePerMinute`. */
 const GLOBAL_RATE_CHECK_JOB = 'metering.globalRateCheck';
@@ -178,6 +193,8 @@ export class MeteringService extends PuterService {
      */
     static GLOBAL_SHARD_COUNT = 10000;
     static APP_SHARD_COUNT = 10000;
+    /** Shards one page of a sweep reads; the pause between pages is the pacing. */
+    static SHARD_SWEEP_PAGE_ITEMS = 1000;
 
     /**
      * Share of the allowance past which an approximate running total is no
@@ -194,7 +211,7 @@ export class MeteringService extends PuterService {
      */
     static FORCE_EXACT_READ_MS = 15_000;
 
-    /** Bound for `#forceExactUntil`, same FIFO posture as the other actor maps. */
+    /** Bound for `#forceExactUntil`, like the other per-actor maps. */
     static FORCE_EXACT_MEMO_LIMIT = 10_000;
 
     /**
@@ -305,7 +322,7 @@ export class MeteringService extends PuterService {
     private pendingAuxPromises = new Set<Promise<unknown>>();
 
     /** Uuid → resolved policy + expiry; `lookupFailed` marks a fallback. */
-    private subscriptionCache = new Map<
+    private subscriptionCache = new BoundedTtlMap<
         string,
         {
             policy: SubscriptionPolicy;
@@ -314,19 +331,19 @@ export class MeteringService extends PuterService {
             /** No explicit subscription answered, so this is a default. */
             fromDefault: boolean;
         }
-    >();
+    >({ maxEntries: MeteringService.SUBSCRIPTION_CACHE_LIMIT });
 
     /** Uuid → last budget state sent; `rearmed` makes the next one news. */
-    private creditAlertState = new Map<
+    private creditAlertState = new BoundedTtlMap<
         string,
         'ok' | 'near-limit' | 'exhausted' | 'rearmed'
-    >();
+    >({ maxEntries: MeteringService.CREDIT_CACHE_LIMIT });
 
     /** Uuid → whether the actor had budget left. See CREDIT_CACHE_MS. */
-    private creditCache = new Map<
+    private creditCache = new BoundedTtlMap<
         string,
         { hasCredits: boolean; expiresAt: number }
-    >();
+    >({ maxEntries: MeteringService.CREDIT_CACHE_LIMIT });
 
     /**
      * Uuid → an addons record with no purchased credit left, for the increment
@@ -335,12 +352,15 @@ export class MeteringService extends PuterService {
      * caching for the force-exact window. A record with credit left is always
      * read fresh: other nodes draw it down unannounced.
      */
-    #spentAddons = new Map<
+    #spentAddons = new BoundedTtlMap<
         string,
         { addons: UsageAddons; expiresAt: number }
-    >();
+    >({ maxEntries: MeteringService.CREDIT_CACHE_LIMIT });
     /** Bumped on every drop, so a read that straddles one isn't cached. */
     #spentAddonsDrops = 0;
+
+    /** Running sum reported by `#alarmSettleReadFailed`. */
+    #unchargedSinceStart = 0;
 
     /**
      * Uuid → until when a near-allowance read bypasses the exact-read throttle.
@@ -349,7 +369,9 @@ export class MeteringService extends PuterService {
      * so the next near-allowance decision reads exact unconditionally instead
      * of trusting a throttled answer.
      */
-    #forceExactUntil = new Map<string, number>();
+    #forceExactUntil = new BoundedTtlMap<string, number>({
+        maxEntries: MeteringService.FORCE_EXACT_MEMO_LIMIT,
+    });
 
     /**
      * Uuid → the refresh currently running for it, so concurrent requests share
@@ -375,7 +397,9 @@ export class MeteringService extends PuterService {
      * landed. The retry sends the same token, so it can tell. Bounded by
      * MONTHLY_CHARGE_MEMO_LIMIT.
      */
-    private pendingClaimTokens = new Map<string, number>();
+    private pendingClaimTokens = new BoundedTtlMap<string, number>({
+        maxEntries: MeteringService.MONTHLY_CHARGE_MEMO_LIMIT,
+    });
 
     /**
      * Usage waiting to be written, keyed by actor and app so each bucket
@@ -640,6 +664,7 @@ export class MeteringService extends PuterService {
                             costOverrideRaw,
                         },
                         'info',
+                        { channel: 'billing' },
                     );
                 }
 
@@ -675,51 +700,99 @@ export class MeteringService extends PuterService {
                 appCallCount: usages.length,
             });
 
+            // The usage is already being recorded, so a failed balance read
+            // must not skip settling it.
+            let settleReadError: Error | null = null;
             const [usageResult, subscription, actorAddons] = await Promise.all([
                 usageResultPromise,
                 this.#actorSubscriptionWithStatus(actor),
-                this.#addonsForSettle(actor),
+                (async () => {
+                    try {
+                        return await this.#addonsForSettle(actor);
+                    } catch (e) {
+                        settleReadError = e as Error;
+                        return null;
+                    }
+                })(),
             ]);
             const { policy: actorSubscription, provisionalUntil } =
                 subscription;
 
-            const actorUsages = await this.exactUsageNearAllowance(
-                userId,
-                actorUsageKey,
-                usageResult,
-                actorSubscription.monthUsageAllowance,
-            );
+            let actorUsages: UsageByType;
+            try {
+                actorUsages = await this.exactUsageNearAllowance(
+                    userId,
+                    actorUsageKey,
+                    usageResult,
+                    actorSubscription.monthUsageAllowance,
+                );
+            } catch (e) {
+                settleReadError ??= e as Error;
+                actorUsages = usageResult.res as unknown as UsageByType;
+            }
 
+            // After a failed read only the allowance share is charged:
+            // purchased credit is never drawn against an unread balance.
+            const readAddons = settleReadError ? null : actorAddons;
             const settledAllowanceUsed = await this.settleIncrementCharges(
                 userId,
                 actorUsageKey,
                 actorUsages,
                 actorSubscription,
-                actorAddons,
+                readAddons ?? ({} as UsageAddons),
                 totalBatchCost,
             );
             // Before any hold this usage stands for is released.
             await this.stores.creditHold.bump(userId);
 
-            this.maybeAlertOveruse({
-                actor,
-                userId,
-                actorUsages,
-                actorSubscription,
-                actorAddons,
-                incrementCost: totalBatchCost,
-                batchUsages: usages,
-            });
-
-            this.rememberRemainingCredits(
-                userId,
-                settledAllowanceUsed,
-                actorSubscription,
-                actorAddons,
-                provisionalUntil,
+            // What the allowance did not cover of this batch.
+            const overage = Math.max(
+                0,
+                totalBatchCost -
+                    (settledAllowanceUsed -
+                        MeteringService.allowanceUsedBefore(
+                            actorUsages,
+                            actorSubscription.monthUsageAllowance,
+                            totalBatchCost,
+                        )),
             );
+            if (!readAddons) {
+                this.#alarmSettleReadFailed(actor, settleReadError, overage);
+            } else {
+                this.maybeAlertOveruse({
+                    actor,
+                    userId,
+                    actorUsages,
+                    actorSubscription,
+                    actorAddons,
+                    incrementCost: totalBatchCost,
+                    batchUsages: usages,
+                });
 
-            const own = this.#withDetail(actorUsages, usageResult.detail);
+                // `actorAddons` was read before this batch drew on it. Right
+                // after a credits change it may predate that too, and counting
+                // the draw could report credit that just landed as spent.
+                const consumed = actorAddons?.consumedPurchaseCredits || 0;
+                const unspent = Math.max(
+                    0,
+                    (actorAddons?.purchasedCredits || 0) - consumed,
+                );
+                const drawn = this.#isForcingExactReads(userId)
+                    ? 0
+                    : Math.min(overage, unspent);
+                this.rememberRemainingCredits(
+                    userId,
+                    settledAllowanceUsed,
+                    actorSubscription,
+                    actorAddons && {
+                        ...actorAddons,
+                        consumedPurchaseCredits: consumed + drawn,
+                    },
+                    provisionalUntil,
+                );
+            }
+
+            const own = this.#withDetail(actorUsages, await usageResult.detail);
             const charged = await this.applyMonthlyCharges(
                 actor,
                 currentMonth,
@@ -727,9 +800,7 @@ export class MeteringService extends PuterService {
             );
             // Where the call and a charge touched the same type, the charge's
             // running record is the newer one.
-            return charged && usageResult.detail
-                ? ({ ...own, ...charged } as UsageByType)
-                : (charged ?? own);
+            return charged ? ({ ...own, ...charged } as UsageByType) : own;
         } catch (e) {
             // Part of the usage may have landed before the failure.
             if (actor?.user?.uuid) {
@@ -753,6 +824,7 @@ export class MeteringService extends PuterService {
                     batchUsages: usages,
                 },
                 'info',
+                { channel: 'billing' },
             );
             return { total: 0 } as UsageByType;
         }
@@ -786,26 +858,28 @@ export class MeteringService extends PuterService {
             pathAndAmountMap: { total: appTotalCost },
         });
 
-        let detail: FlatUsageDetail = {};
-        try {
-            detail = await this.#recordDetail({
-                userId,
-                appId,
-                month: currentMonth,
-                byType,
-                knownPaths:
-                    (totals.res as unknown as UsageByType).detailPaths ?? 0,
-                appTotalCost,
-                appCallCount,
-                includeAppAggregate: appId !== GLOBAL_APP_KEY,
-            });
-        } catch (e) {
-            // The total is already settled — a detail failure must never
-            // take the billing decision that depends on it down too.
-            console.warn(
-                `[metering] usage detail write failed for ${userId}: ${(e as Error).message}`,
-            );
-        }
+        const detail = (async (): Promise<FlatUsageDetail> => {
+            try {
+                return await this.#recordDetail({
+                    userId,
+                    appId,
+                    month: currentMonth,
+                    byType,
+                    knownPaths:
+                        (totals.res as unknown as UsageByType).detailPaths ?? 0,
+                    appTotalCost,
+                    appCallCount,
+                    includeAppAggregate: appId !== GLOBAL_APP_KEY,
+                });
+            } catch (e) {
+                // The total is already settled — a detail failure must never
+                // take the billing decision that depends on it down too.
+                console.warn(
+                    `[metering] usage detail write failed for ${userId}: ${(e as Error).message}`,
+                );
+                return {};
+            }
+        })();
 
         return { res: totals.res, exact: totals.exact, detail };
     }
@@ -1201,37 +1275,40 @@ export class MeteringService extends PuterService {
             };
         }
 
-        const monthKey = `${METRICS_V2_PREFIX}:actor:${actor.user.uuid}:${currentMonth}`;
+        const userId = actor.user.uuid;
+        const monthKey = `${METRICS_V2_PREFIX}:actor:${userId}:${currentMonth}`;
 
-        const { res } = await this.stores.meteringBuffer.get({
-            key: monthKey,
-        });
-        const usage = res as UsageByType | null;
+        const readUsage = async (): Promise<UsageByType> => {
+            const { res } = await this.stores.meteringBuffer.get({
+                key: monthKey,
+            });
+            const usage = res as UsageByType | null;
 
-        // Reading the month is one of the two things that settles its
-        // recurring charges.
-        const charged = await this.applyMonthlyCharges(
-            actor,
-            currentMonth,
-            usage,
-        );
-        const resolvedUsage = await this.#composeShardedUsage(
-            this.#actorDetailKeys(actor.user.uuid, currentMonth),
-            monthKey,
-            // `charged` already carries shard detail, which composing reads
-            // again; keep only its scalars.
-            charged
-                ? ({
-                      ...(usage ?? {}),
-                      ...scalarsOf(charged),
-                  } as unknown as UsageByType)
-                : usage,
-        );
+            // Reading the month is one of the two things that settles its
+            // recurring charges.
+            const charged = await this.applyMonthlyCharges(
+                actor,
+                currentMonth,
+                usage,
+            );
+            return this.#composeShardedUsage(
+                this.#actorDetailKeys(userId, currentMonth),
+                monthKey,
+                // `charged` already carries shard detail, which composing reads
+                // again; keep only its scalars.
+                charged
+                    ? ({
+                          ...(usage ?? {}),
+                          ...scalarsOf(charged),
+                      } as unknown as UsageByType)
+                    : usage,
+            );
+        };
 
-        const appTotals = await this.#actorAppTotals(
-            actor.user.uuid,
-            currentMonth,
-        );
+        const [resolvedUsage, appTotals] = await Promise.all([
+            readUsage(),
+            this.#actorAppTotals(userId, currentMonth),
+        ]);
 
         return { usage: resolvedUsage, appTotals };
     }
@@ -1509,12 +1586,23 @@ export class MeteringService extends PuterService {
      */
     async getUsageHeadroom(
         actor: Actor,
-    ): Promise<{ balance: number; held: number }> {
+        opts: { versioned?: boolean } = {},
+    ): Promise<UsageHeadroom> {
+        const userId = actor?.user?.uuid;
+        // Read before the balance, so a write the balance misses bumps it.
+        const version =
+            opts.versioned && userId
+                ? await this.stores.creditHold.version(userId)
+                : undefined;
         const [{ remaining }, held] = await Promise.all([
             this.getAllowedUsage(actor),
             this.getOutstandingHolds(actor),
         ]);
-        return { balance: remaining || 0, held };
+        return {
+            balance: remaining || 0,
+            held,
+            ...(version !== undefined ? { version } : {}),
+        };
     }
 
     /**
@@ -1535,15 +1623,51 @@ export class MeteringService extends PuterService {
      * being able to reach the cache is our problem, and turning it into failed
      * requests for everyone spending money is worse than the overshoot it would
      * prevent.
+     *
+     * With `within`, the headroom the caller sized the operation from, the hold
+     * is taken only if it still fits: null when another operation took the room
+     * since that read, `'stale'` when the balance changed. Either way the
+     * caller reads the headroom again and sizes the operation anew.
      */
     async reserveCredits(
         actor: Actor,
         amount: number,
-        opts: { ttlMs?: number } = {},
-    ): Promise<CreditHold> {
+        opts?: { ttlMs?: number },
+    ): Promise<CreditHold>;
+    async reserveCredits(
+        actor: Actor,
+        amount: number,
+        opts: { ttlMs?: number; within: UsageHeadroom },
+    ): Promise<CreditHold | 'stale' | null>;
+    async reserveCredits(
+        actor: Actor,
+        amount: number,
+        opts: { ttlMs?: number; within?: UsageHeadroom } = {},
+    ): Promise<CreditHold | 'stale' | null> {
         const userId = actor?.user?.uuid;
         if (!userId || isSystemActor(actor) || !(amount > 0)) {
             return NO_CREDIT_HOLD;
+        }
+
+        if (opts.within) {
+            const { balance, version } = opts.within;
+            // The cache couldn't answer the read either; the caller's own
+            // check of the balance stands.
+            if (version === null) return NO_CREDIT_HOLD;
+            const result = await this.stores.creditHold.reserve(
+                userId,
+                // Rounded down: the amount was sized to fit the headroom, and
+                // rounding up could put it a unit past it.
+                Math.max(1, Math.floor(amount)),
+                balance,
+                version ?? '',
+                opts.ttlMs,
+            );
+            if (result.outcome === 'accepted') {
+                return this.#holdHandle(userId, result.member, opts.ttlMs);
+            }
+            if (result.outcome === 'unavailable') return NO_CREDIT_HOLD;
+            return result.outcome === 'stale' ? 'stale' : null;
         }
 
         const member = await this.stores.creditHold.take(
@@ -1560,12 +1684,25 @@ export class MeteringService extends PuterService {
      * operations hold; null when it doesn't. The check and the hold are one
      * step in the cache, and a usage write or release that lands after the
      * balance read sends the reservation back to read it again. When the cache
-     * can't answer, the balance alone decides and nothing is held.
+     * can't answer, the balance alone decides and nothing is held. A listener
+     * that tops the actor up at the moment of refusal gets one more try.
      */
     async reserveCreditsIfAffordable(
         actor: Actor,
         amount: number,
         opts: { ttlMs?: number } = {},
+    ): Promise<CreditHold | null> {
+        const hold = await this.#reserveIfAffordable(actor, amount, opts);
+        if (hold || !(await creditsRefilled(this.clients.event, actor))) {
+            return hold;
+        }
+        return this.#reserveIfAffordable(actor, amount, opts);
+    }
+
+    async #reserveIfAffordable(
+        actor: Actor,
+        amount: number,
+        opts: { ttlMs?: number },
     ): Promise<CreditHold | null> {
         const userId = actor?.user?.uuid;
         if (
@@ -1760,7 +1897,7 @@ export class MeteringService extends PuterService {
     }
 
     /** Nothing to run out of, unless the plan says it grants nothing. */
-    private static isUnmetered(policy: SubscriptionPolicy): boolean {
+    static isUnmetered(policy: SubscriptionPolicy): boolean {
         return !policy.noAllowance && !(policy.monthUsageAllowance > 0);
     }
 
@@ -1790,10 +1927,6 @@ export class MeteringService extends PuterService {
                 (addons?.consumedPurchaseCredits || 0),
         );
         return remainingAllowance + remainingPurchasedCredits;
-    }
-
-    async hasAnyUsage(actor: Actor): Promise<boolean> {
-        return (await this.getRemainingUsage(actor)) > 0;
     }
 
     async hasEnoughCredits(actor: Actor, amount: number): Promise<boolean> {
@@ -1880,14 +2013,6 @@ export class MeteringService extends PuterService {
      * `#forceExactUntil`.
      */
     #rememberForceExact(userUuid: string): void {
-        if (
-            this.#forceExactUntil.size >=
-                MeteringService.FORCE_EXACT_MEMO_LIMIT &&
-            !this.#forceExactUntil.has(userUuid)
-        ) {
-            const oldest = this.#forceExactUntil.keys().next().value;
-            if (oldest !== undefined) this.#forceExactUntil.delete(oldest);
-        }
         this.#forceExactUntil.set(
             userUuid,
             Date.now() + MeteringService.FORCE_EXACT_READ_MS,
@@ -1979,6 +2104,19 @@ export class MeteringService extends PuterService {
             monthUsageAllowance,
             addons,
         );
+        try {
+            this.clients.event.emit(
+                'metering.balance',
+                {
+                    userUuid: userId,
+                    remaining,
+                    subscriptionId: subscription.id,
+                },
+                {},
+            );
+        } catch (e) {
+            console.warn('[metering] balance emit failed:', e);
+        }
     }
 
     /** Transitions only: a blocked actor retries, and every retry lands here. */
@@ -2003,14 +2141,6 @@ export class MeteringService extends PuterService {
                   : 'ok';
 
         if (this.creditAlertState.get(userUuid) === state) return;
-        // Same FIFO bound as `creditCache`; this map has one entry per actor.
-        if (
-            this.creditAlertState.size >= MeteringService.CREDIT_CACHE_LIMIT &&
-            !this.creditAlertState.has(userUuid)
-        ) {
-            const oldest = this.creditAlertState.keys().next().value;
-            if (oldest !== undefined) this.creditAlertState.delete(oldest);
-        }
         this.creditAlertState.set(userUuid, state);
         if (state === 'ok') return;
 
@@ -2049,12 +2179,6 @@ export class MeteringService extends PuterService {
             existing.expiresAt = expiresAt;
             return;
         }
-        // Map preserves insertion order; FIFO-evict so a flood of one-shot
-        // actors can't grow this without bound.
-        if (this.creditCache.size >= MeteringService.CREDIT_CACHE_LIMIT) {
-            const oldest = this.creditCache.keys().next().value;
-            if (oldest !== undefined) this.creditCache.delete(oldest);
-        }
         this.creditCache.set(userId, { hasCredits, expiresAt });
     }
 
@@ -2087,11 +2211,6 @@ export class MeteringService extends PuterService {
 
     async getActorSubscription(actor: Actor): Promise<SubscriptionPolicy> {
         return (await this.#actorSubscriptionWithStatus(actor)).policy;
-    }
-
-    /** On a plan somebody subscribed them to, not one a resolver inferred. */
-    async actorHasPaidSubscription(actor: Actor): Promise<boolean> {
-        return (await this.getActorSubscriptionStatus(actor)).paid;
     }
 
     /** The plan, whether it is paid, and whether the answer is provisional. */
@@ -2164,15 +2283,6 @@ export class MeteringService extends PuterService {
             };
         }
 
-        // Map preserves insertion order; FIFO-evict so a flood of one-shot
-        // actors can't grow this without bound.
-        if (
-            this.subscriptionCache.size >=
-            MeteringService.SUBSCRIPTION_CACHE_LIMIT
-        ) {
-            const oldest = this.subscriptionCache.keys().next().value;
-            if (oldest !== undefined) this.subscriptionCache.delete(oldest);
-        }
         const expiresAt =
             now +
             (resolved.lookupFailed
@@ -2358,10 +2468,6 @@ export class MeteringService extends PuterService {
             this.#isForcingExactReads(uuid)
         )
             return addons;
-        if (this.#spentAddons.size >= MeteringService.CREDIT_CACHE_LIMIT) {
-            const oldest = this.#spentAddons.keys().next().value;
-            if (oldest !== undefined) this.#spentAddons.delete(oldest);
-        }
         this.#spentAddons.set(uuid, {
             addons,
             expiresAt: Date.now() + MeteringService.CREDIT_CACHE_MS,
@@ -2403,29 +2509,10 @@ export class MeteringService extends PuterService {
         return addons;
     }
 
-    async getActorAppUsage(actor: Actor, appId: string): Promise<UsageByType> {
-        if (!actor.user?.uuid)
-            throw new HttpError(403, 'Actor must be a user to get app usage', {
-                legacyCode: 'forbidden',
-            });
-        const actorAppId = actor.effectiveApp?.uid;
-        if (actorAppId && actorAppId !== appId) {
-            throw new HttpError(
-                403,
-                'Actor can only get usage for their own app',
-                { legacyCode: 'forbidden' },
-            );
-        }
-
-        const currentMonth = this.monthYearString();
-        return this.#readActorAppUsage(actor.user.uuid, appId, currentMonth);
-    }
-
     /**
      * An actor-app's month, resolved from the totals item plus its per-model
-     * shards — the shared read behind `getActorCurrentMonthAppUsageDetails` and
-     * `getActorAppUsage`, which differ only in how they resolve and gate
-     * `appId`.
+     * shards; the read behind `getActorCurrentMonthAppUsageDetails` and the app
+     * branch of `getActorCurrentMonthUsageDetails`.
      */
     async #readActorAppUsage(
         userId: string,
@@ -2447,20 +2534,50 @@ export class MeteringService extends PuterService {
         );
     }
 
-    /** Summed over every global shard for the month — each is `{ total }` only. */
-    async getGlobalUsage(): Promise<UsageByType> {
-        const currentMonth = this.monthYearString();
-        const keyPrefix = `${METRICS_V2_PREFIX}:puter:`;
-        const keys = Array.from(
-            { length: MeteringService.GLOBAL_SHARD_COUNT },
-            (_, shard) => `${keyPrefix}${shard}:${currentMonth}`,
-        );
+    /** The global total for `month` (default: this one). */
+    async getGlobalUsage(
+        month: string = this.monthYearString(),
+    ): Promise<UsageByType> {
+        const totals = await this.getGlobalUsageByMonth();
+        return { total: totals.get(month) ?? 0 } as UsageByType;
+    }
 
-        const { res } = await this.stores.kv.get({ key: keys });
-        const usages = (res ?? []) as (UsageByType | null)[];
-        let total = 0;
-        for (const entry of usages) total += entry?.total || 0;
-        return { total } as UsageByType;
+    /**
+     * The global total of every month on record, by `YYYY-MM`. Shards sort by
+     * number before month, so one listing covers them all; it is charged by
+     * bytes read, where getting each shard by key is charged per key.
+     */
+    async getGlobalUsageByMonth(): Promise<Map<string, number>> {
+        const totals = new Map<string, number>();
+        let cursor: string | undefined;
+        do {
+            const startedAt = Date.now();
+            const { res, usage } = await this.stores.kv.list({
+                as: 'entries',
+                keyPrefix: GLOBAL_USAGE_PREFIX,
+                limit: MeteringService.SHARD_SWEEP_PAGE_ITEMS,
+                cursor,
+            });
+            const page = res as {
+                items: { key: string; value: unknown }[];
+                cursor?: string;
+            };
+            for (const { key, value } of page.items) {
+                const month = GLOBAL_SHARD_KEY_RE.exec(
+                    key.slice(GLOBAL_USAGE_PREFIX.length),
+                )?.[1];
+                if (!month) continue;
+                const total = Number((value as UsageByType | null)?.total);
+                if (Number.isFinite(total))
+                    totals.set(month, (totals.get(month) ?? 0) + total);
+            }
+            cursor = page.cursor;
+            const waitMs =
+                (usage.read / SHARD_SWEEP_READ_UNITS_PER_SECOND) * 1000 -
+                (Date.now() - startedAt);
+            if (cursor && waitMs > 0) await sleep(waitMs);
+        } while (cursor);
+        return totals;
     }
 
     async updateAddonCredit(
@@ -2561,7 +2678,7 @@ export class MeteringService extends PuterService {
         const hash =
             murmurhash.v3(`${userId}:${appId}`) %
             MeteringService.GLOBAL_SHARD_COUNT;
-        return `${METRICS_V2_PREFIX}:puter:${hash}:${currentMonth}`;
+        return `${GLOBAL_USAGE_PREFIX}${hash}:${currentMonth}`;
     }
 
     private appUsageKey(
@@ -2735,11 +2852,6 @@ export class MeteringService extends PuterService {
      * attempt reads its own token back (per replica: two regions claiming in
      * the same second can both win). A failed write keeps its token for the
      * retry, so a write that landed anyway still counts.
-     *
-     * Through `V1_CLAIM_THROUGH_MONTH`, the claim is taken on the v1 key —
-     * every earlier September claim, from any node, landed there, and a fresh
-     * v2 claim would let every already-charged user's recurring charge fire
-     * again. Later months claim on the v2 key like everything else.
      */
     private async claimAndCharge(
         actor: Actor,
@@ -2747,10 +2859,7 @@ export class MeteringService extends PuterService {
         currentMonth: string,
     ): Promise<UsageByType | null> {
         const claimId = `${userId}:${currentMonth}`;
-        const claimKey =
-            currentMonth <= V1_CLAIM_THROUGH_MONTH
-                ? `${METRICS_PREFIX}:actor:${userId}:${currentMonth}`
-                : `${METRICS_V2_PREFIX}:actor:${userId}:${currentMonth}`;
+        const claimKey = `${METRICS_V2_PREFIX}:actor:${userId}:${currentMonth}`;
         // Above any count an older claim left behind.
         const token =
             this.pendingClaimTokens.get(claimId) ?? randomInt(2 ** 32, 2 ** 47);
@@ -2793,7 +2902,8 @@ export class MeteringService extends PuterService {
         const userActor: Actor = { user: actor.user, effectiveApp: null };
 
         const charges: UsageInput[] = [];
-        await this.clients.event.emitAndWait(
+        // Each listener only pushes its own entries, so they run together.
+        await this.clients.event.emitAndWaitConcurrently(
             'metering.monthly.charges',
             { actor: userActor, month: currentMonth, charges },
             {},
@@ -2809,12 +2919,9 @@ export class MeteringService extends PuterService {
         const charged = await this.batchIncrementUsages(userActor, valid);
 
         // The charge just wrote new detail — a breakdown cached from before
-        // it would now under-report. Always the v2 keys: `batchIncrementUsages`
-        // writes there regardless of what `claimKey` above was.
+        // it would now under-report.
         await Promise.all([
-            this.stores.meteringBuffer.forgetSummed(
-                `${METRICS_V2_PREFIX}:actor:${userId}:${currentMonth}`,
-            ),
+            this.stores.meteringBuffer.forgetSummed(claimKey),
             this.stores.meteringBuffer.forgetSummed(
                 `${METRICS_V2_PREFIX}:actor:${userId}:app:${GLOBAL_APP_KEY}:${currentMonth}`,
             ),
@@ -2844,14 +2951,6 @@ export class MeteringService extends PuterService {
     }
 
     #rememberClaimToken(claimId: string, token: number): void {
-        if (
-            this.pendingClaimTokens.size >=
-                MeteringService.MONTHLY_CHARGE_MEMO_LIMIT &&
-            !this.pendingClaimTokens.has(claimId)
-        ) {
-            const oldest = this.pendingClaimTokens.keys().next().value;
-            if (oldest !== undefined) this.pendingClaimTokens.delete(oldest);
-        }
         this.pendingClaimTokens.set(claimId, token);
     }
 
@@ -2955,6 +3054,32 @@ export class MeteringService extends PuterService {
         }
         await Promise.all(writes);
         return usedBefore + allowanceCharge;
+    }
+
+    /**
+     * One alarm id for every actor, so a store brownout is a single alarm with
+     * a count. `unchargedCost` is what credit would have covered, had any been
+     * left; nothing charges it later.
+     */
+    #alarmSettleReadFailed(
+        actor: Actor,
+        error: Error | null,
+        unchargedCost: number,
+    ): void {
+        this.#unchargedSinceStart += unchargedCost;
+        this.clients.alarm.create(
+            'metering_settle_read_failed',
+            'Metering settled usage to the allowance only: a balance read failed',
+            {
+                userId: actor.user?.uuid,
+                appId: actor.effectiveApp?.uid,
+                unchargedCost,
+                unchargedSinceStart: this.#unchargedSinceStart,
+                error: error ?? undefined,
+            },
+            'info',
+            { channel: 'billing' },
+        );
     }
 
     private maybeAlertOveruse(ctx: {

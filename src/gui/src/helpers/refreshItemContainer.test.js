@@ -47,7 +47,6 @@ Object.assign(window, {
     shared_path: '/alice/Shared',
     trash_path: '/alice/Trash',
     user_preferences: {},
-    desktop_item_positions: {},
     check_fsentry_against_allowed_file_types_string: () => true,
     sort_items: () => {},
     update_explorer_footer_item_count: () => {},
@@ -105,6 +104,31 @@ describe('refresh_item_container in the Shared view', () => {
             uid: 'u-2',
             shared_with_me: true,
             is_team_share: true,
+        });
+    });
+
+    it('flags a direct share the team holds too', async () => {
+        list_all_shared.mockResolvedValue([
+            {
+                entryUid: 'u-1',
+                name: 'a.txt',
+                path: '/bob/u-1/a.txt',
+                isDir: false,
+                mode: 'read',
+                issuer: 'bob',
+                owner: 'bob',
+                alsoHeldByTeam: true,
+            },
+        ]);
+        document.body.innerHTML =
+            '<div class="window"><div class="item-container" data-path="/alice/Shared"></div></div>';
+
+        refresh_item_container($('.item-container'));
+
+        await vi.waitFor(() => expect(UIItem).toHaveBeenCalledTimes(1));
+        expect(UIItem.mock.calls[0][0]).toMatchObject({
+            is_team_share: false,
+            is_also_team_share: true,
         });
     });
 });
@@ -167,6 +191,15 @@ describe('refresh_item_container after the window moves to another folder', () =
         expect($('.window').attr('data-uid')).toBe('pictures');
     });
 
+    it('stores a folder name holding HTML characters on the window as it is', async () => {
+        navigate('/alice/R&D');
+
+        pending.stat['/alice/R&D'].resolve({ id: 'rd', name: 'R&D' });
+        await vi.waitFor(() => expect($('.window').attr('data-uid')).toBe('rd'));
+
+        expect($('.window').attr('data-name')).toBe('R&D');
+    });
+
     it('drops a listing that arrives just before the window moves on', async () => {
         vi.useFakeTimers();
         navigate('/alice/Documents');
@@ -194,5 +227,59 @@ describe('refresh_item_container after the window moves to another folder', () =
         await new Promise((r) => setTimeout(r, 10));
 
         expect(renderedPaths()).toEqual(['/alice/Documents/a.txt']);
+    });
+});
+
+describe('refresh_item_container and the folder\'s stored view', () => {
+    let views;
+
+    beforeEach(() => {
+        views = {};
+        puter.kv = {
+            get: vi.fn((key) => {
+                views[key] ??= deferred();
+                return views[key].promise;
+            }),
+        };
+        puter.fs.stat.mockImplementation(async ({ path }) => ({ id: path.slice(1), name: path.slice(1) }));
+        puter.fs.readdir.mockResolvedValue([]);
+        vi.spyOn(window, 'sort_items');
+        vi.spyOn(window, 'update_window_layout');
+        document.body.innerHTML =
+            '<div class="window"><div class="item-container" data-sort_by="name" data-sort_order="asc"></div></div>';
+    });
+
+    afterEach(() => {
+        delete puter.kv;
+    });
+
+    it('lays out and re-sorts the folder by what is stored for it', async () => {
+        navigate('/docs');
+        await vi.waitFor(() => expect(views['folder_view:docs']).toBeDefined());
+        views['folder_view:docs'].resolve({ sort_by: 'size', sort_order: 'desc', layout: 'details' });
+
+        await vi.waitFor(() => expect(window.sort_items).toHaveBeenCalledWith(
+            expect.anything(), 'size', 'desc',
+        ));
+        expect($('.item-container').attr('data-sort_by')).toBe('size');
+        expect($('.window').attr('data-sort_order')).toBe('desc');
+        expect(window.update_window_layout).toHaveBeenCalledWith(expect.anything(), 'details');
+    });
+
+    it('ignores the view of a folder the window has left', async () => {
+        navigate('/docs');
+        await vi.waitFor(() => expect(views['folder_view:docs']).toBeDefined());
+        navigate('/pics');
+        await vi.waitFor(() => expect(views['folder_view:pics']).toBeDefined());
+
+        views['folder_view:pics'].resolve(null);
+        views['folder_view:docs'].resolve({ sort_by: 'size', layout: 'list' });
+        await vi.waitFor(() => expect(window.update_window_layout).toHaveBeenCalledOnce());
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(window.update_window_layout).toHaveBeenCalledWith(expect.anything(), 'icons');
+        expect(window.update_window_layout).not.toHaveBeenCalledWith(expect.anything(), 'list');
+        expect($('.item-container').attr('data-sort_by')).toBe('name');
+        expect(window.sort_items).not.toHaveBeenCalledWith(expect.anything(), 'size', expect.anything());
     });
 });

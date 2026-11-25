@@ -20,7 +20,7 @@
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Readable } from 'node:stream';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
     WORKER_SUBDOMAIN_PREFIX,
     type SubdomainRow,
@@ -233,6 +233,110 @@ describe('LocalWorkerService.cfCallLocal', () => {
         expect(res.status).toBe(404);
         expect(await res.text()).toBe('subdomain not found');
     });
+
+    it('404s a request for a suspended owner’s worker', async () => {
+        const name = `lws-susp-${Date.now()}`;
+        const src = await writeSource(
+            `${name}.js`,
+            "router.get('/', () => new Response('up'));",
+        );
+        await seedWorkerRow(name, { root_dir_id: src.id });
+        const call = () =>
+            localWorkers.cfCallLocal(name, new Request('http://x.localhost/'));
+
+        await server.stores.user.update(ownerUserId, { suspended: 1 });
+        try {
+            expect((await call()).status).toBe(404);
+        } finally {
+            await server.stores.user.update(ownerUserId, { suspended: 0 });
+        }
+        const res = await call();
+        expect(await res.text()).toBe('up');
+        await localWorkers.cfDeleteLocal(name);
+    });
+
+    it('serves concurrent first requests from a single deploy', async () => {
+        const name = `lws-cold-${Date.now()}`;
+        const src = await writeSource(
+            `${name}.js`,
+            "router.get('/', () => new Response('up'));",
+        );
+        await seedWorkerRow(name, { root_dir_id: src.id });
+        const deploy = vi.spyOn(localWorkers, 'cfDeployLocal');
+        try {
+            const responses = await Promise.all(
+                Array.from({ length: 8 }, () =>
+                    localWorkers.cfCallLocal(
+                        name,
+                        new Request('http://x.localhost/'),
+                    ),
+                ),
+            );
+            const bodies = await Promise.all(responses.map((r) => r.text()));
+            expect(bodies).toEqual(Array(8).fill('up'));
+            expect(deploy).toHaveBeenCalledTimes(1);
+        } finally {
+            deploy.mockRestore();
+            await localWorkers.cfDeleteLocal(name);
+        }
+    }, 60_000);
+
+    it('answers 502 for a worker whose script the runtime rejects', async () => {
+        const name = `lws-broken-${Date.now()}`;
+        const src = await writeSource(
+            `${name}.js`,
+            "router.get('/', () => {",
+        );
+        await seedWorkerRow(name, { root_dir_id: src.id });
+        const res = await localWorkers.cfCallLocal(
+            name,
+            new Request('http://x.localhost/'),
+        );
+        expect(res.status).toBe(502);
+    }, 60_000);
+
+    it('retries the deploy on the request after a failed first one', async () => {
+        const name = `lws-retry-${Date.now()}`;
+        const src = await writeSource(
+            `${name}.js`,
+            "router.get('/', () => new Response('up'));",
+        );
+        const row = await seedWorkerRow(name, { root_dir_id: src.id });
+        const call = () =>
+            localWorkers.cfCallLocal(name, new Request('http://x.localhost/'));
+
+        // With no source file the deploy throws for every waiting request.
+        await server.stores.subdomain.update(row.uuid as string, {
+            root_dir_id: null,
+        });
+        const failed = await Promise.allSettled([call(), call()]);
+        expect(failed.map((r) => r.status)).toEqual(['rejected', 'rejected']);
+
+        await server.stores.subdomain.update(row.uuid as string, {
+            root_dir_id: src.id,
+        });
+        const res = await call();
+        expect(await res.text()).toBe('up');
+        await localWorkers.cfDeleteLocal(name);
+    }, 60_000);
+});
+
+describe('LocalWorkerService deploy of a script the runtime rejects', () => {
+    it('reports the failure and keeps no instance', async () => {
+        const name = `lws-unloadable-${Date.now()}`;
+        const deployed = await localWorkers.cfDeployLocal(
+            name,
+            'test-authorization',
+            'addEventListener("fetch", (e) => {',
+        );
+        expect(deployed).toEqual({ success: false, errors: [], url: null });
+        // Nothing resident, so a call looks the worker up and finds no row.
+        const res = await localWorkers.cfCallLocal(
+            name,
+            new Request('http://x.localhost/'),
+        );
+        expect(res.status).toBe(404);
+    }, 60_000);
 });
 
 describe('LocalWorkerService.cfDeleteLocal', () => {
@@ -275,6 +379,51 @@ describe('LocalWorkerService.cfDeployLocal', () => {
             new Request('http://worker.localhost/hi'),
         );
         expect(after.status).toBe(404);
+    }, 60_000);
+
+    it('serves a request that arrives while a redeploy is in progress', async () => {
+        const name = `lws-swap-${Date.now()}`;
+        const respond = (text: string) =>
+            `addEventListener('fetch', (e) => e.respondWith(new Response('${text}')));`;
+        const call = () =>
+            localWorkers.cfCallLocal(name, new Request('http://x.localhost/'));
+        try {
+            await localWorkers.cfDeployLocal(name, 'auth', respond('v1'));
+            expect(await (await call()).text()).toBe('v1');
+
+            const redeploy = localWorkers.cfDeployLocal(
+                name,
+                'auth',
+                respond('v2'),
+            );
+            const during = await call();
+            expect(await during.text()).toBe('v2');
+            expect((await redeploy).success).toBe(true);
+        } finally {
+            await localWorkers.cfDeleteLocal(name);
+        }
+    }, 60_000);
+
+    it('keeps serving the last good deploy when a redeploy cannot start', async () => {
+        const name = `lws-keep-${Date.now()}`;
+        const call = () =>
+            localWorkers.cfCallLocal(name, new Request('http://x.localhost/'));
+        try {
+            await localWorkers.cfDeployLocal(
+                name,
+                'auth',
+                "addEventListener('fetch', (e) => e.respondWith(new Response('v1')));",
+            );
+            const redeploy = await localWorkers.cfDeployLocal(
+                name,
+                'auth',
+                "addEventListener('fetch', (e) => {",
+            );
+            expect(redeploy.success).toBe(false);
+            expect(await (await call()).text()).toBe('v1');
+        } finally {
+            await localWorkers.cfDeleteLocal(name);
+        }
     }, 60_000);
 
     it('reaches this machine, but not link-local or LAN addresses by default', async () => {

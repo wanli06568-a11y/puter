@@ -256,10 +256,34 @@ describe('decideSocketAuth', () => {
 // -- socketRoomsFor ----------------------------------------------------
 
 describe('socketRoomsFor', () => {
-    it('puts a session in the user room', () => {
+    it('puts a session in the user room and a room of its own', () => {
+        expect(
+            socketRoomsFor({
+                user: { id: 7, uuid: 'u-7', username: 'u' },
+                session: { uid: 'sess-1' },
+            }),
+        ).toEqual(['7', accountSocketRoom(7), 'sess:sess-1', 'u7:scoped']);
+    });
+
+    it('puts a first-party page session in its sign-in room too', () => {
+        expect(
+            socketRoomsFor({
+                user: { id: 7, uuid: 'u-7', username: 'u' },
+                session: { uid: 'page-1', kind: 'web', parentUid: 'sign-in-1' },
+            }),
+        ).toEqual([
+            '7',
+            accountSocketRoom(7),
+            'sess:page-1',
+            'sess:sign-in-1',
+            'u7:scoped',
+        ]);
+    });
+
+    it('puts an actor without a session in the sessionless room', () => {
         expect(
             socketRoomsFor({ user: { id: 7, uuid: 'u-7', username: 'u' } }),
-        ).toEqual(['7', accountSocketRoom(7)]);
+        ).toEqual(['7', accountSocketRoom(7), 'u7:nosess', 'u7:scoped']);
     });
 
     it('gives an access token a room of its own to be revoked by', () => {
@@ -273,7 +297,13 @@ describe('socketRoomsFor', () => {
                 },
             }),
         );
-        expect(rooms).toEqual(['7', accountSocketRoom(7), 'tok:tok-9']);
+        expect(rooms).toEqual([
+            '7',
+            accountSocketRoom(7),
+            'tok:tok-9',
+            'u7:nosess',
+            'u7:scoped',
+        ]);
     });
 
     it('keeps an app out of the user room and in its own', () => {
@@ -283,7 +313,12 @@ describe('socketRoomsFor', () => {
                 app: { uid: 'app-1' },
             }),
         );
-        expect(rooms).toEqual(['u7:aapp-1', accountSocketRoom(7)]);
+        expect(rooms).toEqual([
+            'u7:aapp-1',
+            accountSocketRoom(7),
+            'u7:nosess',
+            'u7:scoped',
+        ]);
         expect(rooms).not.toContain('7');
     });
 });
@@ -426,6 +461,43 @@ describe('SocketService (live socket.io)', () => {
         });
         expect(sessionSocket.connected).toBe(true);
         sessionSocket.disconnect();
+    });
+
+    it('drops a token`s socket on a revocation that reached it from elsewhere', async () => {
+        const row = await server.stores.user.getByUsername(user.username);
+        const actor = makeActor({ user: row as never });
+        const doomed = await runWithContext({ actor }, () =>
+            server.services.auth.createAccessToken(actor, [[FULL_API_ACCESS]], {
+                label: 'revoke-fanout-probe',
+            }),
+        );
+        const { token_uid } = server.services.token.verify<{
+            token_uid: string;
+        }>('auth', doomed);
+        const tokenSocket = await connect({ auth_token: doomed });
+        expect(tokenSocket.connected).toBe(true);
+
+        // A malformed peer payload is ignored.
+        for (const data of [null, {}, { token_uid: 42 }]) {
+            server.clients.event.emit(
+                'outer.auth.access-token.revoked',
+                data as never,
+                { from_outside: true },
+            );
+        }
+        await new Promise((r) => setTimeout(r, 200));
+        expect(tokenSocket.connected).toBe(true);
+
+        // As a peer cluster delivers it: the token was revoked on another node.
+        server.clients.event.emit(
+            'outer.auth.access-token.revoked',
+            { token_uid },
+            { from_outside: true },
+        );
+
+        await vi.waitFor(() => expect(tokenSocket.connected).toBe(false), {
+            timeout: 5000,
+        });
     });
 
     it('rejects an app-under-user token while events are off', async () => {
@@ -841,17 +913,46 @@ describe('SocketService (live socket.io)', () => {
         const socket = await connect({ auth_token: `Bearer ${evicted.token}` });
         expect(socket.connected).toBe(true);
 
+        const { actor } = await server.services.auth.authenticate(
+            evicted.token,
+        );
+
         // As a peer cluster delivers it: the node holding this socket is not
         // the one that revoked the session.
         server.clients.event.emit(
             'outer.auth.sessions.revoked',
-            { user_id: row!.id, session_uids: ['whatever'] },
+            { user_id: row!.id, session_uids: [actor!.session!.uid] },
             {},
         );
 
         await vi.waitFor(() => expect(socket.connected).toBe(false), {
             timeout: 5_000,
         });
+    });
+
+    it("keeps the account's other sessions connected when one is revoked", async () => {
+        const owner = await createTestUser(server, {
+            username: 'sock-two-sessions',
+            password: 'sock-two-sessions-password',
+        });
+        const row = await server.stores.user.getByUsername(owner.username);
+        const other = await server.services.auth.createSessionToken(row!, {});
+        const keptSocket = await connect({
+            auth_token: `Bearer ${owner.token}`,
+        });
+        const revokedSocket = await connect({
+            auth_token: `Bearer ${other.token}`,
+        });
+
+        await server.services.auth.revokeSession(
+            (other.session as { uuid: string }).uuid,
+        );
+
+        await vi.waitFor(() => expect(revokedSocket.connected).toBe(false), {
+            timeout: 5_000,
+        });
+        expect(keptSocket.connected).toBe(true);
+        keptSocket.disconnect();
     });
 
     it('leaves other accounts alone when one is revoked', async () => {
@@ -924,6 +1025,31 @@ describe('SocketService (live socket.io)', () => {
 
         expect(socket.connected).toBe(true);
         socket.disconnect();
+    });
+
+    it('keeps a connection up when its re-check lookup fails', async () => {
+        const user = await createTestUser(server, {
+            username: 'sock-lookup-down',
+            password: 'sock-lookup-down-password',
+        });
+        const socket = await connect({ auth_token: `Bearer ${user.token}` });
+        const authenticate = vi
+            .spyOn(server.services.auth, 'authenticate')
+            .mockRejectedValue(
+                Object.assign(new Error('Database operation failed'), {
+                    code: 'dbBatchFailed',
+                }),
+            );
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+            await socketService.reauthenticateSockets();
+            await new Promise((r) => setTimeout(r, 200));
+            expect(socket.connected).toBe(true);
+        } finally {
+            authenticate.mockRestore();
+            warn.mockRestore();
+            socket.disconnect();
+        }
     });
 
     it('re-checks without recording session activity', async () => {

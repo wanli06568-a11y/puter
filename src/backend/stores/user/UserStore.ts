@@ -17,6 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import { chunk } from '../../util/concurrency.js';
 import { isUniqueViolation } from '../../util/dbError.js';
 import { cleanEmail, isSameAddress } from '../../util/email.js';
 import { normalizeReferralCode } from '../../util/referralCode.js';
@@ -75,6 +76,8 @@ export interface UserRow {
      * "verified a card".
      */
     card_fingerprint?: string | null;
+    /** TLS fingerprint of the request that created the account, if known. */
+    signup_tls_fingerprint?: string | null;
     /**
      * Home region this account's data belongs in - a node id from
      * `IConfig.servers`, not a storage region. Null for accounts that predate
@@ -267,16 +270,11 @@ export class UserStore extends PuterStore {
                 ),
             ),
         ];
-        for (
-            let offset = 0;
-            offset < unique.length;
-            offset += BULK_QUERY_CHUNK_SIZE
-        ) {
-            const chunk = unique.slice(offset, offset + BULK_QUERY_CHUNK_SIZE);
-            const placeholders = chunk.map(() => '?').join(', ');
+        for (const batch of chunk(unique, BULK_QUERY_CHUNK_SIZE)) {
+            const placeholders = batch.map(() => '?').join(', ');
             const rows = (await this.clients.db.pread(
                 `SELECT \`id\`, \`suspended\` FROM \`user\` WHERE \`id\` IN (${placeholders})`,
-                chunk,
+                batch,
             )) as Array<{ id: number; suspended: unknown }>;
             for (const row of rows) {
                 out.set(Number(row.id), Boolean(row.suspended));
@@ -297,34 +295,42 @@ export class UserStore extends PuterStore {
         const numericIds = (Array.isArray(ids) ? ids : []).filter(
             (id): id is number => typeof id === 'number',
         );
-        return this.#cache.getMany(
-            'id',
-            numericIds,
-            async (missing, primary) => {
-                const users: UserRow[] = [];
-                for (
-                    let offset = 0;
-                    offset < missing.length;
-                    offset += BULK_QUERY_CHUNK_SIZE
-                ) {
-                    const chunk = missing.slice(
-                        offset,
-                        offset + BULK_QUERY_CHUNK_SIZE,
-                    );
-                    const placeholders = chunk.map(() => '?').join(', ');
-                    const sql = `SELECT * FROM \`user\` WHERE \`id\` IN (${placeholders})`;
-                    const rows = (
-                        primary
-                            ? await this.clients.db.pread(sql, chunk)
-                            : await this.clients.db.tryHardRead(sql, chunk, {
-                                  race: false,
-                              })
-                    ) as Array<Record<string, unknown>>;
-                    for (const row of rows) users.push(this.#normalizeRow(row));
-                }
-                return users;
-            },
+        return this.#cache.getMany('id', numericIds, (missing, primary) =>
+            this.#readByIds(missing, primary),
         );
+    }
+
+    /** Whether an account with this uuid exists, from the primary, uncached. */
+    async existsByUuidOnPrimary(uuid: string): Promise<boolean> {
+        if (!uuid || typeof uuid !== 'string') return false;
+        const rows = await this.clients.db.pread(
+            'SELECT 1 AS found FROM `user` WHERE `uuid` = ? LIMIT 1',
+            [uuid],
+        );
+        return rows.length > 0;
+    }
+
+    /** `getByIds` from the primary, uncached: for a row a replica may lack. */
+    async getByIdsFromPrimary(ids: number[]): Promise<Map<number, UserRow>> {
+        const users = await this.#readByIds([...new Set(ids)], true);
+        return new Map(users.map((user) => [Number(user.id), user]));
+    }
+
+    async #readByIds(ids: number[], primary: boolean): Promise<UserRow[]> {
+        const users: UserRow[] = [];
+        for (const batch of chunk(ids, BULK_QUERY_CHUNK_SIZE)) {
+            const placeholders = batch.map(() => '?').join(', ');
+            const sql = `SELECT * FROM \`user\` WHERE \`id\` IN (${placeholders})`;
+            const rows = (
+                primary
+                    ? await this.clients.db.pread(sql, batch)
+                    : await this.clients.db.tryHardRead(sql, batch, {
+                          race: false,
+                      })
+            ) as Array<Record<string, unknown>>;
+            for (const row of rows) users.push(this.#normalizeRow(row));
+        }
+        return users;
     }
 
     /**
@@ -341,7 +347,8 @@ export class UserStore extends PuterStore {
         cleanEmailValue: string,
         opts: { force?: boolean } = {},
     ): Promise<UserRow | null> {
-        if (!cleanEmailValue) return null;
+        if (!cleanEmailValue || typeof cleanEmailValue !== 'string')
+            return null;
         if (!isStorableAsLatin1(cleanEmailValue)) return null;
         const sql = `SELECT \`id\`, \`clean_email\` FROM \`user\` WHERE \`clean_email\` = ? ${EMAIL_OWNER_ORDER} LIMIT 1`;
         const rows = (await (opts.force
@@ -354,6 +361,29 @@ export class UserStore extends PuterStore {
         if (!row || !isSameAddress(row.clean_email, cleanEmailValue))
             return null;
         return this.getById(row.id as number, opts);
+    }
+
+    /**
+     * The account a billing customer id is recorded on. Not cached: the column
+     * isn't an identifying property. `force` reads the primary.
+     */
+    async getByStripeCustomerId(
+        customerId: string,
+        opts: { force?: boolean; excludeUserId?: number } = {},
+    ): Promise<UserRow | null> {
+        if (!customerId || typeof customerId !== 'string') return null;
+        const exclude = opts.excludeUserId !== undefined;
+        const sql =
+            'SELECT * FROM `user` WHERE `stripe_customer_id` = ?' +
+            (exclude ? ' AND `id` <> ?' : '') +
+            ' LIMIT 1';
+        const params = exclude
+            ? [customerId, opts.excludeUserId]
+            : [customerId];
+        const rows = await (opts.force
+            ? this.clients.db.pread(sql, params)
+            : this.clients.db.tryHardRead(sql, params));
+        return rows[0] ? this.#normalizeRow(rows[0]) : null;
     }
 
     /**
@@ -376,7 +406,7 @@ export class UserStore extends PuterStore {
         email: string,
         opts: { force?: boolean } = {},
     ): Promise<UserRow | null> {
-        if (!email) return null;
+        if (!email || typeof email !== 'string') return null;
         const direct = await this.getByEmail(email, { force: opts.force });
         if (direct) return direct;
         return this.getByCleanEmail(cleanEmail(email), opts);
@@ -396,7 +426,7 @@ export class UserStore extends PuterStore {
         phone: string,
         excludeUserId: number,
     ): Promise<number> {
-        if (!phone) return 0;
+        if (!phone || typeof phone !== 'string') return 0;
         if (!isStorableAsLatin1(phone)) return 0;
         const rows = (await this.clients.db.tryHardRead(
             'SELECT COUNT(*) AS n FROM `user` WHERE `phone` = ? AND `id` != ?',
@@ -419,6 +449,14 @@ export class UserStore extends PuterStore {
     ): Promise<UserRow | null> {
         const cached = options.cached ?? true;
         const force = options.force ?? false;
+
+        // A text column compared with a number casts the column, so `0` or
+        // `true` would match unrelated rows. Only `id` takes a number.
+        if (
+            typeof value !== 'string' &&
+            !(prop === 'id' && typeof value === 'number')
+        )
+            return null;
 
         // Reject lookup values that can't exist in a latin1 column before
         // the driver turns them into a collation-mix error at MySQL.
@@ -531,6 +569,7 @@ export class UserStore extends PuterStore {
         signup_ip?: string | null;
         signup_ip_forwarded?: string | null;
         signup_user_agent?: string | null;
+        signup_tls_fingerprint?: string | null;
         signup_origin?: string | null;
         signup_server?: string | null;
         referrer?: string | null;
@@ -557,6 +596,7 @@ export class UserStore extends PuterStore {
              signup_ip,
              signup_ip_forwarded,
              signup_user_agent,
+             signup_tls_fingerprint,
              signup_origin,
              signup_server,
              referrer,
@@ -565,7 +605,7 @@ export class UserStore extends PuterStore {
              phone,
              requires_phone_verification,
              requires_card_verification)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)${this.clients.db.returningIdClause()}`,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)${this.clients.db.returningIdClause()}`,
             [
                 fields.username,
                 fields.email,
@@ -585,6 +625,7 @@ export class UserStore extends PuterStore {
                 fields.signup_ip ?? null,
                 fields.signup_ip_forwarded ?? null,
                 fields.signup_user_agent ?? null,
+                fields.signup_tls_fingerprint ?? null,
                 fields.signup_origin ?? null,
                 fields.signup_server ?? null,
                 fields.referrer ?? null,
@@ -718,6 +759,87 @@ export class UserStore extends PuterStore {
     }
 
     /**
+     * Record the account's billing customer id only while it has none, so a
+     * later one can't replace the first. True when it wrote.
+     */
+    async setStripeCustomerIdIfUnset(
+        userUuid: string,
+        customerId: string,
+    ): Promise<boolean> {
+        const user = await this.getByUuid(userUuid);
+        if (!user) return false;
+        return this.#write(
+            user.id,
+            { stripe_customer_id: customerId },
+            "(`stripe_customer_id` IS NULL OR `stripe_customer_id` = '')",
+        );
+    }
+
+    /**
+     * Puts `previous` back while the row still holds `written`, so a change
+     * made meanwhile stands. True when it wrote.
+     */
+    async revertStripeCustomerId(
+        userId: number,
+        written: string,
+        previous: string | null,
+    ): Promise<boolean> {
+        return this.#write(
+            userId,
+            { stripe_customer_id: previous },
+            '`stripe_customer_id` = ?',
+            [written],
+        );
+    }
+
+    /**
+     * Suspends an account that is active or held by a suspension in
+     * `replaceable`, in one guarded write that emits `user.suspended`. False
+     * when it is suspended otherwise, so overlapping batches suspend it once.
+     */
+    async claimSuspension(
+        userId: number,
+        {
+            reason,
+            replaceable = [],
+        }: { reason: string; replaceable?: readonly string[] },
+    ): Promise<boolean> {
+        const db = this.clients.db;
+        const replaced = replaceable.length
+            ? ` OR \`suspended_reason\` IN (${replaceable.map(() => '?').join(', ')})`
+            : '';
+        return this.#write(
+            userId,
+            {
+                suspended: true,
+                suspended_at: Math.floor(Date.now() / 1000),
+                suspended_reason: reason,
+            },
+            `(\`suspended\` IS NULL OR \`suspended\` = ${db.booleanLiteral(false)}${replaced})`,
+            [...replaceable],
+        );
+    }
+
+    /**
+     * Flips the developer incentive approval only if it differs (unset reads as
+     * false), so two concurrent flips change it once. True when it wrote.
+     */
+    async setDevIncentiveApproval(
+        userId: number,
+        approved: boolean,
+    ): Promise<boolean> {
+        const db = this.clients.db;
+        const column = '`dev_approved_for_incentive_program`';
+        return this.#write(
+            userId,
+            { dev_approved_for_incentive_program: approved },
+            approved
+                ? `(${column} IS NULL OR ${column} = ${db.booleanLiteral(false)})`
+                : `${column} = ${db.booleanLiteral(true)}`,
+        );
+    }
+
+    /**
      * Cache-aware write path. `guard` is extra SQL ANDed into the WHERE clause;
      * a guarded write reports false when it matches no row.
      */
@@ -820,22 +942,68 @@ export class UserStore extends PuterStore {
         return true;
     }
 
+    /**
+     * Merge `patch` into the user's `metadata` in one statement, so a
+     * concurrent merge of other keys is kept. Refreshes the cached row from the
+     * primary.
+     */
     async updateMetadata(
         userId: number,
         patch: Record<string, unknown>,
     ): Promise<void> {
-        const user = await this.getById(userId);
-        const current: Record<string, unknown> = user?.metadata ?? {};
-        const merged = { ...current, ...patch };
-
-        await this.clients.db.write(
-            'UPDATE `user` SET `metadata` = ? WHERE `id` = ?',
-            [JSON.stringify(merged), userId],
+        const entries = Object.entries(patch).filter(
+            ([, value]) => value !== undefined,
         );
-        if (user) {
-            const refreshed: UserRow = { ...user, metadata: merged };
-            await this.#cache.refresh(refreshed);
+        if (entries.length === 0) return;
+        for (const [key] of entries) {
+            if (/["\\]/.test(key)) {
+                throw new Error(`invalid metadata key: ${key}`);
+            }
         }
+        const db = this.clients.db;
+        const pair = db.case({
+            mysql: '?, CAST(? AS JSON)',
+            postgres: '?::text, ?::jsonb',
+            otherwise: '?, json(?)',
+        });
+        const pairs = entries.map(() => pair).join(', ');
+        const set = db.case({
+            mysql: `JSON_SET(COALESCE(\`metadata\`, JSON_OBJECT()), ${pairs})`,
+            postgres: `COALESCE(\`metadata\`, '{}'::jsonb) || jsonb_build_object(${pairs})`,
+            otherwise: `json_set(COALESCE(\`metadata\`, '{}'), ${pairs})`,
+        });
+        const params = entries.flatMap(([key, value]) => [
+            db.case({ postgres: key, otherwise: `$."${key}"` }),
+            JSON.stringify(value),
+        ]);
+        await db.write(
+            `UPDATE \`user\` SET \`metadata\` = ${set} WHERE \`id\` = ?`,
+            [...params, userId],
+        );
+        const [row] = (await db.pread('SELECT * FROM `user` WHERE `id` = ?', [
+            userId,
+        ])) as Array<Record<string, unknown>>;
+        if (row) await this.#cache.refresh(this.#normalizeRow(row));
+    }
+
+    /** Single-key form of `updateMetadata`. */
+    async setMetadataKey(
+        userId: number,
+        key: string,
+        value: string | number | boolean | null,
+    ): Promise<void> {
+        await this.updateMetadata(userId, { [key]: value });
+    }
+
+    /**
+     * Move `last_activity_ts` forward to `ts` (a SQL timestamp string), never
+     * back. Left out of the cache: a few minutes' drift there doesn't matter.
+     */
+    async touchLastActivity(userId: number, ts: string): Promise<void> {
+        await this.clients.db.write(
+            'UPDATE `user` SET `last_activity_ts` = ? WHERE `id` = ? AND (`last_activity_ts` IS NULL OR `last_activity_ts` < ?)',
+            [ts, userId, ts],
+        );
     }
 
     /**
@@ -854,7 +1022,12 @@ export class UserStore extends PuterStore {
         email: string,
         cleanEmailValue: string,
     ): Promise<UserRow | null> {
-        if (!email) return null;
+        if (
+            !email ||
+            typeof email !== 'string' ||
+            typeof cleanEmailValue !== 'string'
+        )
+            return null;
         const rows = (await this.clients.db.pread(
             'SELECT * FROM `user` WHERE `id` != ? AND (`email` = ? OR `clean_email` = ?) ' +
                 `AND \`email_confirmed\` = ${this.clients.db.booleanLiteral(true)} ` +
@@ -874,6 +1047,8 @@ export class UserStore extends PuterStore {
         // straight to SQL, so without their pre-image we don't know which
         // cache keys it retires — and a cached copy still carries the address
         // that was just revoked, which would keep answering lookups for it.
+        if (typeof email !== 'string' || typeof cleanEmailValue !== 'string')
+            return;
         const matched = (await this.clients.db.pread(
             'SELECT * FROM `user` WHERE `id` != ? AND (`email` = ? OR `clean_email` = ?)',
             [userId, email, cleanEmailValue],
@@ -942,6 +1117,16 @@ export class UserStore extends PuterStore {
         if (cached) return this.markDeleted(cached);
         // No cached copy to name the rest, but the id key is always this row's.
         await this.tombstoneCacheKeys([idKey]);
+    }
+
+    /**
+     * Delete the row and tombstone its cache keys. `row`, read before the
+     * delete, names every key; without it the cached copy does.
+     */
+    async deleteById(id: number, row?: UserRow | null): Promise<void> {
+        await this.clients.db.write('DELETE FROM `user` WHERE `id` = ?', [id]);
+        if (row) await this.markDeleted(row);
+        else await this.markDeletedById(id);
     }
 
     // -- Internals ----------------------------------------------------

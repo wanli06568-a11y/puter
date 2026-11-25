@@ -19,16 +19,15 @@
 
 import type { Request, Response } from 'express';
 import { makeActor, type Actor } from '../../core/actor.js';
+import { abortOnDisconnect } from '../../core/http/abortOnDisconnect.js';
 import { HttpError } from '../../core/http/HttpError.js';
 import { computeNetworkFingerprint } from '../../core/http/middleware/rateLimit.js';
 import type { PuterRouter } from '../../core/http/PuterRouter.js';
+import type { UsageInput } from '../../services/metering/types.js';
+import { runWithConcurrencyLimit } from '../../util/concurrency.js';
 import { PuterController } from '../types.js';
 import { PEER_COSTS } from './costs.js';
-import {
-    readClaimedGrantIdentifier,
-    signGuestGrant,
-    verifyGuestGrant,
-} from './guestGrant.js';
+import { signGuestGrant, verifyGuestGrant } from './guestGrant.js';
 import {
     DEFAULT_FREE_SUBSCRIPTION,
     DEFAULT_TEMP_SUBSCRIPTION,
@@ -44,6 +43,12 @@ const DEFAULT_GRANT_TTL = 3600;
  * which a leaked one can relay traffic on the host's tab stays small.
  */
 const DEFAULT_GUEST_CREDENTIAL_TTL = 3600;
+
+/** Users metered at once by a usage ingest. */
+const INGEST_CONCURRENCY = 16;
+
+/** How long a relay credential request may take upstream. */
+const TURN_CREDENTIAL_TIMEOUT_MS = 10_000;
 
 /**
  * Encode a UUID (or `app-<uuid>` UID) as base64url with no padding. Strips an
@@ -191,19 +196,31 @@ export class PeerController extends PuterController {
                 // guests share one bucket and no host can be relayed for by
                 // more guests per minute than this — the only ceiling on guest
                 // spend we can apply before the bytes are already spent.
-                // A grant that doesn't parse can't name a bucket, so those
-                // requests fall back to the caller's own network.
+                // The limiter counts a request when it admits it, so only a
+                // grant that would redeem names a host; otherwise anyone
+                // holding the host's identifier could drain the bucket and
+                // lock out every real guest. Anything else - forged, expired,
+                // malformed, or no secret configured - is charged to the
+                // caller's own network.
                 rateLimit: {
                     scope: 'peer-guest-turn',
                     limit: 60,
                     window: 60_000,
                     key: (req: Request) => {
-                        const claimed = readClaimedGrantIdentifier(
-                            (req.body as { grant?: unknown } | undefined)
-                                ?.grant,
-                        );
-                        return claimed
-                            ? `host:${claimed}`
+                        const secret =
+                            this.config.peers?.guest_turn?.grant_secret;
+                        const verified = secret
+                            ? verifyGuestGrant({
+                                  grant: (
+                                      req.body as
+                                          | { grant?: unknown }
+                                          | undefined
+                                  )?.grant,
+                                  secret,
+                              })
+                            : null;
+                        return verified?.status === 'ok'
+                            ? `host:${verified.customIdentifier}`
                             : `net:${computeNetworkFingerprint(req)}`;
                     },
                 },
@@ -284,35 +301,52 @@ export class PeerController extends PuterController {
     #mintIceServers = async (
         customIdentifier: string,
         ttl: number,
+        res: Response,
     ): Promise<unknown> => {
         const { serviceId, apiToken } = this.#requireTurnConfig();
+        const signal = AbortSignal.any([
+            AbortSignal.timeout(TURN_CREDENTIAL_TIMEOUT_MS),
+            abortOnDisconnect(res),
+        ]);
 
-        const cfRes = await fetch(
-            `https://rtc.live.cloudflare.com/v1/turn/keys/${serviceId}/credentials/generate-ice-servers`,
-            {
-                method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${apiToken}`,
-                    'Content-Type': 'application/json',
+        try {
+            const cfRes = await fetch(
+                `https://rtc.live.cloudflare.com/v1/turn/keys/${serviceId}/credentials/generate-ice-servers`,
+                {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${apiToken}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ ttl, customIdentifier }),
+                    signal,
                 },
-                body: JSON.stringify({ ttl, customIdentifier }),
-            },
-        );
-
-        if (!cfRes.ok) {
-            const body = await cfRes.text();
-            console.warn(
-                '[peer] Cloudflare TURN credential generation failed',
-                cfRes.status,
-                body,
             );
-            throw new HttpError(500, 'TURN credential generation failed', {
-                legacyCode: 'internal_error',
-            });
-        }
 
-        const data = (await cfRes.json()) as { iceServers?: unknown };
-        return data.iceServers;
+            if (!cfRes.ok) {
+                const body = await cfRes.text();
+                console.warn(
+                    '[peer] Cloudflare TURN credential generation failed',
+                    cfRes.status,
+                    body,
+                );
+                throw new HttpError(500, 'TURN credential generation failed', {
+                    legacyCode: 'internal_error',
+                });
+            }
+
+            const data = (await cfRes.json()) as { iceServers?: unknown };
+            return data.iceServers;
+        } catch (err) {
+            if ((err as { name?: unknown } | null)?.name === 'TimeoutError') {
+                throw new HttpError(
+                    504,
+                    'TURN credential generation timed out',
+                    { legacyCode: 'upstream_timeout' },
+                );
+            }
+            throw err;
+        }
     };
 
     /** POST /peer/generate-turn — generate TURN credentials via Cloudflare. */
@@ -321,6 +355,7 @@ export class PeerController extends PuterController {
         const iceServers = await this.#mintIceServers(
             actorToTurnIdentifier(req.actor),
             ttl,
+            res,
         );
         res.json({ ttl, iceServers });
     };
@@ -389,6 +424,7 @@ export class PeerController extends PuterController {
         const iceServers = await this.#mintIceServers(
             verified.customIdentifier,
             ttl,
+            res,
         );
         res.json({ ttl, iceServers });
     };
@@ -396,8 +432,8 @@ export class PeerController extends PuterController {
     /**
      * POST /turn/ingest-usage — internal-only TURN egress metering. an external
      * service that knows the usage information from cloudflare will send it to
-     * us here. Meters each record directly against the owning user via
-     * `services.metering.incrementUsage` multiplied by turn:egress-bytes cost.
+     * us here. Meters each record against the owning user at the
+     * turn:egress-bytes cost, one metering call per user.
      */
     #ingestUsage = async (req: Request, res: Response): Promise<void> => {
         const { records } = req.body ?? {};
@@ -407,6 +443,8 @@ export class PeerController extends PuterController {
             });
         }
 
+        // One metering call per user, each record still its own usage.
+        const usagesByUser = new Map<string, UsageInput[]>();
         for (const record of records) {
             if (!record || typeof record !== 'object') continue;
             const egressBytes = Number(record.egressBytes ?? 0);
@@ -416,33 +454,42 @@ export class PeerController extends PuterController {
                 ? base64urlToUuid(String(record.userId))
                 : null;
             if (!userUuid) continue;
-
-            try {
-                const user = await this.stores.user.getByUuid(userUuid);
-                if (!user) continue;
-                const costInMicrocents =
-                    egressBytes * PEER_COSTS['turn:egress-bytes'];
-                const actor = makeActor({
-                    user: {
-                        uuid: user.uuid,
-                        id: user.id,
-                        username: user.username,
-                        email: user.email ?? null,
-                    },
-                });
-                await this.services.metering.incrementUsage(
-                    actor,
-                    'turn:egress-bytes',
-                    egressBytes,
-                    costInMicrocents,
-                );
-            } catch (e) {
-                console.warn(
-                    '[peer] TURN metering failed:',
-                    (e as Error).message,
-                );
-            }
+            const usages = usagesByUser.get(userUuid) ?? [];
+            usages.push({
+                usageType: 'turn:egress-bytes',
+                usageAmount: egressBytes,
+                costOverride: egressBytes * PEER_COSTS['turn:egress-bytes'],
+            });
+            usagesByUser.set(userUuid, usages);
         }
+
+        await runWithConcurrencyLimit(
+            [...usagesByUser],
+            INGEST_CONCURRENCY,
+            async ([userUuid, usages]) => {
+                try {
+                    const user = await this.stores.user.getByUuid(userUuid);
+                    if (!user) return;
+                    const actor = makeActor({
+                        user: {
+                            uuid: user.uuid,
+                            id: user.id,
+                            username: user.username,
+                            email: user.email ?? null,
+                        },
+                    });
+                    await this.services.metering.batchIncrementUsages(
+                        actor,
+                        usages,
+                    );
+                } catch (e) {
+                    console.warn(
+                        '[peer] TURN metering failed:',
+                        (e as Error).message,
+                    );
+                }
+            },
+        );
 
         res.json({ ok: true });
     };

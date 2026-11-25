@@ -34,6 +34,7 @@ import {
 import { isOriginBootstrapApp, toAppReadView } from '../../util/appView.js';
 import { awaitLater } from '../../util/concurrency.js';
 import { isUniqueViolation } from '../../util/dbError.js';
+import { isGodmodeApp } from '../../util/godmodeApps.js';
 import {
     buildHostedSubdomainIndexUrlCandidates,
     extractPuterHostedSubdomain,
@@ -42,7 +43,7 @@ import {
 import {
     normalizeLimit,
     normalizeOffset,
-    openCursor,
+    openIdCursor,
     sealCursor,
 } from '../../util/pagination.js';
 import {
@@ -94,11 +95,22 @@ const INDEX_URL_UNIQUENESS_EXEMPTION_CANDIDATES = [
     'https://dev-center.puter.com/coming-soon',
 ];
 
+// Static page Dev Center points a new app at until its first deploy. It
+// sits on Dev Center's own host, so the godmode-host check lets this exact
+// URL through.
+const NEW_APP_PLACEHOLDER_INDEX_URL =
+    'https://console.puter.com/coming-soon.html';
+
 // Sentinel host for builtin apps. The GUI rewrites index_urls on this
 // host to `<gui origin>/builtin/<name>` (see launchApp.js), so rows
 // carrying it are reserved for migration-seeded builtins — a user app
 // claiming it would load its code same-origin with the desktop.
 const BUILTIN_APPS_HOST = 'builtins.namespaces.puter.com';
+
+const systemHostError = () =>
+    new HttpError(400, '`index_url` cannot point at a Puter system host', {
+        legacyCode: 'bad_request',
+    });
 
 // Canonical-uid alias namespace. When a user-created app is merged into
 // an existing origin-bootstrap row, the source uid is mapped to the
@@ -106,7 +118,6 @@ const BUILTIN_APPS_HOST = 'builtins.namespaces.puter.com';
 // resolving to the joined row. TTL keeps abandoned entries from
 // accumulating indefinitely.
 const APP_UID_ALIAS_KEY_PREFIX = 'app:canonicalUidAlias';
-const APP_UID_ALIAS_REVERSE_KEY_PREFIX = 'app:canonicalUidAliasReverse';
 const APP_UID_ALIAS_TTL_SECONDS = 60 * 60 * 24 * 90;
 
 const hasIndexUrlUniquenessExemption = (candidates) => {
@@ -206,13 +217,16 @@ export class AppDriver extends PuterDriver {
         // Puter-hosted index_url handling (custom domains included). Order
         // matches v1 AppES:
         //   1. Refuse if the index_url's site isn't owned by this user.
-        //   2. Try to merge into an existing row with the same index_url
-        //      (origin-bootstrap takeover, or claiming an unowned row).
-        //   3. Otherwise enforce index_url uniqueness so two rows can't
-        //      share a hosted URL.
+        //   2. Merge into an existing row with the same index_url
+        //      (origin-bootstrap takeover, or claiming an unowned row), or
+        //      refuse when one exists that can't be merged, so two rows
+        //      can't share a hosted URL.
         // The name lookup runs alongside so the host checks add no round
         // trip of their own.
         const nameTaken = awaitLater(this.appStore.existsByName(fields.name));
+        const onGodmodeHost = awaitLater(
+            this.#findGodmodeHostApp(fields.index_url),
+        );
         const customSite = await this.#customSiteForIndexUrl(fields.index_url);
         await this.#ensurePuterSiteSubdomainIsOwned(
             fields.index_url,
@@ -228,10 +242,7 @@ export class AppDriver extends PuterDriver {
         if (joinedApp) {
             return joinedApp;
         }
-        await this.#ensureIndexUrlNotAlreadyInUse({
-            indexUrl: fields.index_url,
-            customSite,
-        });
+        if (await onGodmodeHost) throw systemHostError();
 
         // Name conflict handling
         if (await nameTaken) {
@@ -294,7 +305,10 @@ export class AppDriver extends PuterDriver {
 
     async read({ uid, id, params = {}, ...rest } = {}) {
         const actor = requireContextActor();
-        const app = await this.#resolve({ uid, id });
+        const app =
+            !uid && id?.url !== undefined
+                ? await this.#getByUrl(id.url)
+                : await this.#resolve({ uid, id });
         if (!app)
             throw new HttpError(404, 'App not found', {
                 legacyCode: 'not_found',
@@ -330,22 +344,21 @@ export class AppDriver extends PuterDriver {
     }
 
     /**
-     * Paged app listing. Unlike `/query/app`, which answers only for apps named
-     * by the caller and so must not confirm ones it may not see, this is the
-     * listing surface a launcher reads: `protected` apps are filtered by the
-     * permission check below, and everything else is listable by design. Narrow
-     * it with `predicate: ['user-can-edit']` to the caller's own.
+     * Paged listing of the caller's own apps. Apps owned by anyone else are
+     * reachable only by name or uid, through `read` and `/query/app`.
      */
     async select(args = {}) {
-        const { predicate, params = {} } = args;
+        const { params = {} } = args;
         const actor = requireContextActor();
         this.#requireUserOrAppActor(actor);
 
         const limit = normalizeLimit(args.limit, { cap: 5000 }) ?? 500;
         const offset = normalizeOffset(args.offset);
         const hasCursor = Object.prototype.hasOwnProperty.call(args, 'cursor');
-        const payload = openCursor(args.cursor, this.config.jwt_secret_v2);
-        if (payload && offset !== undefined) {
+        const afterId = openIdCursor(args.cursor, this.config.jwt_secret_v2, {
+            strict: true,
+        });
+        if (afterId !== null && offset !== undefined) {
             throw new HttpError(400, 'cursor and offset cannot be combined', {
                 legacyCode: 'bad_request',
             });
@@ -353,41 +366,32 @@ export class AppDriver extends PuterDriver {
         const includeTotal = args.includeTotal === true;
         const paginated = hasCursor || offset !== undefined || includeTotal;
 
-        const filters = {};
-        // predicate: ['user-can-edit'] → scope to owner
-        const ownerScoped =
-            Array.isArray(predicate) && predicate[0] === 'user-can-edit';
-        if (ownerScoped) {
-            filters.ownerUserId = actor.user.id;
-        }
+        // Always the caller's own. `predicate: ['user-can-edit']` asks for the
+        // same thing and is accepted for older clients.
+        const ownerUserId = actor.user.id;
 
         let apps = await this.appStore.list({
-            ...filters,
+            ownerUserId,
             limit: paginated ? limit + 1 : limit,
             offset,
-            afterId: payload?.id !== undefined ? Number(payload.id) : undefined,
+            afterId: afterId ?? undefined,
         });
 
         let cursor;
         if (paginated && apps.length > limit) {
             apps = apps.slice(0, limit);
-            // The cursor tracks the last fetched row, not the last visible
-            // one, so rows hidden by the permission filter below aren't
-            // re-scanned on the next page.
             cursor = sealCursor(
                 { id: Number(apps[apps.length - 1].id) },
                 this.config.jwt_secret_v2,
             );
         }
 
-        // Protected apps are filtered by one batched grant check; stats and
-        // the shared views are each one batched lookup across the page.
-        const visible = await this.services.app.filterReadable(apps, actor);
+        // Stats and the shared views are each one batched lookup per page.
         const [statsByUid, views] = await Promise.all([
-            this.appStore.getAppsStats(visible.map((a) => a.uid)),
-            this.services.app.views(visible, actor),
+            this.appStore.getAppsStats(apps.map((a) => a.uid)),
+            this.services.app.views(apps, actor),
         ]);
-        const items = visible.map((app, i) =>
+        const items = apps.map((app, i) =>
             toAppReadView(app, views[i], {
                 viewer: actor.user,
                 stats: statsByUid.get(app.uid),
@@ -396,14 +400,9 @@ export class AppDriver extends PuterDriver {
         );
         if (!paginated) return items;
 
-        let total;
-        if (includeTotal) {
-            total = ownerScoped
-                ? await this.appStore.count({ ownerUserId: actor.user.id })
-                : await this.appStore.count({
-                      visibleToUserId: actor.user?.id ?? null,
-                  });
-        }
+        const total = includeTotal
+            ? await this.appStore.count({ ownerUserId })
+            : undefined;
 
         return {
             items,
@@ -439,6 +438,10 @@ export class AppDriver extends PuterDriver {
         const nameTaken = renaming
             ? awaitLater(this.appStore.existsByName(fields.name))
             : null;
+        const onGodmodeHost =
+            fields.index_url && !isGodmodeApp(app)
+                ? awaitLater(this.#findGodmodeHostApp(fields.index_url, app.id))
+                : null;
 
         // Puter-hosted index_url handling on update — same flow as create.
         // #validateInput already dropped an unchanged index_url. Self-app is
@@ -463,11 +466,7 @@ export class AppDriver extends PuterDriver {
             if (joinedApp) {
                 return joinedApp;
             }
-            await this.#ensureIndexUrlNotAlreadyInUse({
-                indexUrl: fields.index_url,
-                excludeAppId: app.id,
-                customSite,
-            });
+            if (await onGodmodeHost) throw systemHostError();
             if (
                 app.is_private &&
                 (await this.services.auth.originHeldByOtherUser(
@@ -792,11 +791,7 @@ export class AppDriver extends PuterDriver {
             reserved.has(hostname) ||
             (label !== undefined && extensionStore.claimedSubdomains.has(label))
         ) {
-            throw new HttpError(
-                400,
-                '`index_url` cannot point at a Puter system host',
-                { legacyCode: 'bad_request' },
-            );
+            throw systemHostError();
         }
     }
 
@@ -817,6 +812,20 @@ export class AppDriver extends PuterDriver {
         if (typeof id === 'number') return this.appStore.getById(id);
         if (typeof id === 'string') return this.#getByUidWithAlias(id);
         return null;
+    }
+
+    /**
+     * The app a page at `url` acts as: the origin identity app tokens use, so
+     * only the URL's origin counts.
+     */
+    async #getByUrl(url) {
+        if (typeof url !== 'string' || !url) {
+            throw new HttpError(400, '`id.url` must be a non-empty string', {
+                legacyCode: 'bad_request',
+            });
+        }
+        const uid = await this.services.auth.appUidFromOrigin(url);
+        return this.appStore.getByUid(uid);
     }
 
     /**
@@ -1034,25 +1043,15 @@ export class AppDriver extends PuterDriver {
         });
     }
 
-    async #ensureIndexUrlNotAlreadyInUse({
-        indexUrl,
-        excludeAppId,
-        customSite,
-    } = {}) {
-        const conflictRow = await this.#findIndexUrlConflictRow({
-            indexUrl,
-            excludeAppId,
-            customSite,
-        });
-        if (conflictRow) {
-            throw new HttpError(400, 'App index_url already in use', {
-                legacyCode: 'app_index_url_already_in_use',
-                fields: {
-                    index_url: indexUrl,
-                    app_uid: conflictRow.uid,
-                },
-            });
+    /** A godmode app whose origin `indexUrl` would share. */
+    #findGodmodeHostApp(indexUrl, excludeAppId) {
+        if (indexUrl === NEW_APP_PLACEHOLDER_INDEX_URL) {
+            return Promise.resolve(null);
         }
+        const host = URL.parse(indexUrl)?.host;
+        return host
+            ? this.appStore.findGodmodeOnHost(host, { excludeAppId })
+            : Promise.resolve(null);
     }
 
     async #ensurePuterSiteSubdomainIsOwned(indexUrl, user, customSite) {
@@ -1088,33 +1087,15 @@ export class AppDriver extends PuterDriver {
         }
     }
 
-    // -- Canonical-uid alias kvstore pair -----------------------------
+    // -- Canonical-uid alias ------------------------------------------
     //
     // After a merge, the source app uid → canonical uid mapping is
     // kept in `stores.kv` (system namespace) so any client that still
     // holds the old uid keeps resolving to the joined row via
-    // `#getByUidWithAlias`. Reverse map lets callers enumerate aliases
-    // for a canonical uid (matches v1 plumbing).
+    // `#getByUidWithAlias`.
 
     #buildCanonicalAppUidAliasKey(oldAppUid) {
         return `${APP_UID_ALIAS_KEY_PREFIX}:${oldAppUid}`;
-    }
-
-    #buildCanonicalAppUidAliasReverseKey(canonicalAppUid) {
-        return `${APP_UID_ALIAS_REVERSE_KEY_PREFIX}:${canonicalAppUid}`;
-    }
-
-    #normalizeCanonicalAliasUidList(value) {
-        if (!Array.isArray(value)) return [];
-        const out = [];
-        const seen = new Set();
-        for (const item of value) {
-            if (typeof item !== 'string' || !item) continue;
-            if (seen.has(item)) continue;
-            seen.add(item);
-            out.push(item);
-        }
-        return out;
     }
 
     async #readCanonicalAppUidAlias(oldAppUid) {
@@ -1135,28 +1116,12 @@ export class AppDriver extends PuterDriver {
         if (oldAppUid === canonicalAppUid) return;
 
         const key = this.#buildCanonicalAppUidAliasKey(oldAppUid);
-        const reverseKey =
-            this.#buildCanonicalAppUidAliasReverseKey(canonicalAppUid);
         const expireAt =
             Math.floor(Date.now() / 1000) + APP_UID_ALIAS_TTL_SECONDS;
         try {
-            const { res: reverseValue } = await this.stores.kv.get({
-                key: reverseKey,
-            });
-            const reverseAliases =
-                this.#normalizeCanonicalAliasUidList(reverseValue);
-            if (!reverseAliases.includes(oldAppUid)) {
-                reverseAliases.push(oldAppUid);
-            }
-
             await this.stores.kv.set({
                 key,
                 value: canonicalAppUid,
-                expireAt,
-            });
-            await this.stores.kv.set({
-                key: reverseKey,
-                value: reverseAliases,
                 expireAt,
             });
         } catch {
@@ -1184,20 +1149,8 @@ export class AppDriver extends PuterDriver {
         customSite,
     } = {}) {
         const indexUrl = object?.index_url;
-        // Alias-group hosts (`app_origin_aliases`) and custom domains get the
-        // same merge treatment as puter-hosted subdomains. Without this, a
-        // bootstrap stub on such a host could never be absorbed — and since
-        // `#findIndexUrlConflictRow` *does* honor them, the uniqueness check
-        // below would hard-reject the owner's own create/update instead of
-        // merging into the stub.
-        if (
-            !this.#isPuterHostedIndexUrl(indexUrl) &&
-            !this.#findOriginAliasGroupForIndexUrl(indexUrl) &&
-            !customSite
-        ) {
-            return null;
-        }
-
+        // Puter-hosted subdomains, alias-group hosts (`app_origin_aliases`) and
+        // custom domains; any other URL finds no conflict row.
         const conflictRow = await this.#findIndexUrlConflictRow({
             indexUrl,
             excludeAppId,

@@ -41,9 +41,8 @@ import {
 } from '../../services/notification/appMessage.js';
 import {
     APP_READABLE_AUDIENCES,
-    canViewNotification,
     notificationRowScope,
-    ownedAppUids,
+    visibleNotificationRows,
 } from '../../services/notification/notificationAudience.js';
 import {
     assertNotificationValueFits,
@@ -64,6 +63,7 @@ import { PuterDriver } from '../types.js';
 import type { Actor } from '../../core/actor.js';
 import type { DriverRateLimitConfig } from '../meta.js';
 import { CRUD_CONCURRENT } from '../util/crudLimits.js';
+import type { NotificationRow } from '../../services/notification/NotificationService.js';
 
 const MAX_SELECT_LIMIT = 200;
 const MINUTE_MS = 60_000;
@@ -289,12 +289,12 @@ export class NotificationDriver extends PuterDriver {
         // Silent: a driver `create` has never pushed to the live socket, only
         // ever written the row — moving through the registry does not change
         // that.
-        const uid = await this.#write(actor.user.id, value, {
+        const row = await this.#write(actor.user.id, value, {
             type: registeredType,
             appUid,
             silent: true,
         });
-        return this.#readBack(uid, actor.user.id);
+        return this.#toClient(row);
     }
 
     async read(args: Record<string, unknown>): Promise<unknown> {
@@ -382,7 +382,9 @@ export class NotificationDriver extends PuterDriver {
             query,
         );
         const visible =
-            scope === null ? rows : await this.#visibleRows(actor, rows);
+            scope === null
+                ? rows
+                : await visibleNotificationRows(this.stores.app, actor, rows);
         return visible.map((r) => this.#toClient(r));
     }
 
@@ -447,12 +449,9 @@ export class NotificationDriver extends PuterDriver {
             return this.#scheduleAppMessage(actor, message, handle, timing);
 
         if (handle === undefined) {
-            const uid = await this.#sendAppMessage(
-                actor.user.id,
-                appUid,
-                message,
+            return this.#toClient(
+                await this.#sendAppMessage(actor.user.id, appUid, message),
             );
-            return this.#readBack(uid, actor.user.id);
         }
         try {
             const recipient =
@@ -484,7 +483,7 @@ export class NotificationDriver extends PuterDriver {
         recipientId: number,
         appUid: string,
         message: AppMessage,
-    ): Promise<string> {
+    ): Promise<NotificationRow> {
         return this.#oneSendPerGroup(recipientId, appUid, message, () =>
             this.#replaceOrWriteAppMessage(recipientId, appUid, message),
         );
@@ -675,7 +674,7 @@ export class NotificationDriver extends PuterDriver {
         recipientId: number,
         appUid: string,
         message: AppMessage,
-    ): Promise<string> {
+    ): Promise<NotificationRow> {
         // Primary: a lagging replica would turn a replacement into a new
         // notification, which spends a day slot.
         const open = message.group
@@ -698,17 +697,13 @@ export class NotificationDriver extends PuterDriver {
         );
 
         if (open) {
-            const uid = String(open.uid);
-            if (
-                await this.services.notification.notifyUpdate(
-                    uid,
-                    recipientId,
-                    message,
-                    { type: APP_MESSAGE_TYPE, replace: true },
-                )
-            ) {
-                return uid;
-            }
+            const replaced = await this.services.notification.replaceUnseen(
+                open,
+                recipientId,
+                message,
+                { type: APP_MESSAGE_TYPE },
+            );
+            if (replaced) return replaced;
             // Shown or dismissed since the lookup, so this one is new after all.
             await this.#spendAppMessageLimits(recipientId, appUid, ['day']);
         }
@@ -760,7 +755,7 @@ export class NotificationDriver extends PuterDriver {
         }
     }
 
-    /** Writes for `userId`, who need not be the actor, and names the row. */
+    /** Writes for `userId`, who need not be the actor, and returns the row. */
     async #write(
         userId: number,
         value: Record<string, unknown>,
@@ -770,31 +765,18 @@ export class NotificationDriver extends PuterDriver {
             silent: boolean;
             group?: string | null;
         },
-    ): Promise<string> {
-        const uid = await this.services.notification.notify(
+    ): Promise<NotificationRow> {
+        const [row] = await this.services.notification.notifyRows(
             [userId],
             value,
             opts,
         );
-        if (!uid) {
+        if (!row) {
             throw new HttpError(500, 'Notification could not be created', {
                 legacyCode: 'internal_error',
             });
         }
-        return uid;
-    }
-
-    /** The service hands back only the uid; the primary has the rest. */
-    async #readBack(
-        uid: string,
-        userId: number,
-    ): Promise<Record<string, unknown> | null> {
-        return this.#toClient(
-            await this.stores.notification.getByUid(uid, {
-                userId,
-                primary: true,
-            }),
-        );
+        return row;
     }
 
     // -- Permissions -------------------------------------------------
@@ -829,28 +811,6 @@ export class NotificationDriver extends PuterDriver {
         return { audiences: APP_READABLE_AUDIENCES, appUid };
     }
 
-    /** The audience predicate over a page, with the developer fact resolved. */
-    async #visibleRows(
-        actor: Actor,
-        rows: Array<Record<string, unknown>>,
-    ): Promise<Array<Record<string, unknown>>> {
-        if (rows.length === 0) return rows;
-        const scopes = rows.map(notificationRowScope);
-        const owned = await ownedAppUids(
-            this.stores.app,
-            Number(actor.user.id),
-            scopes.flatMap((s) =>
-                s.audience === 'developer' && s.appUid ? [s.appUid] : [],
-            ),
-        );
-
-        return rows.filter((_row, i) =>
-            canViewNotification(scopes[i], actor, {
-                recipientOwnsApp: owned.has(scopes[i].appUid ?? ''),
-            }),
-        );
-    }
-
     /**
      * Whether one row may be shown. A `null` scope is the holder asking for
      * their own mailbox with nothing named — all of it is theirs, and the
@@ -863,7 +823,10 @@ export class NotificationDriver extends PuterDriver {
     ): Promise<boolean> {
         if (scope === null) return true;
         if (!inScope(row, scope)) return false;
-        return (await this.#visibleRows(actor, [row])).length === 1;
+        return (
+            (await visibleNotificationRows(this.stores.app, actor, [row]))
+                .length === 1
+        );
     }
 
     /**

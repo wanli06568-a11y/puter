@@ -40,7 +40,7 @@ beforeEach(() => {
     })));
     vi.stubGlobal('puter', {
         authToken: 'test-session',
-        kv: { get: async key => saved.get(key), set: vi.fn() },
+        kv: { get: async key => saved.get(typeof key === 'object' ? key.key : key), set: vi.fn() },
     });
     onLaunch.mockClear();
 });
@@ -68,6 +68,102 @@ async function mount (options = {}) {
 }
 
 describe('shared app browser', () => {
+    it('keeps an app off the grid while its uninstall is still on its way to the server', async () => {
+        const actions = { showAlert: vi.fn(), revokeAppSessions: vi.fn(async () => {}) };
+        await mount({ editable: true, actions });
+        let finishRevoke;
+        puter.perms = { revokeApp: vi.fn(() => new Promise(resolve => { finishRevoke = resolve; })) };
+        // The app's windows are closed first; the test has none.
+        $.fn.close ??= function () { return this; };
+        window.matchMedia = () => ({ matches: true });
+        browser._setReorderMode($root, true);
+        $('.myapps-tile[data-app-name="editor"] .myapps-tile-remove').trigger('click');
+        $('.myapps-modal-confirm').trigger('click');
+        expect(puter.perms.revokeApp).toHaveBeenCalled();
+
+        // A refresh before the revoke lands still lists the app as installed.
+        await browser.loadApps($root);
+        expect(browser._apps.map(app => app.name)).not.toContain('editor');
+
+        installed = installed.filter(app => app.name !== 'editor');
+        finishRevoke({});
+        await vi.waitFor(() => expect(browser._pendingUninstalls.size).toBe(0));
+        await browser.loadApps($root);
+        expect(browser._apps.map(app => app.name)).not.toContain('editor');
+        expect(actions.showAlert).not.toHaveBeenCalled();
+    });
+
+    it('takes the saved layout from the boot batch on the first load only', async () => {
+        const reads = [];
+        puter.kv.get = vi.fn(async key => {
+            reads.push(key);
+            return saved.get(typeof key === 'object' ? key.key : key);
+        });
+        const layoutKeys = [APPS_ORDER_KV_KEY, REMOVED_APPS_KV_KEY, APP_GROUPS_KV_KEY];
+        await mount();
+        expect(reads).toEqual(expect.arrayContaining(layoutKeys));
+
+        reads.length = 0;
+        await browser.loadApps($root);
+        expect(reads).toEqual(expect.arrayContaining(layoutKeys.map(key => ({ key }))));
+        expect(reads.filter(key => typeof key === 'string')).toEqual([]);
+    });
+
+    it('saves one layout at a time, sending only the newest once the last write lands', async () => {
+        await mount({ editable: true });
+        const writes = [];
+        puter.kv.set = vi.fn((key, value) => new Promise(resolve => writes.push({ key, value, resolve })));
+        const orderWrites = () => writes.filter(w => w.key === APPS_ORDER_KV_KEY);
+
+        browser._apps = [{ name: 'a' }, { name: 'b' }];
+        browser.saveOrder();
+        browser._apps = [{ name: 'b' }, { name: 'a' }];
+        browser.saveOrder();
+        browser._apps = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
+        browser.saveOrder();
+        expect(orderWrites()).toHaveLength(1);
+
+        orderWrites()[0].resolve();
+        await vi.waitFor(() => expect(orderWrites()).toHaveLength(2));
+        expect(orderWrites()[1].value).toBe(JSON.stringify(browser._savedOrderNames));
+        expect(orderWrites()[1].value).not.toBe(orderWrites()[0].value);
+        orderWrites()[1].resolve();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(orderWrites()).toHaveLength(2);
+    });
+
+    it('leaves the app request form open on an Escape that ends an IME composition', async () => {
+        await mount({ editable: true });
+        $('.myapps-add-tile').trigger('click');
+        $('.myapps-add-option[data-add-option="request"]').trigger('click');
+        const pane = () => $('.myapps-add-pane:not([hidden])').attr('data-pane');
+        expect(pane()).toBe('request');
+
+        $('.myapps-add-message')[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', isComposing: true, bubbles: true }));
+        expect(pane()).toBe('request');
+        $('.myapps-add-message')[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        expect(pane()).toBe('options');
+        $(document).off('keydown.add-app-modal');
+    });
+
+    it('lets Tab reach the delete-data option in the Uninstall dialog', async () => {
+        // jsdom lays nothing out; the focus trap skips elements with no offsetParent.
+        vi.spyOn(HTMLElement.prototype, 'offsetParent', 'get').mockReturnValue(document.body);
+        await mount({ editable: true });
+        browser._setReorderMode($root, true);
+        $('.myapps-tile[data-app-name="editor"] .myapps-tile-remove').trigger('click');
+        const $overlay = $('.myapps-modal-overlay');
+        expect(document.activeElement.classList.contains('myapps-modal-cancel')).toBe(true);
+
+        // Tab from the last control wraps to the first, the checkbox.
+        $overlay.find('.myapps-modal-confirm')[0].focus();
+        $overlay.trigger($.Event('keydown', { key: 'Tab', shiftKey: false }));
+        expect(document.activeElement.classList.contains('myapps-modal-delete-data')).toBe(true);
+        // Shift+Tab from it wraps back to the last.
+        $overlay.trigger($.Event('keydown', { key: 'Tab', shiftKey: true }));
+        expect(document.activeElement.classList.contains('myapps-modal-confirm')).toBe(true);
+    });
+
     it('uses saved order, folders, and removed recommendations in read-only mode', async () => {
         await mount();
         expect(browser._apps.map(app => app.name)).toEqual(['notes', 'sheet', 'editor']);
@@ -108,6 +204,21 @@ describe('shared app browser', () => {
         expect(onLaunch).toHaveBeenCalled();
     });
 
+    it('offers Copy link, not Open in new tab, and copies the app\'s index_url', async () => {
+        installed = [{ name: 'editor', title: 'Editor', index_url: 'https://editor.puter.site/' }];
+        saved = new Map();
+        const actions = { showContextMenu: vi.fn() };
+        await mount({ editable: true, actions });
+        window.copy_to_clipboard = vi.fn();
+        $('.myapps-tile[data-app-name="editor"]').trigger('contextmenu');
+        const { items } = actions.showContextMenu.mock.calls[0][0];
+        const labels = items.filter(item => item !== '-').map(item => item.html);
+        expect(labels).toContain('copy_link');
+        expect(labels).not.toContain('open_in_new_tab');
+        await items.find(item => item.html === 'copy_link').onClick();
+        expect(window.copy_to_clipboard).toHaveBeenCalledWith('https://editor.puter.site/');
+    });
+
     it('retains the dashboard editing controls and isolates component state', async () => {
         await mount({ editable: true });
         expect($('.myapps-reorder-btn, .myapps-add-tile')).toHaveLength(2);
@@ -129,7 +240,7 @@ describe('shared app browser', () => {
         $('.myapps-search').val('editor').trigger('input');
         $('.myapps-tile[data-app-name="editor"]').trigger('click');
         expect(window.open).toHaveBeenCalledWith('', '_blank');
-        expect(actions.launchApp).toHaveBeenCalledWith({ name: 'editor', newTab: tab });
+        expect(actions.launchApp).toHaveBeenCalledWith({ name: 'editor', newTab: tab, trigger: 'app_icon' });
         await vi.waitFor(() => expect(browser._launchingApps.size).toBe(0));
         expect($('.window')).toHaveLength(0);
     });
@@ -148,23 +259,44 @@ describe('shared app browser', () => {
         expect(actions.launchApp).toHaveBeenCalledWith({
             name: 'editor', maximized: true,
             window_options: { morph_from_dashboard_tile: true },
+            trigger: 'app_icon',
         });
         expect(actions.beginTileLaunch).toHaveBeenCalledWith(tile);
         await vi.waitFor(() => expect(actions.settleTileLaunch).toHaveBeenCalledWith(tile));
         expect(browser._launchingApps.size).toBe(0);
     });
 
-    it('launches the app store from the dashboard add-app dialog', async () => {
+    it.each([
+        ['browse', 'https://apps.puter.com/'],
+        ['ai', 'https://builder.puter.com/'],
+    ])('opens the %s option of the add-app dialog as a signed-in site in a new tab', async (option, site) => {
+        const actions = {
+            launchApp: vi.fn(async () => {}),
+            openSite: vi.fn(() => Promise.resolve()),
+        };
+        await mount({ editable: true, onLaunch: undefined, actions });
+        $('.myapps-add-tile').trigger('click');
+        $(`.myapps-add-option[data-add-option="${option}"]`).trigger('click');
+        expect(actions.openSite).toHaveBeenCalledWith(site);
+        expect(actions.launchApp).not.toHaveBeenCalled();
+        expect($('.myapps-add-modal')).toHaveLength(0);
+    });
+
+    it.each([
+        ['browse', 'app-center'],
+        ['ai', 'builder'],
+    ])('opens the %s option\'s app in-page when the browser refuses the tab', async (option, appName) => {
         const actions = {
             launchApp: vi.fn(async () => {}),
             settleTileLaunch: vi.fn(),
+            openSite: vi.fn(() => null),
         };
         puter.apps = { get: async name => ({ name, title: name }) };
         await mount({ editable: true, onLaunch: undefined, actions });
         $('.myapps-add-tile').trigger('click');
-        $('.myapps-add-option[data-add-option="browse"]').trigger('click');
+        $(`.myapps-add-option[data-add-option="${option}"]`).trigger('click');
         await vi.waitFor(() => expect(actions.launchApp).toHaveBeenCalledWith(
-            expect.objectContaining({ name: 'app-center', maximized: true }),
+            expect.objectContaining({ name: appName, maximized: true }),
         ));
         expect($('.myapps-add-modal')).toHaveLength(0);
     });

@@ -28,6 +28,7 @@ import { HttpError } from '../../core/http/HttpError.js';
 import {
     CONTENT_FILTER_PATTERN,
     CREDIT_EXHAUSTION_PATTERN,
+    fetchBoundedJson,
     isCreditExhaustion,
     isTransientUpstreamError,
     isUpstreamConnectionError,
@@ -35,6 +36,7 @@ import {
     sanitizeUpstreamMessage,
     upstreamBodyStream,
     upstreamFetch,
+    upstreamJson,
     UpstreamResponseError,
 } from './upstreamErrors.js';
 
@@ -224,6 +226,12 @@ describe('sanitizeUpstreamMessage', () => {
         ).toBe('Bad gateway');
     });
 
+    it('reads a message that is not text as empty', () => {
+        for (const value of [undefined, null, 5, { message: 'x' }, ['x']]) {
+            expect(sanitizeUpstreamMessage(value)).toBe('');
+        }
+    });
+
     it('bounds the length', () => {
         const out = sanitizeUpstreamMessage('x'.repeat(1000));
         expect(out.length).toBe(300);
@@ -242,6 +250,52 @@ describe('sanitizeUpstreamMessage', () => {
                 'Add credits at https://vendor.test/billing (request id: req-parenthesized) request_id: req_standalone',
             ),
         ).toBe('Add credits at');
+    });
+});
+
+describe('upstreamJson', () => {
+    it('returns the parsed body', async () => {
+        expect(
+            await upstreamJson('acme', 'Acme', Response.json({ a: 1 }), 1024),
+        ).toEqual({ a: 1 });
+    });
+
+    it('raises a 502 naming the provider when the body is not JSON', async () => {
+        const error = await upstreamJson(
+            'acme',
+            'Acme',
+            new Response('<html>Bad gateway</html>'),
+            1024,
+        ).catch((e) => e);
+        expect(error).toBeInstanceOf(HttpError);
+        expect(error.statusCode).toBe(502);
+        expect(error.legacyCode).toBe('upstream_failed');
+        expect(error.fields).toEqual({ provider: 'acme' });
+    });
+
+    it('raises a 502 for a body over the cap, declared or not', async () => {
+        const big = JSON.stringify({ data: 'x'.repeat(2048) });
+        for (const response of [
+            new Response(big, {
+                headers: { 'content-length': String(big.length) },
+            }),
+            new Response(
+                new ReadableStream({
+                    start(c) {
+                        c.enqueue(new TextEncoder().encode(big));
+                        c.close();
+                    },
+                }),
+            ),
+        ]) {
+            await expect(
+                upstreamJson('acme', 'Acme', response, 1024),
+            ).rejects.toMatchObject({
+                statusCode: 502,
+                legacyCode: 'upstream_failed',
+                fields: { provider: 'acme' },
+            });
+        }
     });
 });
 
@@ -457,6 +511,48 @@ describe('upstreamFetch', () => {
         controller.abort();
         await expect(reader.next()).rejects.toMatchObject({
             name: 'AbortError',
+        });
+    });
+
+    describe('fetchBoundedJson', () => {
+        const tooLarge = (max: number) => new Error(`over ${max}`);
+        const post = (status: number, body: string, maxBytes = 1024) =>
+            fetchBoundedJson<{ error?: { message?: string } }>(
+                `${base}/status/${status}`,
+                { method: 'POST', body },
+                { timeoutMs: 5000, maxBytes, tooLarge },
+            );
+
+        it('parses the envelope whatever the status', async () => {
+            const ok = await post(200, '{"data":{"id":"t1"}}');
+            expect(ok.response.status).toBe(200);
+            expect(ok.payload).toEqual({ data: { id: 't1' } });
+            const failed = await post(429, '{"error":{"message":"slow"}}');
+            expect(failed.response.status).toBe(429);
+            expect(failed.payload.error?.message).toBe('slow');
+        });
+
+        it('gives `{}` for a body that is not a JSON object', async () => {
+            expect((await post(502, '<html>bad gateway</html>')).payload).toEqual(
+                {},
+            );
+            expect((await post(200, '"text"')).payload).toEqual({});
+        });
+
+        it('rejects a body over the cap', async () => {
+            await expect(post(200, 'x'.repeat(64), 16)).rejects.toThrow(
+                'over 16',
+            );
+        });
+
+        it('rejects with a TimeoutError when the provider never answers', async () => {
+            await expect(
+                fetchBoundedJson(`${base}/hang`, {}, {
+                    timeoutMs: 100,
+                    maxBytes: 1024,
+                    tooLarge,
+                }),
+            ).rejects.toMatchObject({ name: 'TimeoutError' });
         });
     });
 });

@@ -28,7 +28,9 @@ import type { puterStores } from '../../../stores';
 import type { IConfig, LayerInstances } from '../../../types';
 import { awaitLater } from '../../../util/concurrency';
 import { isTrashedPath } from '../../../util/hostedAppBacking';
-import { makeActor } from '../../actor';
+import { normalizeHost } from '../../../util/hosts.js';
+import { makeActor, type Actor } from '../../actor';
+import { pipeToResponse } from '../pipeToResponse';
 import {
     buildAppCenterFallback,
     buildHostingConfig,
@@ -171,13 +173,6 @@ interface Layers {
     services: LayerInstances<typeof puterServices>;
 }
 
-function normalizeHost(value: string | undefined | null): string | null {
-    if (typeof value !== 'string') return null;
-    const trimmed = value.trim().toLowerCase().replace(/^\./, '');
-    if (!trimmed) return null;
-    return trimmed.split(':')[0] || null;
-}
-
 export const createPuterSiteMiddleware = (
     config: IConfig,
     layers: Layers,
@@ -297,6 +292,18 @@ export const createPuterSiteMiddleware = (
             res.status(404).type('text/plain').send('Subdomain not found');
             return;
         }
+        const ownerActor: Actor = {
+            user: {
+                uuid: owner.uuid,
+                id: owner.id,
+                username: owner.username,
+                email: owner.email ?? null,
+                suspended: !!owner.suspended,
+            },
+        };
+        // Most visitors are anonymous, so a failure past this point is
+        // reported against the site's owner.
+        req.alarmActor = ownerActor;
 
         // The hosted app and the site root depend only on the site row, so
         // both lookups run together. Each is awaited where it is read, so an
@@ -548,6 +555,8 @@ export const createPuterSiteMiddleware = (
                             requestHostname: host,
                         }),
                     );
+                    // A shared cache must not hand this visitor's cookie to others.
+                    res.set('Cache-Control', 'private');
                 }
             } catch (e) {
                 // Best-effort — don't block the public file serve.
@@ -840,18 +849,8 @@ export const createPuterSiteMiddleware = (
                 // Unknown requesters are billed to the site owner.
             }
         }
-        req.egressActor = visitorActor ?? {
-            user: {
-                uuid: owner.uuid,
-                id: owner.id,
-                username: owner.username,
-                email: owner.email ?? null,
-                suspended: !!owner.suspended,
-            },
-        };
+        req.egressActor = visitorActor ?? ownerActor;
 
-        req.on('close', () => download.body.destroy());
-        download.body.on('error', (err) => res.destroy(err));
-        download.body.pipe(res);
+        void pipeToResponse(download.body, res);
     };
 };

@@ -15,11 +15,11 @@ import {
     vi,
 } from 'vitest';
 import type { FSController } from '../src/backend/controllers/fs/FSController.ts';
+import type { ClientSignedWriteResponse } from '../src/backend/controllers/fs/requestTypes.ts';
 import type {
-    ClientSignedWriteResponse,
     CompleteWriteRequest,
     SignedWriteRequest,
-} from '../src/backend/controllers/fs/requestTypes.ts';
+} from '../src/backend/services/fs/types.ts';
 import type { Actor } from '../src/backend/core/actor.ts';
 import { runWithContext } from '../src/backend/core/context.ts';
 import { PuterServer } from '../src/backend/server.ts';
@@ -127,6 +127,27 @@ describe('thumbnails extension — handleThumbnailCreated', () => {
             crypto.randomUUID(),
         );
         expect(url).toBeNull();
+    });
+
+    it('stores the sniffed image type, not the declared one', async () => {
+        const newUrl = await created(
+            `data:text/html;base64,${TINY_PNG_BASE64}`,
+            crypto.randomUUID(),
+        );
+        const key = (newUrl as string).slice(`s3://${BUCKET}/`.length);
+        const obj = await s3.send(
+            new GetObjectCommand({ Bucket: BUCKET, Key: key }),
+        );
+        expect(obj.ContentType).toBe('image/png');
+    });
+
+    it('sets event.url to null for an SVG data: URL', async () => {
+        const svg = Buffer.from(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><script>alert(1)</script></svg>',
+        ).toString('base64');
+        expect(
+            await created(`data:image/svg+xml;base64,${svg}`, crypto.randomUUID()),
+        ).toBeNull();
     });
 
     it('sets event.url to null for a data: URL with no entry to bind it to', async () => {
@@ -258,6 +279,23 @@ describe('thumbnails extension — handleThumbnailUploadPrepare', () => {
         expect(item.thumbnailUrl).toBeUndefined();
     });
 
+    it.each(['text/html', 'image/svg+xml', 'application/octet-stream'])(
+        'skips items declared as %s',
+        async (contentType) => {
+            const item: Record<string, unknown> = {
+                contentType,
+                size: 1024,
+                item_uid: crypto.randomUUID(),
+            };
+            await handleThumbnailUploadPrepare(
+                { items: [item] },
+                { s3Presign, bucketName: BUCKET },
+            );
+            expect(item.uploadUrl).toBeUndefined();
+            expect(item.thumbnailUrl).toBeUndefined();
+        },
+    );
+
     it('skips items with no entry to bind the key to', async () => {
         const item: Record<string, unknown> = {
             contentType: 'image/png',
@@ -344,6 +382,54 @@ describe('thumbnails extension — handleThumbnailRead', () => {
             );
             vi.setSystemTime(signedAt + 3600_000);
             expect(await read()).not.toBe(first);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('reuses a URL signed this hour and signs afresh under a new signing key', async () => {
+        // Short-lived credentials are fetched again on every signing, so a
+        // swapped secret shows whether a read was signed or served from cache.
+        const creds = { accessKeyId: 'AKIDFIRST', secretAccessKey: 'one' };
+        const client = new S3Client({
+            region: 'us-west-2',
+            endpoint: 'http://127.0.0.1:4566',
+            forcePathStyle: true,
+            credentials: async () => ({
+                ...creds,
+                expiration: new Date(Date.now() + 60_000),
+            }),
+        });
+        const keys = [mintedKey(), mintedKey(), mintedKey()];
+        const read = async (key: string) => {
+            const entry: Record<string, unknown> = {
+                thumbnail: `s3://${BUCKET}/${key}`,
+            };
+            await handleThumbnailRead(entry, {
+                s3,
+                s3Presign: client,
+                bucketName: BUCKET,
+                bucketEndpoint: BUCKET_ENDPOINT,
+                fsEntry: server.stores.fsEntry,
+            });
+            return entry.thumbnail as string;
+        };
+        const listing = () => Promise.all(keys.map(read));
+
+        vi.useFakeTimers({ toFake: ['Date'] });
+        try {
+            vi.setSystemTime(Date.UTC(2026, 9, 26, 10, 30));
+            // A cold client's first listing signs its entries concurrently.
+            const first = await listing();
+            creds.secretAccessKey = 'two';
+            expect(await listing()).toEqual(first);
+
+            creds.accessKeyId = 'AKIDSECOND';
+            const rotated = await read(keys[0]);
+            expect(rotated).not.toBe(first[0]);
+            expect(
+                new URL(rotated).searchParams.get('X-Amz-Credential'),
+            ).toMatch(/^AKIDSECOND\//);
         } finally {
             vi.useRealTimers();
         }
@@ -1147,5 +1233,28 @@ describe('thumbnails extension — signed batch upload through /fs', () => {
             expect(await objectExists(s3, sourceKey)).toBe(false);
         });
         expect(await objectExists(s3, copyKey)).toBe(true);
+    });
+
+    it('deletes the thumbnail object an overwrite drops', async () => {
+        const { actor, username } = await makeActor();
+        const s3 = server.clients.s3.get();
+        const path = `/${username}/Documents/edited.png`;
+        const { entry } = await upload(actor, path, (s) => s.thumbnailUrl);
+        const key = entry.thumbnail!.slice(`s3://${BUCKET}/`.length);
+        expect(await objectExists(s3, key)).toBe(true);
+
+        // An app saving over the file sends no thumbnail.
+        await server.services.fs.write(actor.user!.id!, {
+            fileMetadata: { path, size: 4, overwrite: true },
+            fileContent: 'efgh',
+        } as never);
+
+        expect(
+            (await server.stores.fsEntry.getEntryByPath(path))?.thumbnail,
+        ).toBeNull();
+        // `thumbnail.discarded` is fire-and-forget.
+        await vi.waitFor(async () => {
+            expect(await objectExists(s3, key)).toBe(false);
+        });
     });
 });

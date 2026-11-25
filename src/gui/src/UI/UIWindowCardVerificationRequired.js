@@ -421,6 +421,10 @@ function UIWindowCardVerificationRequired(options) {
                             showError(
                                 'This card has already been used to verify other accounts. Please try a different card.',
                             );
+                        } else if (res.reason === 'card_not_on_file') {
+                            showError(i18n('card_not_on_file'));
+                        } else if (res.reason === 'card_not_accepted') {
+                            showError(i18n('card_not_accepted'));
                         } else {
                             showError(
                                 "We couldn't verify this card. Please try a different card.",

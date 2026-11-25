@@ -18,13 +18,14 @@
  */
 
 import type { Request } from 'express';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { v4 as uuidv4 } from 'uuid';
 import { makeActor } from '../../actor';
 import {
     HOSTED_ASSET_COOKIES,
     type AuthService,
 } from '../../../services/auth/AuthService';
+import { FULL_API_ACCESS } from '../../../services/permission/consts';
 import { PuterServer } from '../../../server';
 import { setupTestServer } from '../../../testUtil';
 import type { IConfig } from '../../../types';
@@ -36,8 +37,6 @@ import {
     getBootstrapToken,
     hostMatchesPrivateDomain,
     isTopLevelNavigation,
-    normalizeHost,
-    normalizeHostRaw,
     pathWithoutQueryParam,
     renderLoginBootstrapHtml,
     resolveOwnedAppForHostedSite,
@@ -49,44 +48,6 @@ import {
 // ── Pure helpers ────────────────────────────────────────────────────
 //
 // These don't need a server, so they live above the harness.
-
-describe('normalizeHost', () => {
-    it('lowercases and strips port + leading dot', () => {
-        expect(normalizeHost('Foo.Puter.Site:1234')).toBe('foo.puter.site');
-        expect(normalizeHost('.foo.bar')).toBe('foo.bar');
-        expect(normalizeHost('  foo.bar  ')).toBe('foo.bar');
-    });
-
-    it('returns null for non-strings, empty input, or bare port', () => {
-        expect(normalizeHost(null)).toBeNull();
-        expect(normalizeHost(undefined)).toBeNull();
-        expect(normalizeHost(123 as unknown as string)).toBeNull();
-        expect(normalizeHost('')).toBeNull();
-        expect(normalizeHost('   ')).toBeNull();
-        // `':1234'` → trimmed empty → bare-port case (head before `:` is '').
-        expect(normalizeHost(':1234')).toBeNull();
-    });
-});
-
-describe('normalizeHostRaw', () => {
-    it('keeps the port (used for index_url candidate matching)', () => {
-        expect(normalizeHostRaw('Foo.Puter.Site:1234')).toBe(
-            'foo.puter.site:1234',
-        );
-    });
-
-    it('still strips the leading dot and trims', () => {
-        expect(normalizeHostRaw('.foo:80')).toBe('foo:80');
-        expect(normalizeHostRaw('  foo.bar  ')).toBe('foo.bar');
-    });
-
-    it('returns null for missing / empty input', () => {
-        expect(normalizeHostRaw(null)).toBeNull();
-        expect(normalizeHostRaw(undefined)).toBeNull();
-        expect(normalizeHostRaw('')).toBeNull();
-        expect(normalizeHostRaw('   ')).toBeNull();
-    });
-});
 
 describe('hostMatchesPrivateDomain', () => {
     it('matches exact host AND any subdomain of a private domain', () => {
@@ -123,12 +84,13 @@ describe('subdomainFromHost', () => {
     it('prefers longest-matching hosting domain (avoids over-stripping)', () => {
         // `bar.puter.app` is configured as a hosting domain itself, so a
         // visit to `foo.bar.puter.app` should pull `foo`, not `foo.bar`.
-        expect(
-            subdomainFromHost('foo.bar.puter.app', [
-                'puter.app',
-                'bar.puter.app',
-            ]),
-        ).toBe('foo');
+        const { hostingDomains } = buildHostingConfig({
+            static_hosting_domain: 'puter.app',
+            private_app_hosting_domain: 'bar.puter.app',
+        } as IConfig);
+        expect(subdomainFromHost('foo.bar.puter.app', hostingDomains)).toBe(
+            'foo',
+        );
     });
 
     it('returns empty for the bare hosting domain', () => {
@@ -551,6 +513,327 @@ describe('renderLoginBootstrapHtml', () => {
     });
 });
 
+describe('the login bootstrap page script', () => {
+    const LAUNCH_URL =
+        'https://priv.app.test/?puter.app_instance_id=i&puter.item.uid=f-1&page=2#/doc';
+    const STRIPPED_URL = 'https://priv.app.test/?page=2#/doc';
+
+    type Button = {
+        disabled: boolean;
+        click?: () => Promise<void> | void;
+        addEventListener: (type: string, fn: () => Promise<void> | void) => void;
+    };
+    const button = (): Button => ({
+        disabled: false,
+        addEventListener(_type, fn) {
+            this.click = fn;
+        },
+    });
+    const flush = () => new Promise((resolve) => setImmediate(resolve));
+    const OK = { type: 'basic', ok: true, status: 200 };
+    const REDIRECT = { type: 'opaqueredirect', ok: false, status: 0 };
+
+    /** Runs the page's inline script against stand-ins for the browser. */
+    const openPage = (opts: {
+        puter?: Record<string, unknown>;
+        fetchResult?: object | Error;
+        lastAttempted?: string;
+        lastHeaderTry?: { t: string; at: number };
+        href?: string;
+    }) => {
+        const script = renderLoginBootstrapHtml({ name: 'app' }).match(
+            /<script>([\s\S]*?)<\/script>/,
+        )![1];
+        const elements = {
+            status: { textContent: '' },
+            loginButton: button(),
+            retryButton: button(),
+        };
+        const replaced: string[] = [];
+        const location = {
+            href: opts.href ?? LAUNCH_URL,
+            reloads: 0,
+            replace: (url: string) => replaced.push(url),
+            reload() {
+                this.reloads++;
+            },
+        };
+        const session = new Map<string, string>();
+        if (opts.lastAttempted) {
+            session.set(
+                'puter.privateAppBootstrap.lastAttemptedToken',
+                opts.lastAttempted,
+            );
+        }
+        if (opts.lastHeaderTry) {
+            session.set(
+                'puter.privateAppBootstrap.lastHeaderTry',
+                JSON.stringify(opts.lastHeaderTry),
+            );
+        }
+        const fetches: Array<[string, RequestInit]> = [];
+        const fetchStub = async (url: string, init: RequestInit) => {
+            fetches.push([url, init]);
+            if (opts.fetchResult instanceof Error) throw opts.fetchResult;
+            return opts.fetchResult ?? OK;
+        };
+        new Function(
+            'document',
+            'location',
+            'fetch',
+            'sessionStorage',
+            'localStorage',
+            'globalThis',
+            'console',
+            script,
+        )(
+            { getElementById: (id: keyof typeof elements) => elements[id] },
+            location,
+            fetchStub,
+            {
+                getItem: (key: string) => session.get(key) ?? null,
+                setItem: (key: string, value: string) => session.set(key, value),
+            },
+            { getItem: () => null },
+            { puter: opts.puter },
+            { error: () => {} },
+        );
+        return { elements, location, replaced, fetches };
+    };
+
+    /** A puter.js whose desktop handoff settles when `handOver` is called. */
+    const desktopTab = () => {
+        let handOver!: (token: string) => void;
+        const kept: unknown[] = [];
+        const puter: Record<string, unknown> = { authToken: null };
+        const settled = new Promise<void>((resolve) => {
+            handOver = (token) => {
+                puter.authToken = token;
+                resolve();
+            };
+        });
+        puter.keepTabLaunchForNextPage_ = (token?: string) => {
+            kept.push(token);
+            return settled;
+        };
+        return { puter, handOver, kept };
+    };
+    const urlToken = (url: string) =>
+        new URL(url).searchParams.get('puter.auth.token');
+
+    it('signs in with the token the desktop hands over, keeping it out of the URL', async () => {
+        const { puter, handOver, kept } = desktopTab();
+        const page = openPage({ puter });
+        // puter.js clears the launch params from the address bar after load.
+        page.location.href = STRIPPED_URL;
+        handOver('T');
+        await flush();
+
+        expect(page.fetches).toHaveLength(1);
+        const [url, init] = page.fetches[0];
+        expect(url).toBe(LAUNCH_URL);
+        expect(init).toMatchObject({
+            headers: { 'X-Puter-Auth-Token': 'T' },
+            credentials: 'same-origin',
+            redirect: 'manual',
+        });
+        expect(page.replaced).toEqual([LAUNCH_URL]);
+        // The opened item is kept only for a sign-in with the handed token.
+        expect(kept).toContain('T');
+    });
+
+    it('reloads when the app URL differs from the page only in its hash', async () => {
+        const { puter, handOver } = desktopTab();
+        const page = openPage({ puter });
+        handOver('T');
+        await flush();
+
+        expect(page.fetches).toHaveLength(1);
+        expect(page.replaced).toEqual([]);
+        expect(page.location.reloads).toBe(1);
+    });
+
+    it('goes to the app without the token for any answer other than a redirect', async () => {
+        const { puter, handOver } = desktopTab();
+        const page = openPage({ puter, fetchResult: { type: 'basic', ok: false, status: 404 } });
+        page.location.href = STRIPPED_URL;
+        handOver('T');
+        await flush();
+
+        expect(page.replaced).toEqual([LAUNCH_URL]);
+    });
+
+    it('falls back to the token in the URL when the host redirects instead', async () => {
+        const { puter, handOver } = desktopTab();
+        const page = openPage({ puter, fetchResult: REDIRECT });
+        handOver('T');
+        await flush();
+
+        const target = new URL(page.replaced[0]);
+        expect(target.searchParams.get('puter.auth.token')).toBe('T');
+        expect(target.searchParams.get('puter.app_instance_id')).toBe('i');
+        expect(target.hash).toBe('#/doc');
+    });
+
+    it('falls back to the token in the URL when the request fails', async () => {
+        const { puter, handOver } = desktopTab();
+        const page = openPage({ puter, fetchResult: new Error('offline') });
+        handOver('T');
+        await flush();
+
+        expect(urlToken(page.replaced[0])).toBe('T');
+    });
+
+    it('waits for a click, then goes the URL way, when a header sign-in with the token just now did not load the app', async () => {
+        const { puter, handOver } = desktopTab();
+        const page = openPage({ puter, lastHeaderTry: { t: 'T', at: Date.now() } });
+        handOver('T');
+        await flush();
+        expect(page.fetches).toEqual([]);
+        expect(page.replaced).toEqual([]);
+
+        await page.elements.loginButton.click!();
+        await flush();
+        expect(page.fetches).toEqual([]);
+        expect(urlToken(page.replaced[0])).toBe('T');
+    });
+
+    it('uses the token the desktop hands over when clicked before it arrives', async () => {
+        const { puter, handOver } = desktopTab();
+        puter.authToken = 'STORED';
+        // The stored token already failed, so nothing starts without a click.
+        const page = openPage({ puter, lastAttempted: 'STORED' });
+        const clicked = page.elements.loginButton.click!();
+        handOver('FRESH');
+        await clicked;
+        await flush();
+
+        expect(page.fetches).toHaveLength(1);
+        expect(page.fetches[0][1]).toMatchObject({
+            headers: { 'X-Puter-Auth-Token': 'FRESH' },
+        });
+    });
+
+    it('uses the header again when the earlier header sign-in was a while ago', async () => {
+        const { puter, handOver } = desktopTab();
+        const page = openPage({
+            puter,
+            lastHeaderTry: { t: 'T', at: Date.now() - 2 * 60 * 1000 },
+        });
+        page.location.href = STRIPPED_URL;
+        handOver('T');
+        await flush();
+
+        expect(page.fetches).toHaveLength(1);
+        expect(page.replaced).toEqual([LAUNCH_URL]);
+    });
+
+    it('prefers the token the desktop hands over to a stored one', async () => {
+        const { puter, handOver } = desktopTab();
+        puter.authToken = 'STORED';
+        const page = openPage({ puter });
+        handOver('FRESH');
+        await flush();
+
+        expect(page.fetches[0][1]).toMatchObject({
+            headers: { 'X-Puter-Auth-Token': 'FRESH' },
+        });
+    });
+
+    it('waits for a click when no token was handed over', async () => {
+        const page = openPage({
+            puter: {
+                authToken: null,
+                keepTabLaunchForNextPage_: () => Promise.resolve(),
+            },
+        });
+        await flush();
+
+        expect(page.fetches).toEqual([]);
+        expect(page.replaced).toEqual([]);
+        expect(page.elements.loginButton.disabled).toBe(false);
+    });
+
+    it('does not retry a token that already failed', async () => {
+        const { puter, handOver } = desktopTab();
+        const page = openPage({ puter, lastAttempted: 'T' });
+        handOver('T');
+        await flush();
+
+        expect(page.fetches).toEqual([]);
+        expect(page.replaced).toEqual([]);
+    });
+
+    it('signs in through puter.js on a click, returning to the URL the tab opened at', async () => {
+        const kept: unknown[] = [];
+        const puter = {
+            authToken: null,
+            keepTabLaunchForNextPage_: (token?: string) => {
+                kept.push(token);
+                return Promise.resolve();
+            },
+            auth: { signIn: async () => ({ token: 'S' }) },
+        };
+        const page = openPage({ puter });
+        await flush();
+        page.location.href = STRIPPED_URL;
+        await page.elements.loginButton.click!();
+        await flush();
+
+        expect(page.fetches[0][1]).toMatchObject({
+            headers: { 'X-Puter-Auth-Token': 'S' },
+        });
+        expect(page.replaced).toEqual([LAUNCH_URL]);
+        expect(kept.filter(Boolean)).toEqual(['S']);
+    });
+
+    it('replaces a rejected token in the URL with the new one, as the host reads that first', async () => {
+        const puter = {
+            authToken: null,
+            keepTabLaunchForNextPage_: () => Promise.resolve(),
+            auth: { signIn: async () => ({ token: 'S' }) },
+        };
+        const page = openPage({
+            puter,
+            href: `${LAUNCH_URL.split('#')[0]}&puter.auth.token=STALE`,
+        });
+        await flush();
+        expect(page.replaced).toEqual([]);
+        await page.elements.loginButton.click!();
+        await flush();
+
+        expect(page.fetches).toEqual([]);
+        expect(urlToken(page.replaced[0])).toBe('S');
+    });
+
+    it('still signs in with a stored token on an older puter.js', async () => {
+        const page = openPage({ puter: { authToken: 'OLD' } });
+        page.location.href = STRIPPED_URL;
+        await flush();
+
+        expect(page.fetches[0][1]).toMatchObject({
+            headers: { 'X-Puter-Auth-Token': 'OLD' },
+        });
+        expect(page.replaced).toEqual([LAUNCH_URL]);
+    });
+
+    it('retries at the URL the tab opened at', async () => {
+        const page = openPage({ puter: { authToken: null } });
+        page.location.href = STRIPPED_URL;
+        page.elements.retryButton.click!();
+
+        expect(page.replaced).toEqual([LAUNCH_URL]);
+    });
+
+    it('retries with a reload when the URL has not changed', async () => {
+        const page = openPage({ puter: { authToken: null } });
+        page.elements.retryButton.click!();
+
+        expect(page.replaced).toEqual([]);
+        expect(page.location.reloads).toBe(1);
+    });
+});
+
 // ── Server-backed helpers (AuthService + DB) ─────────────────────────
 //
 // `resolveOwnedAppForHostedSite` queries the apps table directly;
@@ -706,7 +989,7 @@ describe('resolveOwnedAppForHostedSite', () => {
         expect(out).toBeNull();
     });
 
-    it('returns a public app when requirePrivate is not set', async () => {
+    it('returns a public app', async () => {
         const owner = await makeUser();
         const app = await createApp(
             owner.id,
@@ -720,23 +1003,6 @@ describe('resolveOwnedAppForHostedSite', () => {
             config: baseConfig(),
         });
         expect(out?.uid).toBe(app.uid);
-    });
-
-    it('filters out non-private apps when requirePrivate is set', async () => {
-        const owner = await makeUser();
-        await createApp(
-            owner.id,
-            'http://beans.site.puter.localhost/',
-            { isPrivate: false },
-        );
-        const out = await resolveOwnedAppForHostedSite({
-            req: reqOf('beans.site.puter.localhost'),
-            site: { user_id: owner.id },
-            appStore: server.stores.app,
-            config: baseConfig(),
-            requirePrivate: true,
-        });
-        expect(out).toBeNull();
     });
 
     it('prefers the private app over an older public bootstrap stub on an alternate host', async () => {
@@ -833,10 +1099,15 @@ describe('resolvePrivateIdentity', () => {
 
     it('returns the sticky private-cookie identity when the token matches the expected app/subdomain/host', async () => {
         const user = await makeUser();
+        const { session } = await authService.createSessionToken(
+            user as never,
+            {},
+        );
         const appUid = `app-${uuidv4()}`;
         const token = await authService.createHostedAssetToken('private', {
             appUid,
             userUid: user.uuid,
+            sessionUuid: (session as { uuid: string }).uuid,
             subdomain: 'beans',
             host: 'beans.app.puter.localhost',
         });
@@ -859,9 +1130,14 @@ describe('resolvePrivateIdentity', () => {
 
     it('falls through to req.actor when the private cookie is for a different app', async () => {
         const user = await makeUser();
+        const { session } = await authService.createSessionToken(
+            user as never,
+            {},
+        );
         const wrongToken = await authService.createHostedAssetToken('private', {
             appUid: `app-${uuidv4()}`,
             userUid: user.uuid,
+            sessionUuid: (session as { uuid: string }).uuid,
             subdomain: 'beans',
             host: 'beans.app.puter.localhost',
         });
@@ -1011,7 +1287,32 @@ describe('resolvePrivateIdentity', () => {
         expect(out.source).toBe('none');
     });
 
-    it('accepts a full-access token, which holds the account', async () => {
+    it('accepts a full-access token, which holds the account, bound to its own row', async () => {
+        const user = await makeUser();
+        const issuer = makeActor({ user: { uuid: user.uuid } });
+        const out = await resolvePrivateIdentity({
+            req: reqOf({
+                cookies: {},
+                actor: makeActor({
+                    user: { uuid: user.uuid },
+                    accessToken: {
+                        uid: `tok-${uuidv4()}`,
+                        issuer,
+                        fullAccess: true,
+                        sessionUid: 'token-row-1',
+                    },
+                }),
+            }),
+            authService,
+            sessionCookieName: 'puter_auth_token',
+            expectedAppUid: `app-target-${uuidv4()}`,
+        });
+        expect(out.source).toBe('session-cookie');
+        expect(out.userUid).toBe(user.uuid);
+        expect(out.sessionUuid).toBe('token-row-1');
+    });
+
+    it('ignores a full-access token that names no row of its own to bind a cookie to', async () => {
         const user = await makeUser();
         const issuer = makeActor({ user: { uuid: user.uuid } });
         const out = await resolvePrivateIdentity({
@@ -1030,8 +1331,61 @@ describe('resolvePrivateIdentity', () => {
             sessionCookieName: 'puter_auth_token',
             expectedAppUid: `app-target-${uuidv4()}`,
         });
-        expect(out.source).toBe('session-cookie');
-        expect(out.userUid).toBe(user.uuid);
+        expect(out.source).toBe('none');
+    });
+
+    describe('a cookie minted from a full-access token in the query', () => {
+        const mint = async () => {
+            const user = await makeUser();
+            const appUid = `app-${uuidv4()}`;
+            const expected = {
+                expectedAppUid: appUid,
+                expectedSubdomain: 'beans',
+                expectedPrivateHost: 'beans.app.puter.localhost',
+            };
+            const token = await authService.createAccessToken(
+                makeActor({ user: { id: user.id, uuid: user.uuid } }),
+                [[FULL_API_ACCESS]],
+            );
+            const viaQuery = await resolvePrivateIdentity({
+                req: reqOf({ query: { auth_token: token } }),
+                authService,
+                sessionCookieName: 'puter_auth_token',
+                ...expected,
+            });
+            expect(viaQuery.source).toBe('query');
+            const cookie = await authService.createHostedAssetToken('private', {
+                appUid,
+                userUid: viaQuery.userUid!,
+                sessionUuid: viaQuery.sessionUuid,
+                subdomain: 'beans',
+                host: 'beans.app.puter.localhost',
+            });
+            const withCookie = () =>
+                resolvePrivateIdentity({
+                    req: reqOf({
+                        cookies: {
+                            [HOSTED_ASSET_COOKIES.private.name]: cookie,
+                        },
+                    }),
+                    authService,
+                    sessionCookieName: 'puter_auth_token',
+                    ...expected,
+                });
+            return { user, token, viaQuery, withCookie };
+        };
+
+        it('is refused once the token is revoked', async () => {
+            const { user, token, viaQuery, withCookie } = await mint();
+            expect(viaQuery.sessionUuid).toBeTruthy();
+            expect((await withCookie()).source).toBe('private-cookie');
+
+            await authService.revokeAccessToken(
+                makeActor({ user: { id: user.id, uuid: user.uuid } }),
+                token,
+            );
+            expect((await withCookie()).source).toBe('none');
+        });
     });
 
     it("ignores a bootstrap query-token whose actor.app.uid doesn't match the target app", async () => {
@@ -1132,13 +1486,149 @@ describe('resolvePublicHostedIdentity', () => {
     const reqOf = (init: {
         cookies?: Record<string, string>;
         actor?: unknown;
+        headers?: Record<string, string>;
+        query?: Record<string, string>;
     }): Request =>
         ({
             cookies: init.cookies ?? {},
             actor: init.actor,
-            headers: {},
-            query: {},
+            headers: init.headers ?? {},
+            query: init.query ?? {},
         }) as unknown as Request;
+
+    describe('with the launch token in the Referer', () => {
+        const host = 'launch.site.puter.localhost';
+        const cookieName = HOSTED_ASSET_COOKIES.public.name;
+
+        const launch = async () => {
+            const user = await makeUser();
+            const sub = `launch-${uuidv4().slice(0, 8)}`;
+            const app = await server.stores.app.create(
+                { name: sub, title: sub, index_url: `http://${host}/` },
+                { ownerUserId: user.id },
+            );
+            const token = await authService.getUserAppToken(
+                { user } as unknown as Parameters<
+                    typeof authService.getUserAppToken
+                >[0],
+                app.uid,
+            );
+            const actor = (await authService.authenticateFromToken(token))!;
+            const cookie = await authService.createHostedAssetToken('public', {
+                appUid: app.uid,
+                userUid: user.uuid,
+                sessionUuid: actor.session?.uid,
+                subdomain: 'launch',
+                host,
+            });
+            return { user, appUid: app.uid, token, cookie, actor };
+        };
+
+        const resolve = (
+            appUid: string,
+            init: Parameters<typeof reqOf>[0],
+            expectedHost = host,
+        ) =>
+            resolvePublicHostedIdentity({
+                req: reqOf(init),
+                authService,
+                sessionCookieName: 'puter_auth_token',
+                expectedAppUid: appUid,
+                expectedSubdomain: 'launch',
+                expectedHost,
+            });
+
+        const refererFor = (token: string) =>
+            `http://${host}/?puter.auth.token=${encodeURIComponent(token)}`;
+
+        it('takes the cookie when the token names its user and session', async () => {
+            const { user, appUid, token, cookie } = await launch();
+            const authenticate = vi.spyOn(authService, 'authenticate');
+            try {
+                const out = await resolve(appUid, {
+                    cookies: { [cookieName]: cookie },
+                    headers: { referer: refererFor(token) },
+                });
+                expect(out).toMatchObject({
+                    source: 'public-cookie',
+                    userUid: user.uuid,
+                    hasValidPublicCookie: true,
+                });
+                expect(authenticate).not.toHaveBeenCalled();
+            } finally {
+                authenticate.mockRestore();
+            }
+        });
+
+        it('authenticates a query token even when it names the cookie identity', async () => {
+            const { user, appUid, token, cookie } = await launch();
+            const out = await resolve(appUid, {
+                cookies: { [cookieName]: cookie },
+                query: { 'puter.auth.token': token },
+            });
+            expect(out.source).toBe('query');
+            expect(out.userUid).toBe(user.uuid);
+            expect(
+                (out as { hasValidPublicCookie?: boolean })
+                    .hasValidPublicCookie,
+            ).toBeUndefined();
+        });
+
+        it('authenticates the token when the cookie was minted for another host', async () => {
+            const { user, appUid, token, cookie } = await launch();
+            const out = await resolve(
+                appUid,
+                {
+                    cookies: { [cookieName]: cookie },
+                    headers: { referer: refererFor(token) },
+                },
+                'other.site.puter.localhost',
+            );
+            expect(out.source).toBe('referrer');
+            expect(out.userUid).toBe(user.uuid);
+        });
+
+        it('authenticates a token that names another app under the same session', async () => {
+            const { user, appUid, cookie, actor } = await launch();
+            const otherAppToken = server.services.token.sign('auth', {
+                type: 'app-under-user',
+                version: '2',
+                user_uid: user.uuid,
+                app_uid: `app-${uuidv4()}`,
+                session_uid: actor.session!.uid,
+            });
+            const authenticate = vi.spyOn(authService, 'authenticate');
+            try {
+                const out = await resolve(appUid, {
+                    cookies: { [cookieName]: cookie },
+                    headers: { referer: refererFor(otherAppToken) },
+                });
+                expect(authenticate).toHaveBeenCalledTimes(1);
+                expect(out.source).toBe('public-cookie');
+            } finally {
+                authenticate.mockRestore();
+            }
+        });
+
+        it('never resolves a scoped access token, with or without the cookie', async () => {
+            const { user, appUid, cookie } = await launch();
+            const scoped = await authService.createAccessToken(
+                makeActor({
+                    user: { id: user.id, uuid: user.uuid, username: user.username },
+                }),
+                [[`user:${user.uuid}:email:read`]],
+            );
+            const withCookie = await resolve(appUid, {
+                cookies: { [cookieName]: cookie },
+                headers: { referer: refererFor(scoped) },
+            });
+            expect(withCookie.source).toBe('public-cookie');
+            const withoutCookie = await resolve(appUid, {
+                headers: { referer: refererFor(scoped) },
+            });
+            expect(withoutCookie.source).toBe('none');
+        });
+    });
 
     it('returns the cookie identity when present and valid', async () => {
         const user = await makeUser();

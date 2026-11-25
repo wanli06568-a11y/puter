@@ -8,13 +8,15 @@ import { isFramedDocument } from './lib/appModeGate.js';
 import {
     isGodmodeTokenPayload,
     isUserSessionTokenPayload,
+    keepLaunchItem,
     requestLaunchFromOpener,
-    urlWithoutQueryParam,
+    takeKeptLaunchItem,
+    tokenTag,
+    urlWithoutQueryParams,
 } from './lib/launchToken.js';
 import path from 'path-browserify';
 import localStorageMemory from './lib/polyfills/localStorage.js';
 import xhrshim from './lib/polyfills/xhrshim.js';
-import * as utils from './lib/utils.js';
 import { AI } from './modules/ai/index.js';
 import { Apps } from './modules/apps/index.js';
 import Auth from './modules/Auth.js';
@@ -27,7 +29,7 @@ import FSItem from './modules/FSItem.js';
 import { Hosting } from './modules/hosting/index.js';
 import { KV } from './modules/kv/index.js';
 import { netAPI } from './modules/networking/index.js';
-import { Notifications } from './modules/notifications/index.js';
+import { CLICK_PARAM, Notifications } from './modules/notifications/index.js';
 import { OS } from './modules/os/index.js';
 import { Perms } from './modules/perms/index.js';
 import PuterDialog from './modules/PuterDialog.js';
@@ -104,6 +106,59 @@ class Lock {
 //       generalize this behavior rather than hard-coding it.
 //       (using defaultGUIOrigin breaks locally-hosted apps)
 const PROD_ORIGIN = 'https://puter.com';
+
+// The desktops Puter itself serves. An app learns which one launched it from
+// the URL (`puter.origin`), and only one of these is believed: the GUI origin
+// is what every message from the desktop is checked against, so taking an
+// arbitrary one would let any page that frames an app drive it.
+const FIRST_PARTY_GUI_ORIGINS = new Set([
+    'https://puter.com',
+    'https://desktop.puter.com',
+]);
+
+/** `value`'s origin when it is a first-party desktop, otherwise null. */
+const firstPartyGUIOrigin = (value) => {
+    try {
+        const { origin } = new URL(value);
+        return FIRST_PARTY_GUI_ORIGINS.has(origin) ? origin : null;
+    } catch {
+        return null;
+    }
+};
+
+/**
+ * The `puter.args` launch parameter as an object. `URLSearchParams` has
+ * already decoded it once; a value that isn't JSON yet is tried once more
+ * decoded, for launchers that encoded it twice. Unparseable args read as `{}`.
+ * @param {string | null} raw
+ * @returns {unknown}
+ */
+const parseLaunchArgs = (raw) => {
+    if (raw === null) return {};
+    for (const decode of [(v) => v, decodeURIComponent]) {
+        try {
+            return JSON.parse(decode(raw));
+        } catch {
+            // try the next decoding
+        }
+    }
+    return {};
+};
+
+/**
+ * The `puter.api_origin` launch parameter, decoded once more when it doesn't
+ * start with a scheme: a launcher may have encoded it twice.
+ * @param {string} raw
+ * @returns {string}
+ */
+const parseLaunchOrigin = (raw) => {
+    if (/^https?:\/\//i.test(raw)) return raw;
+    try {
+        return decodeURIComponent(raw);
+    } catch {
+        return raw;
+    }
+};
 
 // localStorage key for the auth token. The retired key below is never read —
 // only deleted, so a token from before the format change doesn't linger in a
@@ -214,6 +269,9 @@ export class Puter {
 
     #defaultAPIOrigin = 'https://api.puter.com';
     #defaultGUIOrigin = 'https://puter.com';
+    // In app mode, the first-party desktop that launched this app, when it
+    // isn't the build's default one.
+    #launchGUIOrigin = null;
 
     /** @returns {string} */
     get defaultAPIOrigin() {
@@ -231,6 +289,7 @@ export class Puter {
     get defaultGUIOrigin() {
         return (
             globalThis.PUTER_ORIGIN ||
+            this.#launchGUIOrigin ||
             globalThis.PUTER_ORIGIN_ENV ||
             this.#defaultGUIOrigin
         );
@@ -278,6 +337,23 @@ export class Puter {
      */
     openerLaunchItem_ = null;
 
+    /**
+     * Fingerprint of the token this tab's launch came with, if any.
+     *
+     * @internal
+     * @type {string | null}
+     */
+    openerLaunchTokenTag_ = null;
+
+    /**
+     * Whether this is a tab the GUI opened for an app and handed a session
+     * token, which it then keeps in sessionStorage the way a framed app does.
+     *
+     * @internal
+     * @type {boolean}
+     */
+    appTabSession_ = false;
+
     // Holds the unique app instance ID that is provided by the host environment
     appInstanceID;
 
@@ -316,6 +392,14 @@ export class Puter {
      * delivery and never wants it parked in a delivery-room socket.
      */
     socketEnabled = globalThis.puter_socket_enabled !== false;
+
+    /**
+     * @internal
+     * Whether this client reports an app open (`/rao`) when it authenticates.
+     * Seeded off `puter_report_app_open`, which the worker runtimes set to
+     * `false`: code running as the account isn't a visit.
+     */
+    reportsAppOpen = globalThis.puter_report_app_open !== false;
 
     /**
      * Puter.js Modules
@@ -568,42 +652,30 @@ export class Puter {
         }
 
         // Get the 'args' from the URL. This is used to pass arguments to the app.
-        if (URLParams.has('puter.args')) {
-            this.args = JSON.parse(
-                decodeURIComponent(URLParams.get('puter.args')),
-            );
-        } else {
-            this.args = {};
-        }
+        this.args = parseLaunchArgs(URLParams.get('puter.args'));
 
         // Try to extract appInstanceID from the URL. appInstanceID is included in every messaage
         // sent to the host environment. This is used to help host environment identify the app
         // instance that sent the message and communicate back to it.
         if (URLParams.has('puter.app_instance_id')) {
-            this.appInstanceID = decodeURIComponent(
-                URLParams.get('puter.app_instance_id'),
-            );
+            this.appInstanceID = URLParams.get('puter.app_instance_id');
         }
 
         // Try to extract parentInstanceID from the URL. If another app launched this app instance, parentInstanceID
         // holds its instance ID, and is used to communicate with that parent app.
         if (URLParams.has('puter.parent_instance_id')) {
-            this.parentInstanceID = decodeURIComponent(
-                URLParams.get('puter.parent_instance_id'),
-            );
+            this.parentInstanceID = URLParams.get('puter.parent_instance_id');
         }
 
         // Try to extract `puter.app.id` from the URL. `puter.app.id` is the unique ID of the app.
         // App ID is useful for identifying the app when communicating with the Puter API, among other things.
         if (URLParams.has('puter.app.id')) {
-            this.appID = decodeURIComponent(URLParams.get('puter.app.id'));
+            this.appID = URLParams.get('puter.app.id');
         }
 
         // Extract app name (added later)
         if (URLParams.has('puter.app.name')) {
-            this.appName = decodeURIComponent(
-                URLParams.get('puter.app.name'),
-            );
+            this.appName = URLParams.get('puter.app.name');
         }
 
         // Construct this App's AppData path based on the appID. AppData path is used to store files that are specific to this app.
@@ -619,11 +691,20 @@ export class Puter {
         // This should only be done when the SDK is running in 'app' mode.
         this.APIOrigin = this.defaultAPIOrigin;
         if (URLParams.has('puter.api_origin') && this.env === 'app') {
-            this.APIOrigin = decodeURIComponent(
+            this.APIOrigin = parseLaunchOrigin(
                 URLParams.get('puter.api_origin'),
             );
         } else if (URLParams.has('puter.domain') && this.env === 'app') {
             this.APIOrigin = `https://api.${URLParams.get('puter.domain')}`;
+        }
+
+        // An app launched by a first-party desktop other than puter.com
+        // (e.g. desktop.puter.com) talks to that desktop: its messages come
+        // from there, and replies meant only for it go there.
+        if (this.env === 'app') {
+            this.#launchGUIOrigin = firstPartyGUIOrigin(
+                URLParams.get('puter.origin'),
+            );
         }
 
         // === START :: Logger ===
@@ -648,6 +729,10 @@ export class Puter {
         // The in-flight boot `/whoami`, awaited by anything that wants the
         // cached user without issuing its own request.
         this.whoamiCache_ = null;
+        /** @internal The boot `/whoami` while in flight, for `getUser()` to join. */
+        this.whoamiInFlight_ = null;
+        /** @internal The token and API origin `whoami` was read with. */
+        this.whoamiFor_ = null;
 
         // A user session token must never be adopted from storage, and an
         // earlier boot may have left one behind.
@@ -673,7 +758,9 @@ export class Puter {
                 URLParams.get(urlTokenParam),
             );
             if (bootstrapAuthToken) {
-                this.stripLaunchTokenFromUrl_(urlTokenParam);
+                this.stripParamsFromUrlAfterLoad_(
+                    (name) => name === urlTokenParam,
+                );
             }
             try {
                 let selectedAuthToken = bootstrapAuthToken;
@@ -750,6 +837,9 @@ export class Puter {
         // the SDK needs to show a dialog to the user to ask for permission to access their Puter account.
         else if (this.env === 'web') {
             try {
+                // A godmode app reloading in the tab the GUI opened it in;
+                // only that handoff stores a session token on this origin.
+                const godmodeToken = this.readStoredSessionToken_();
                 const storedToken = this.normalizeAuthTokenCandidate(
                     localStorage.getItem(STORAGE_KEY_V2),
                 );
@@ -762,7 +852,10 @@ export class Puter {
                 const boundOrigin = this.normalizeStringCandidate(
                     localStorage.getItem(STORAGE_KEY_ORIGIN_V2),
                 );
-                if (
+                if (godmodeToken) {
+                    this.appTabSession_ = true;
+                    this.setAuthToken(godmodeToken);
+                } else if (
                     storedToken &&
                     this._storedTokenUsableForCurrentOrigin(boundOrigin)
                 ) {
@@ -791,6 +884,32 @@ export class Puter {
                     appInstanceID: this.appInstanceID,
                 })
                 : null;
+            // The launch params only describe the launch, so they're cleared
+            // from the tab's address bar. A framed app keeps them: its URL
+            // isn't shown, and reloading the frame needs them.
+            if (this.appInstanceID) {
+                const launchParams = new Set(
+                    [...URLParams.keys()].filter(
+                        (name) =>
+                            name.startsWith('puter.') && name !== CLICK_PARAM,
+                    ),
+                );
+                this.stripParamsFromUrlAfterLoad_((name) =>
+                    launchParams.has(name),
+                );
+            }
+            if (this.appInstanceID && !openerLaunch) {
+                // A page this tab loaded earlier for the same launch, such as
+                // a private app's sign-in page, may have kept its item.
+                const keptItem = takeKeptLaunchItem({
+                    appInstanceID: this.appInstanceID,
+                    token: this.authToken,
+                });
+                if (keptItem) {
+                    this.openerLaunchItem_ = new URLSearchParams(keptItem);
+                    this.openerLaunchTokenTag_ = tokenTag(this.authToken);
+                }
+            }
             if (openerLaunch) {
                 this.openerLaunch_ = openerLaunch.then((launch) => {
                     this.openerLaunch_ = null;
@@ -799,7 +918,16 @@ export class Puter {
                             launch.item,
                         );
                     }
-                    if (launch?.token) this.setAuthToken(launch.token);
+                    if (launch?.token) {
+                        this.openerLaunchTokenTag_ = tokenTag(launch.token);
+                        this.appTabSession_ = this.isUserSessionToken_(
+                            launch.token,
+                        );
+                        this.setAuthToken(launch.token);
+                        // A godmode token doesn't name the app, and a reload
+                        // won't have the app id in the URL any more.
+                        if (this.appID) this.setAppID(this.appID);
+                    }
                 });
             }
 
@@ -864,7 +992,12 @@ export class Puter {
         // when running as a Puter app (i.e. within an iframe in the GUI).
         // Same call opted out of by `socketEnabled: false` — that flag means
         // this client is a disposable per-invocation one, not a real visit.
-        if (this.env === 'gui' || this.env === 'app' || !this.socketEnabled) {
+        if (
+            this.env === 'gui' ||
+            this.env === 'app' ||
+            !this.socketEnabled ||
+            !this.reportsAppOpen
+        ) {
             return;
         }
 
@@ -920,26 +1053,62 @@ export class Puter {
         // use for a cached user and shouldn't pay for the request.
         if (!this.authToken || !this.socketEnabled) return null;
         const issuedUnder = this.authToken;
+        // `user` settles with the user, or null at the first failed attempt.
+        let settle;
+        const inFlight = {
+            token: issuedUnder,
+            origin: this.APIOrigin,
+            user: new Promise((resolve) => {
+                settle = resolve;
+            }),
+            refusal: null,
+        };
+        this.whoamiInFlight_ = inFlight;
         try {
             const resp = await fetchUrl(`${this.APIOrigin}/whoami`, {
                 authToken: this.authToken,
                 interactiveReauth: false,
+                onRetry: () => settle(null),
                 logContext: {
                     service: 'auth',
                     operation: 'whoami',
                     params: {},
                 },
             });
-            if (!resp.ok) return null;
+            if (!resp.ok) {
+                inFlight.refusal = await resp.json().catch(() => null);
+                return null;
+            }
             const body = await resp.json();
             // The answer belongs to the token that asked for it.
-            if (this.authToken !== issuedUnder) return null;
-            this.whoami = body;
+            if (!this.rememberWhoami_(body, issuedUnder, inFlight.origin))
+                return null;
+            settle(body);
             return this.whoami;
         } catch (e) {
             // Best-effort cache — a network failure leaves it unset.
             return null;
+        } finally {
+            settle(null);
+            if (this.whoamiInFlight_ === inFlight) this.whoamiInFlight_ = null;
         }
+    }
+
+    /**
+     * Keeps `user` as `whoami` if it was read with the current token and API
+     * origin.
+     *
+     * @internal
+     * @param {import('./modules/Auth.js').User} user
+     * @param {string} token
+     * @param {string} origin
+     * @returns {boolean} Whether it was kept.
+     */
+    rememberWhoami_(user, token, origin) {
+        if (token !== this.authToken || origin !== this.APIOrigin) return false;
+        this.whoami = user;
+        this.whoamiFor_ = { token, origin };
+        return true;
     }
 
     /**
@@ -1021,10 +1190,10 @@ export class Puter {
 
         // If the SDK is running on a 3rd-party site or an app, then save the authToken in localStorage.
         // A user session token (a godmode app's launch token) never goes there:
-        // an app keeps it in sessionStorage so a frame reload still has it.
+        // an app keeps it in sessionStorage so a reload still has it.
         if (this.env === 'web' || this.env === 'app') {
             this.storeSessionToken_(
-                this.env === 'app' &&
+                (this.env === 'app' || this.appTabSession_) &&
                     this.isUserSessionToken_(normalizedAuthToken)
                     ? normalizedAuthToken
                     : null,
@@ -1065,6 +1234,18 @@ export class Puter {
 
         // rao
         this.request_rao_();
+
+        // The desktop hands back the token it holds after every user
+        // refresh, right after reading the user with it.
+        const readWith = (f) =>
+            f?.token === normalizedAuthToken && f?.origin === this.APIOrigin;
+        if (this.env === 'gui') {
+            if (readWith(this.whoamiInFlight_)) return;
+            if (this.whoami && readWith(this.whoamiFor_)) {
+                this.whoamiCache_ = Promise.resolve(this.whoami);
+                return;
+            }
+        }
 
         // perform whoami and cache results
         this.whoamiCache_ = this.cacheWhoami_();
@@ -1164,7 +1345,9 @@ export class Puter {
     /** Nothing read as one identity may answer for the next. */
     _dropIdentityCaches = function () {
         this.whoami = undefined;
+        this.whoamiFor_ = null;
         this.whoamiCache_ = null;
+        this.whoamiInFlight_ = null;
         try {
             this._cache.flushall();
         } catch (e) {
@@ -1483,18 +1666,19 @@ export class Puter {
 
     /**
      * @internal
-     * Remove the launch token from the address bar after the page loads, so it
-     * stops going out in Referer headers and in anything that records the page
-     * URL. Waiting for `load` keeps it readable to the app's own boot code.
+     * Remove launch params from the page URL after the page loads, so they
+     * stop showing in the address bar, going out in Referer headers, and
+     * landing in anything that records the page URL. Waiting for `load` keeps
+     * them readable to the app's own boot code.
      *
-     * @param {string} param
+     * @param {(name: string) => boolean} shouldRemove
      */
-    stripLaunchTokenFromUrl_ = function (param) {
+    stripParamsFromUrlAfterLoad_ = function (shouldRemove) {
         const strip = () => {
             try {
-                const cleaned = urlWithoutQueryParam(
+                const cleaned = urlWithoutQueryParams(
                     globalThis.location.href,
-                    param,
+                    shouldRemove,
                 );
                 if (cleaned) {
                     globalThis.history.replaceState(
@@ -1513,6 +1697,32 @@ export class Puter {
             stripSoon();
         } else {
             globalThis.addEventListener?.('load', stripSoon, { once: true });
+        }
+    };
+
+    /**
+     * @internal
+     * For a page that sends this tab on to another page of the same launch
+     * (a private app's sign-in page): waits for the launch the GUI hands the
+     * tab, then keeps its opened item for the next page when that page signs
+     * in with `token` and it's the token the launch came with.
+     *
+     * @param {string} [token]
+     * @returns {Promise<void>}
+     */
+    keepTabLaunchForNextPage_ = async function (token) {
+        await this.openerLaunch_;
+        if (
+            token &&
+            tokenTag(token) === this.openerLaunchTokenTag_ &&
+            this.appInstanceID &&
+            this.openerLaunchItem_
+        ) {
+            keepLaunchItem({
+                appInstanceID: this.appInstanceID,
+                item: Object.fromEntries(this.openerLaunchItem_),
+                token,
+            });
         }
     };
 
@@ -1710,24 +1920,7 @@ export class Puter {
             };
         }
 
-        return new Promise((resolve, reject) => {
-            const xhr = utils.initXhr(
-                '/whoami',
-                this.APIOrigin,
-                this.authToken,
-                'get',
-            );
-            // set up event handlers for load and error events
-            utils.setupXhrEventHandlers(
-                xhr,
-                options.success,
-                options.error,
-                resolve,
-                reject,
-            );
-
-            xhr.send();
-        });
+        return this.auth.requestUser_(options);
     };
 
     print = function (...args) {

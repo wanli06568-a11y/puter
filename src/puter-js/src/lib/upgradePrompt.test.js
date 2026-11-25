@@ -179,6 +179,108 @@ describe('promptIfUpgradeRequired', () => {
         });
     });
 
+    describe('on a first-party page that can frame the upgrade', () => {
+        beforeEach(() => {
+            globalThis.puter = {
+                env: 'web',
+                ui: { requestUpgrade: vi.fn(), canShowUpgradeFrame_: () => true },
+            };
+        });
+
+        it('has the dialog ask for the framed upgrade instead of opening a tab', () => {
+            promptIfUpgradeRequired({ code: 'insufficient_funds', status: 402 }, { method: 'puter.ai.chat' });
+            expect(globalThis.puter.ui.requestUpgrade).not.toHaveBeenCalled();
+            const [message, options] = showUsageLimitDialog.mock.calls[0];
+            expect(message).toBe('Your account does not have enough funding to complete this request.');
+            expect(options).toMatchObject({ title: 'Low Balance', method: 'puter.ai.chat', reason: 'funds' });
+
+            expect(options.onUpgrade()).toBe(true);
+            expect(globalThis.puter.ui.requestUpgrade).toHaveBeenCalledWith({
+                reason: 'funds',
+                method: 'puter.ai.chat',
+                message: 'Your account does not have enough funding to complete this request.',
+            });
+        });
+
+        it('leaves the tab to the dialog when the page can no longer frame it by the click', () => {
+            promptIfUpgradeRequired({ code: 'insufficient_funds', status: 402 }, { method: 'puter.ai.chat' });
+            globalThis.puter.ui.canShowUpgradeFrame_ = () => false;
+            expect(showUsageLimitDialog.mock.calls[0][1].onUpgrade()).toBe(false);
+            expect(globalThis.puter.ui.requestUpgrade).not.toHaveBeenCalled();
+        });
+
+        it('shows no dialog over an upgrade the page already shows', () => {
+            globalThis.puter.ui.upgradeFrameShowing_ = () => true;
+            promptIfUpgradeRequired({ code: 'insufficient_funds', status: 402 }, { method: 'puter.ai.chat' });
+            promptIfUpgradeRequired({ code: 'storage_limit_reached' }, { method: 'puter.fs.upload' });
+            expect(showUsageLimitDialog).not.toHaveBeenCalled();
+            expect(globalThis.puter.ui.requestUpgrade).not.toHaveBeenCalled();
+        });
+
+        it('shows no dialog over a top-up the page already shows', () => {
+            globalThis.puter.ui.topUpShowing_ = () => true;
+            promptIfUpgradeRequired({ code: 'insufficient_funds', status: 402 }, { method: 'puter.ai.chat' });
+            promptIfUpgradeRequired({ code: 'storage_limit_reached' }, { method: 'puter.fs.upload' });
+            expect(showUsageLimitDialog).not.toHaveBeenCalled();
+            expect(globalThis.puter.ui.requestUpgrade).not.toHaveBeenCalled();
+        });
+
+        it('keeps the tab when the page cannot frame it', () => {
+            globalThis.puter.ui.canShowUpgradeFrame_ = () => false;
+            promptIfUpgradeRequired({ code: 'storage_limit_reached' }, { method: 'puter.fs.upload' });
+            expect(showUsageLimitDialog.mock.calls[0][1]).not.toHaveProperty('onUpgrade');
+        });
+
+        it('keeps the tab for a storage refusal outside a website', () => {
+            globalThis.puter.env = 'gui';
+            promptIfUpgradeRequired({ code: 'storage_limit_reached' }, { method: 'puter.fs.upload' });
+            expect(showUsageLimitDialog.mock.calls[0][1]).not.toHaveProperty('onUpgrade');
+        });
+    });
+
+    describe('on a website, for an account with a plan', () => {
+        const funds = { code: 'insufficient_funds', status: 402 };
+        const web = (whoami, ui = {}) => {
+            globalThis.puter = {
+                env: 'web',
+                whoami,
+                ui: { requestUpgrade: vi.fn(), showTopUp_: vi.fn(async () => ({ toppedUp: false })), ...ui },
+            };
+        };
+
+        it('has the dialog offer the top-up when credit ran out', () => {
+            web({ subscribed: true });
+            promptIfUpgradeRequired(funds, { method: 'puter.ai.chat' });
+            const [, options] = showUsageLimitDialog.mock.calls[0];
+            expect(globalThis.puter.ui.showTopUp_).not.toHaveBeenCalled();
+            options.onTopUp();
+            expect(globalThis.puter.ui.showTopUp_).toHaveBeenCalledTimes(1);
+        });
+
+        it.each([
+            ['an account without a plan', { subscribed: false }],
+            ['a seat whose team pays for it', { subscribed: true, team: { uid: 'team-1' } }],
+            ['an account not read yet', undefined],
+        ])('offers only the upgrade to %s', (_label, whoami) => {
+            web(whoami);
+            promptIfUpgradeRequired(funds, { method: 'puter.ai.chat' });
+            expect(showUsageLimitDialog.mock.calls[0][1]).not.toHaveProperty('onTopUp');
+        });
+
+        it('offers only the upgrade for a refusal credit would not clear', () => {
+            web({ subscribed: true });
+            promptIfUpgradeRequired({ code: 'storage_limit_reached' }, { method: 'puter.fs.upload' });
+            promptIfUpgradeRequired({ code: 'subscription_required' }, { method: 'puter.hosting.create' });
+            for ( const [, options] of showUsageLimitDialog.mock.calls ) expect(options).not.toHaveProperty('onTopUp');
+        });
+
+        it('offers only the upgrade where the SDK has no top-up to show', () => {
+            web({ subscribed: true }, { showTopUp_: undefined });
+            promptIfUpgradeRequired(funds, { method: 'puter.ai.chat' });
+            expect(showUsageLimitDialog.mock.calls[0][1]).not.toHaveProperty('onTopUp');
+        });
+    });
+
     it('does nothing for a rejection an upgrade would not clear', () => {
         promptIfUpgradeRequired({ status: 403 });
         promptIfUpgradeRequired(new Error('offline'));

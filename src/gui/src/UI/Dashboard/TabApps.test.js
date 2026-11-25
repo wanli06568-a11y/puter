@@ -23,7 +23,6 @@ import jQuery from '../../lib/jquery-3.6.1/jquery-3.6.1.min.js';
 
 // The tab's window and dialog plumbing isn't what these tests exercise.
 vi.mock('../UIWindow.js', () => ({ begin_dashboard_tile_launch: vi.fn(), settle_dashboard_tile_launch: vi.fn() }));
-vi.mock('../UIAlert.js', () => ({ default: vi.fn() }));
 vi.mock('../UIContextMenu.js', () => ({ default: vi.fn() }));
 vi.mock('../../helpers/launchApp.js', () => ({ default: vi.fn() }));
 
@@ -68,7 +67,7 @@ describe('TabApps.beginDeepLinkLaunch', () => {
 });
 
 describe('TabApps cancelling a drag out of a folder', () => {
-    it('puts the folder and the order back as they were', () => {
+    it('puts the folder and the order back as they were', async () => {
         document.body.innerHTML = '<div class="window"><div class="dashboard-section-apps active"><div class="myapps-container"><div class="myapps-page"><div class="myapps-tile" data-app-name="a"></div></div></div></div></div>';
         window.puter = { kv: { set: vi.fn(async () => {}), get: vi.fn(async () => null) } };
         TabApps._groupsLoaded = true;
@@ -91,7 +90,9 @@ describe('TabApps cancelling a drag out of a folder', () => {
         TabApps._endDrag(false);
 
         expect(TabApps._groups).toEqual([{ id: 'g1', name: 'Work', apps: ['a', 'b'] }]);
-        expect(JSON.parse(window.puter.kv.set.mock.calls.at(-2)[1])).toEqual([{ id: 'g1', name: 'Work', apps: ['a', 'b'] }]);
+        // The restore is written once the eject's own write lands.
+        const lastSaved = key => JSON.parse(window.puter.kv.set.mock.calls.filter(([k]) => k === key).at(-1)[1]);
+        await vi.waitFor(() => expect(lastSaved('dashboard_app_groups')).toEqual([{ id: 'g1', name: 'Work', apps: ['a', 'b'] }]));
         vi.restoreAllMocks();
     });
 });

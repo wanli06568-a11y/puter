@@ -20,11 +20,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Actor } from '../../core/actor';
 import { checkRateLimit } from '../../core/http/middleware/rateLimit.js';
-import {
-    runWithConcurrencyLimitSettled,
-    settleWithin,
-} from '../../util/concurrency.js';
-import { FINAL_FLUSH_TIMEOUT_MS } from '../../util/gracefulShutdown.js';
+import { runWithConcurrencyLimitSettled } from '../../util/concurrency.js';
+import { finalFlush } from '../../util/gracefulShutdown.js';
 import { PuterService } from '../types';
 import {
     digestItemPaths,
@@ -46,7 +43,12 @@ import {
     sharedViewLink,
 } from './shareDeepLink';
 import { NOTIFY_FANOUT_CAP } from '../../core/teams.js';
-import { abuseKey, cleanEmail, isBlockedEmail } from '../../util/email.js';
+import {
+    abuseKey,
+    cleanEmail,
+    isBlockedEmail,
+    mayEmailNotify,
+} from '../../util/email.js';
 import { blocksAllShares } from './shareBlocks.js';
 import type { ResolvedShare } from './ShareService';
 import { withRedisLock } from '../../util/redisLock.js';
@@ -133,6 +135,10 @@ type Budget = [key: string, limit: number, windowMs: number];
 const skipped = (reason: string, detail: Record<string, unknown>): void => {
     console.log('[share-notify] not emailing:', reason, detail);
 };
+
+/** `kv.list` answers with a paged envelope or a bare array: its items. */
+const listedItems = (res: unknown): unknown[] =>
+    Array.isArray(res) ? res : ((res as { items?: unknown[] })?.items ?? []);
 
 /** Where a single-item notification points; a masked path, opened in place. */
 interface ShareNotificationTarget {
@@ -221,8 +227,7 @@ export class ShareNotificationService extends PuterService {
         for (const [, timer] of this.#digestTimers) clearTimeout(timer);
         this.#digestTimers.clear();
         const active = [...this.#digestFlushes.values()];
-        const deadline = Date.now() + FINAL_FLUSH_TIMEOUT_MS;
-        const drain = async () => {
+        await finalFlush('share-notify', async (deadline) => {
             try {
                 await Promise.allSettled(active);
                 if (Date.now() >= deadline) return;
@@ -240,10 +245,7 @@ export class ShareNotificationService extends PuterService {
                     err,
                 );
             }
-        };
-        if (!(await settleWithin(drain(), FINAL_FLUSH_TIMEOUT_MS))) {
-            console.warn('[share-notify] final flush timed out');
-        }
+        });
     }
 
     /** The recovery sweep, for tests that can't wait out an interval. */
@@ -263,11 +265,10 @@ export class ShareNotificationService extends PuterService {
                 pattern: 'share:digest:',
                 limit: DIGEST_LIST_LIMIT,
             });
-            const listed = (
-                Array.isArray(res)
-                    ? res
-                    : ((res as { items?: unknown[] })?.items ?? [])
-            ) as Array<{ key: string; value: unknown }>;
+            const listed = listedItems(res) as Array<{
+                key: string;
+                value: unknown;
+            }>;
             if (listed.length === 0) return;
             if (listed.length >= DIGEST_LIST_LIMIT) {
                 console.log('[share-notify] sweep listing hit its cap:', {
@@ -900,10 +901,7 @@ export class ShareNotificationService extends PuterService {
                 pattern: `share:digest:${key}:`,
                 limit: 1,
             });
-            const listed = Array.isArray(res)
-                ? res
-                : ((res as { items?: unknown[] })?.items ?? []);
-            return listed.length > 0;
+            return listedItems(res).length > 0;
         } catch {
             // Fail closed: a broken read must not become unlimited joins.
             return false;
@@ -958,11 +956,7 @@ export class ShareNotificationService extends PuterService {
                 pattern: prefix,
                 limit: DIGEST_LIST_LIMIT,
             });
-            // `list` answers with a paged envelope; unwrap defensively.
-            const listed = Array.isArray(res)
-                ? res
-                : ((res as { items?: unknown[] })?.items ?? []);
-            const keys = listed.filter(
+            const keys = listedItems(res).filter(
                 (entry): entry is string => typeof entry === 'string',
             );
             if (keys.length >= DIGEST_LIST_LIMIT) {
@@ -1034,6 +1028,18 @@ export class ShareNotificationService extends PuterService {
                     ? (matches.values().next().value ?? null)
                     : null;
             const [{ record: first }] = claimed;
+            const template =
+                first.kind === 'holder'
+                    ? 'file_shared_with_you'
+                    : 'file_shared_invite';
+            // Asked at send: an entry may have waited out a window or a retry.
+            const asked = await mayEmailNotify(this.clients.event, template, [
+                first.to,
+            ]);
+            if (!asked.has(first.to)) {
+                skipped('a listener declined the address', { key });
+                return;
+            }
             console.log('[share-notify] sending digest:', {
                 key,
                 kind: first.kind,
@@ -1065,6 +1071,7 @@ export class ShareNotificationService extends PuterService {
                             origin: this.#appLink(),
                             unsubscribe_uuid: first.recipientUuid ?? null,
                         },
+                        { stream: 'notify' },
                     );
                 } else {
                     await this.clients.email.send(
@@ -1078,6 +1085,7 @@ export class ShareNotificationService extends PuterService {
                             shares: digestLines(entries),
                             link: this.#appLink(),
                         },
+                        { stream: 'notify' },
                     );
                 }
                 console.log('[share-notify] digest sent:', {
@@ -1142,12 +1150,26 @@ export class ShareNotificationService extends PuterService {
         if (byEmail.size === 0) return;
 
         const issuer = actor.user?.username;
-        for (const [to, { count, items }] of byEmail) {
+        const unblocked = [...byEmail.keys()].filter((to) => {
+            const blocked = isBlockedEmail(to, this.config.blockedEmailDomains);
+            if (blocked) {
+                skipped('invite address is on a blocked domain', { to });
+            }
+            return !blocked;
+        });
+        // One ask for every address, before any of them claims budget.
+        const allowed = await mayEmailNotify(
+            this.clients.event,
+            'file_shared_invite',
+            unblocked,
+        );
+        for (const to of unblocked) {
+            const { count, items } = byEmail.get(to)!;
             // Each address fails alone — one refused send must not cost the
             // next invitee their only channel.
             try {
-                if (isBlockedEmail(to, this.config.blockedEmailDomains)) {
-                    skipped('invite address is on a blocked domain', { to });
+                if (!allowed.has(to)) {
+                    skipped('a listener declined the invite address', { to });
                     continue;
                 }
                 const mayOpen = await this.#claimInviteEmail(issuerId, to);

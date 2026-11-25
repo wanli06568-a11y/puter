@@ -30,12 +30,12 @@ import {
     acquireConcurrent,
     checkRateLimit,
 } from '../../core/http/middleware/rateLimit.js';
-import { SPEECH_TO_TEXT_COSTS } from '../../drivers/ai-speech2txt/costs.js';
 import {
     type AiMeteringService,
     withAiCostFactor,
-} from '../../drivers/util/aiCostFactor.js';
-import { readProviderKey } from '../../drivers/util/providerRegistry.js';
+} from '../../util/aiCostFactor.js';
+import { OPENAI_GPT_TRANSCRIBE_UCENTS_PER_SECOND } from '../../util/aiPrices.js';
+import { readProviderKey } from '../../util/aiProviderKey.js';
 import { runWithConcurrencyLimit } from '../../util/concurrency.js';
 import { BoundedTtlMap } from '../../util/boundedTtlMap.js';
 import { kv } from '../../util/kvSingleton.js';
@@ -121,7 +121,7 @@ const TRANSCRIPTION_TOKEN_PRICES: Record<
 /** Micro-cents per second for input transcription billed by duration. */
 const TRANSCRIPTION_SECOND_PRICES: Record<string, number> = {
     'whisper-1': 10_000,
-    'gpt-transcribe': SPEECH_TO_TEXT_COSTS['openai:gpt-transcribe:second'],
+    'gpt-transcribe': OPENAI_GPT_TRANSCRIBE_UCENTS_PER_SECOND,
 };
 
 /** The `usage` on `conversation.item.input_audio_transcription.completed`. */
@@ -163,7 +163,8 @@ const PREAUTH_PER_NODE = 600;
 const MAX_AUTHENTICATING = 64;
 const MAX_TOKEN_BYTES = 8192;
 // Each response holds this much audio, at the session model's rates, from the
-// account's budget until its usage is recorded.
+// account's budget until its usage is recorded, on top of the conversation it
+// rereads.
 const RESPONSE_HOLD_INPUT_TOKENS = 8_000;
 const RESPONSE_HOLD_OUTPUT_TOKENS = 4_096;
 // Committed input items whose transcription hasn't completed.
@@ -214,6 +215,10 @@ interface RealtimeEvent {
     response?: { id?: unknown; usage?: RealtimeUsage | null };
     usage?: RealtimeTranscriptionUsage | null;
 }
+
+/** A usage count as a non-negative finite number; anything else is 0. */
+const n = (v: number | undefined): number =>
+    typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -311,8 +316,6 @@ export const realtimeUsageRows = (
     const input = usage.input_token_details ?? {};
     const cached = input.cached_tokens_details ?? {};
     const output = usage.output_token_details ?? {};
-    const n = (v: number | undefined) =>
-        typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
     const counts: [string, number, number][] = [
         [
             'text_input',
@@ -360,8 +363,6 @@ export const realtimeTranscriptionRows = (
     usage: RealtimeTranscriptionUsage | undefined,
 ): UsageInput[] => {
     if (!usage) return [];
-    const n = (v: number | undefined) =>
-        typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
     const known = transcriptionBillingModel(model);
     const usageType = (kind: string) =>
         `openai:${known}:realtime:transcription_${kind}`;
@@ -398,21 +399,46 @@ export const realtimeTranscriptionRows = (
         }));
 };
 
-/** Budget held for one response of `model` until its usage is recorded. */
-const responseHoldAmount = (model: string): number => {
+/**
+ * Tokens a response read and wrote. The next response rereads them as its
+ * conversation so far.
+ */
+export const realtimeResponseTokens = (
+    usage: RealtimeUsage | undefined,
+): number => {
+    const input = usage?.input_token_details ?? {};
+    const output = usage?.output_token_details ?? {};
+    return (
+        n(input.text_tokens) +
+        n(input.audio_tokens) +
+        n(input.image_tokens) +
+        n(output.text_tokens) +
+        n(output.audio_tokens)
+    );
+};
+
+/**
+ * Budget held for one response of `model` until its usage is recorded, with
+ * `contextTokens` of conversation priced as uncached audio.
+ */
+const responseHoldAmount = (model: string, contextTokens = 0): number => {
     const price = REALTIME_MODELS[model];
     return (
-        RESPONSE_HOLD_INPUT_TOKENS * price.audioIn +
+        (RESPONSE_HOLD_INPUT_TOKENS + contextTokens) * price.audioIn +
         RESPONSE_HOLD_OUTPUT_TOKENS * price.audioOut
     );
 };
 
 /** Bills `count` responses that never reported usage at one hold each. */
-const unreportedResponseRows = (model: string, count: number): UsageInput[] => [
+const unreportedResponseRows = (
+    model: string,
+    count: number,
+    contextTokens: number,
+): UsageInput[] => [
     {
         usageType: `openai:${model}:realtime:unreported_response`,
         usageAmount: count,
-        costOverride: count * responseHoldAmount(model),
+        costOverride: count * responseHoldAmount(model, contextTokens),
     },
 ];
 
@@ -838,13 +864,19 @@ export class OpenAIRealtimeRelayService extends PuterService {
                 {},
             );
         });
-        this.clients.event.on('auth.access-token.revoked', (_key, data) => {
-            this.clients.event.emit(
-                'pubsub.realtime.auth-revoked',
-                { tokenUid: data.token_uid },
-                {},
-            );
-        });
+        this.clients.event.on(
+            'outer.auth.access-token.revoked',
+            (_key, data) => {
+                const tokenUid = (data as { token_uid?: unknown } | null)
+                    ?.token_uid;
+                if (typeof tokenUid !== 'string' || !tokenUid) return;
+                this.clients.event.emit(
+                    'pubsub.realtime.auth-revoked',
+                    { tokenUid },
+                    {},
+                );
+            },
+        );
         // Raw WebSockets do not participate in socket.io's cluster adapter.
         this.clients.event.on('pubsub.realtime.auth-revoked', (_key, data) => {
             const revoked = data.sessionUids
@@ -921,7 +953,11 @@ export class OpenAIRealtimeRelayService extends PuterService {
     ): Promise<void> {
         // Buffer what the client sends while auth and the upstream handshake
         // run; OpenAI clients send `session.update` immediately on open.
-        const pending: { data: RawData; isBinary: boolean }[] = [];
+        const pending: {
+            data: RawData;
+            isBinary: boolean;
+            event: RealtimeEvent;
+        }[] = [];
         let pendingBytes = 0;
         let upstream: WebSocket | null = null;
         let closed = false;
@@ -947,6 +983,8 @@ export class OpenAIRealtimeRelayService extends PuterService {
         let requested = 0;
         // Credit holds of responses whose usage isn't recorded yet.
         const responseHolds = new Map<string, Promise<CreditHold | null>>();
+        // Tokens in the conversation as of the last response's usage.
+        let contextTokens = 0;
         // Text sent since the last prompt check, checked when the next
         // response starts. Each started response maps to the completion id
         // its check logged, or null if the check refused it.
@@ -1456,7 +1494,7 @@ export class OpenAIRealtimeRelayService extends PuterService {
                     const taken = await this.#metering.reserveAiCredits(
                         actor!,
                         `openai:${billingModel}:realtime:audio_output`,
-                        responseHoldAmount(billingModel),
+                        responseHoldAmount(billingModel, contextTokens),
                     );
                     if (!taken) {
                         await refuse(
@@ -1713,6 +1751,7 @@ export class OpenAIRealtimeRelayService extends PuterService {
                 case 'response.done': {
                     inFlight = Math.max(0, inFlight - 1);
                     const usage = event.response?.usage ?? undefined;
+                    if (usage) contextTokens = realtimeResponseTokens(usage);
                     const rows = realtimeUsageRows(billingModel, usage);
                     meter(rows, takeHold(event.response?.id));
                     if (typeof event.response?.id === 'string') {
@@ -1918,7 +1957,7 @@ export class OpenAIRealtimeRelayService extends PuterService {
         const forwardPending = (): Promise<void> | undefined => {
             while (pending.length && !closed) {
                 const next = pending[0];
-                const event = parseEvent(next.data as Buffer)!;
+                const { event } = next;
                 const requestedModel =
                     event.type === 'session.update'
                         ? transcriptionModelOf(event.session)
@@ -2057,7 +2096,7 @@ export class OpenAIRealtimeRelayService extends PuterService {
                 );
                 return;
             }
-            pending.push({ data, isBinary });
+            pending.push({ data, isBinary, event });
             pendingBytes += size;
             pumpPending();
         });
@@ -2337,11 +2376,14 @@ export class OpenAIRealtimeRelayService extends PuterService {
                     inFlight,
                     code,
                 },
-                'warning',
-                { dedup: true },
+                'info',
+                { dedup: true, channel: 'ai_providers' },
             );
             // The holds are released once this charge is recorded.
-            meter(unreportedResponseRows(billingModel, inFlight), ...holds);
+            meter(
+                unreportedResponseRows(billingModel, inFlight, contextTokens),
+                ...holds,
+            );
         });
         onAdmitted();
     }

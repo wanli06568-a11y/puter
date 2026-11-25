@@ -19,36 +19,38 @@
 
 import type { Request, Response } from 'express';
 import crypto from 'node:crypto';
-import { Readable } from 'node:stream';
 import { Context } from '../../core/context.js';
 import { abortOnDisconnect } from '../../core/http/abortOnDisconnect.js';
 import { HttpError } from '../../core/http/HttpError.js';
 import { RouteOptions } from '../../core/http/index.js';
-import { pipeToResponse } from '../../core/http/pipeToResponse.js';
 import { computeNetworkFingerprint } from '../../core/http/middleware/rateLimit.js';
 import type { PuterRouter } from '../../core/http/PuterRouter.js';
+import { asRecord } from '../../core/http/requestBody.js';
 import {
     COUNT_TOKENS,
     type ChatCompletionDriver,
-} from '../../drivers/ai-chat/ChatCompletionDriver.js';
+} from '../../drivers/ai/interfaces/chat/ChatCompletionDriver.js';
 import type {
     IChatCompleteResult,
     IChatMessageResult,
     IChatModel,
     ICompleteArguments,
     UsageDetails,
-} from '../../drivers/ai-chat/types.js';
+} from '../../drivers/ai/interfaces/chat/types.js';
 import {
     outputFormatFromResponseFormat,
     rejectStatefulResponsesFields,
     toolChoiceFromWire,
-} from '../../drivers/ai-chat/utils/openaiParams.js';
+} from '../../drivers/ai/protocols/openaiCompatible/openaiParams.js';
 import {
     promoteStopForToolCalls,
     toFinishReason,
-} from '../../drivers/ai-chat/utils/stopReason.js';
+} from '../../drivers/ai/interfaces/chat/utils/stopReason.js';
 import { isDriverStreamResult } from '../../drivers/meta.js';
-import { AI_CONCURRENT, AI_RATE_LIMIT } from '../../drivers/util/aiLimits.js';
+import {
+    AI_CONCURRENT,
+    AI_RATE_LIMIT,
+} from '../../drivers/ai/shared/aiLimits.js';
 import { PuterController } from '../types.js';
 import { parseAnthropicRequest, toAnthropicMessage } from './anthropicWire.js';
 import { pipeNdjsonStream } from './ndjsonStream.js';
@@ -58,9 +60,6 @@ import {
     renderAnthropicError,
     renderOpenAIError,
 } from './wireErrors.js';
-
-const GEMINI_DOWNLOAD_BASE =
-    'https://generativelanguage.googleapis.com/download/v1beta/files';
 
 /**
  * OpenAI-/Anthropic-compatible HTTP surface on top of the
@@ -77,9 +76,7 @@ const GEMINI_DOWNLOAD_BASE =
  * never treated as root tokens). Apps, scoped tokens, and account session
  * ("root") tokens are rejected. The vendor-compatible routes additionally
  * require the account to be on a paid plan. The model listings stay open —
- * clients fetch the catalogue before they have any reason to authenticate — and
- * so does the video proxy, whose signed URLs are handed out by a generation the
- * account already paid for.
+ * clients fetch the catalogue before they have any reason to authenticate.
  */
 export class PuterAIController extends PuterController {
     registerRoutes(router: PuterRouter): void {
@@ -252,115 +249,7 @@ export class PuterAIController extends PuterController {
             publicOpts,
             this.#modelDetails('aiVideo'),
         );
-
-        // -- Video URL proxy -----------------------------------------
-        // Reverse-proxies AI-generated video URLs that can't be given
-        // directly to the client (auth-gated provider downloads). The
-        // URL itself is HMAC-signed, so no additional auth gate — and no
-        // plan gate either: it delivers a video the account already paid to
-        // generate, to whoever holds the link.
-        router.get(
-            '/puterai/video/proxy',
-            {
-                subdomain: 'api',
-                // HMAC-signed but unauthenticated, and it streams provider
-                // bandwidth through us — so the in-flight cap matters as
-                // much as the window.
-                rateLimit: {
-                    scope: 'puterai-video-proxy',
-                    limit: 60,
-                    window: 60_000,
-                    key: 'ip',
-                },
-                concurrent: {
-                    scope: 'puterai-video-proxy',
-                    limit: 5,
-                    key: 'ip',
-                },
-            },
-            this.#videoProxy,
-        );
     }
-
-    #videoProxy = async (req: Request, res: Response): Promise<void> => {
-        const fileId =
-            typeof req.query.fileId === 'string' ? req.query.fileId : '';
-        const provider =
-            typeof req.query.provider === 'string' ? req.query.provider : '';
-        const expires =
-            typeof req.query.expires === 'string' ? req.query.expires : '';
-        const signature =
-            typeof req.query.signature === 'string' ? req.query.signature : '';
-
-        if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
-            res.status(400).send('Invalid or missing fileId parameter');
-            return;
-        }
-        if (!expires || !signature) {
-            res.status(403).send('Missing signature');
-            return;
-        }
-        if (Number(expires) < Date.now() / 1000) {
-            res.status(403).send('Signature expired');
-            return;
-        }
-
-        const secret = this.config.url_signature_secret;
-        if (!secret) {
-            res.status(500).send('URL signature secret not configured');
-            return;
-        }
-        const expected = crypto
-            .createHash('sha256')
-            .update(`${fileId}/video-proxy/${secret}/${expires}`)
-            .digest('hex');
-        // Constant-time compare so signature probing can't time-leak.
-        const sigBuf = Buffer.from(signature, 'hex');
-        const expBuf = Buffer.from(expected, 'hex');
-        if (
-            sigBuf.length !== expBuf.length ||
-            !crypto.timingSafeEqual(sigBuf, expBuf)
-        ) {
-            res.status(403).send('Invalid signature');
-            return;
-        }
-
-        if (provider !== 'gemini') {
-            res.status(400).send('Unsupported provider');
-            return;
-        }
-
-        // Same key used by `gemini-video-generation` driver to mint the asset.
-        const apiKey =
-            this.config.providers?.['gemini-video-generation']?.apiKey;
-        if (!apiKey) {
-            res.status(500).send('Gemini API key not configured');
-            return;
-        }
-
-        // A visitor who leaves stops the download, not just the reply.
-        const upstream = await fetch(
-            `${GEMINI_DOWNLOAD_BASE}/${fileId}:download?alt=media&key=${apiKey}`,
-            { signal: abortOnDisconnect(res) },
-        );
-        if (!upstream.ok) {
-            res.status(upstream.status).send('Failed to fetch video');
-            return;
-        }
-        const contentType = upstream.headers.get('content-type');
-        if (contentType) res.setHeader('Content-Type', contentType);
-
-        if (!upstream.body) {
-            res.status(500).send('Empty response body');
-            return;
-        }
-        void pipeToResponse(
-            Readable.fromWeb(
-                upstream.body as unknown as import('node:stream/web').ReadableStream,
-            ),
-            res,
-        );
-    };
 
     #listModels(driverKey: 'aiChat' | 'aiImage' | 'aiVideo') {
         return async (_req: Request, res: Response): Promise<void> => {
@@ -1005,6 +894,7 @@ export class PuterAIController extends PuterController {
                                 unknown
                             >;
                             item.status = 'completed';
+                            item.arguments = started.arguments;
                             sendEvent({
                                 type: 'response.function_call_arguments.done',
                                 output_index: started.outputIndex,
@@ -1301,13 +1191,18 @@ export class PuterAIController extends PuterController {
         return driver;
     }
 
-    /** A completion that stops, and stops billing, when the caller hangs up. */
+    /**
+     * A completion whose caller may hang up. It runs on to its usage report
+     * either way, so it holds the route's concurrency slot until it settles.
+     */
     #complete(
         res: Response,
         args: ICompleteArguments,
     ): Promise<IChatCompleteResult> {
         Context.set('abortSignal', abortOnDisconnect(res));
-        return this.#driver().complete(args);
+        const completion = this.#driver().complete(args);
+        Context.get('keepConcurrencySlot')?.(completion);
+        return completion;
     }
 }
 
@@ -1365,12 +1260,6 @@ const promptCacheArgsFromBody = (
 
 const randomId = (): string => crypto.randomUUID().replace(/-/g, '');
 const generateId = (prefix: string): string => `${prefix}_${randomId()}`;
-
-const asRecord = (value: unknown): Record<string, unknown> => {
-    return value && typeof value === 'object' && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : {};
-};
 
 const toStringOrEmpty = (v: unknown): string =>
     typeof v === 'string' ? v : '';

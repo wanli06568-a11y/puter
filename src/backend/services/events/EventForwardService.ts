@@ -22,6 +22,7 @@ import {
     PRESENCE_NO_APP,
     type PresenceRow,
 } from '../../stores/events/PresenceStore.js';
+import { BoundedTtlMap } from '../../util/boundedTtlMap.js';
 import { runWithConcurrencyLimitSettled } from '../../util/concurrency.js';
 import {
     appSocketRoom,
@@ -49,7 +50,11 @@ import {
     sessionForward,
 } from './metrics.js';
 import { PresenceCache, remoteRegions } from './presenceCache.js';
-import type { DeliverableEvent, GapMarker } from './registry.js';
+import {
+    gapMarker,
+    type DeliverableEvent,
+    type GapMarker,
+} from './registry.js';
 
 /**
  * Getting a socket delivery to the region that holds the socket.
@@ -103,21 +108,23 @@ export interface ForwardableDelivery {
     ackId?: string;
     /** Client skips its handler: the event is past the handler-chain limit. */
     skipHandler?: true;
+    /**
+     * Set on a queued delivery with a worker behind it: only connections that
+     * run the subscription's handler get it, and with none it is declined.
+     */
+    toHandlers?: true;
 }
 
 /** What stands in for events a full queue could not carry across. */
-const overflowGap = (event: DeliverableEvent): GapMarker => ({
-    id: event.id,
-    subject: event.subject,
-    op: 'gap',
-    reason: 'backlog_overflow',
-    ts: event.ts,
-});
+const overflowGap = (event: DeliverableEvent): GapMarker =>
+    gapMarker(event, 'backlog_overflow');
 
 export class EventForwardService extends PuterService {
     readonly #cache = new PresenceCache();
     /** UserId → uuid, which is what the presence row is keyed by. */
-    readonly #uuids = new Map<number, string>();
+    readonly #uuids = new BoundedTtlMap<number, string>({
+        maxEntries: UUID_CACHE_MAX,
+    });
     readonly #leaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
     /** Peer → subscriptions with a gap marker still queued for it. */
     readonly #pendingMarkers = new Map<string, Set<string>>();
@@ -432,7 +439,7 @@ export class EventForwardService extends PuterService {
         entryId: string,
     ): void {
         if (!this.active) return;
-        if (!this.services.broadcast.addressablePeers.includes(region)) return;
+        if (!this.isPeer(region)) return;
         this.#queueFor().push(region, {
             kind: 'ack',
             userId,
@@ -450,7 +457,7 @@ export class EventForwardService extends PuterService {
         reason: ForwardNack['reason'],
     ): void {
         if (!this.active) return;
-        if (!this.services.broadcast.addressablePeers.includes(region)) return;
+        if (!this.isPeer(region)) return;
         this.#queueFor().push(region, {
             kind: 'nack',
             userId,
@@ -608,31 +615,57 @@ export class EventForwardService extends PuterService {
             to: this.region,
         });
 
+        // Handler rooms are looked up up front, once each however many of the
+        // batch's deliveries name one.
+        let heldRooms: Map<string, boolean> | undefined;
+        try {
+            heldRooms = await this.services.events.heldHandlerRooms(
+                items.filter(
+                    (item): item is ForwardDelivery => item.kind === 'delivery',
+                ),
+            );
+        } catch (err) {
+            console.warn('[events] handler room probe failed', err);
+        }
         for (const item of items) {
             if (item.kind !== 'delivery') continue;
             try {
-                await this.services.events.deliverForwarded(item);
+                await this.services.events.deliverForwarded(item, heldRooms);
             } catch (err) {
                 console.warn('[events] forwarded delivery failed', err);
             }
         }
 
-        for (const item of items) {
-            if (item.kind !== 'watch') continue;
-            // Turned off here means the index is not kept here either: a peer
-            // still running the announce has nothing to forward against.
-            if (!this.forwardSessionActive) continue;
-            try {
-                await this.stores.eventSubscription.noteRemoteWatch(
-                    item.userId,
-                    item.token,
-                    from,
-                    item.op,
-                );
-            } catch (err) {
-                console.warn('[events] remote-watch note failed', err);
+        // Turned off here means the index is not kept here either: a peer
+        // still running the announce has nothing to forward against. Notes on
+        // one token keep the batch's order; different tokens go together.
+        const watches = new Map<string, ForwardWatch[]>();
+        if (this.forwardSessionActive)
+            for (const item of items) {
+                if (item.kind !== 'watch') continue;
+                const key = `${item.userId}|${item.token}`;
+                const held = watches.get(key);
+                if (held) held.push(item);
+                else watches.set(key, [item]);
             }
-        }
+        await runWithConcurrencyLimitSettled(
+            [...watches.values()],
+            EventForwardService.RECEIVE_CONCURRENCY,
+            async (notes) => {
+                for (const item of notes) {
+                    try {
+                        await this.stores.eventSubscription.noteRemoteWatch(
+                            item.userId,
+                            item.token,
+                            from,
+                            item.op,
+                        );
+                    } catch (err) {
+                        console.warn('[events] remote-watch note failed', err);
+                    }
+                }
+            },
+        );
 
         for (const item of items) {
             if (item.kind !== 'bump') continue;
@@ -698,6 +731,7 @@ export class EventForwardService extends PuterService {
                     nack.reason === 'retriable' || nack.reason === 'terminal'
                         ? nack.reason
                         : 'no_handler',
+                    from,
                 ),
         );
         for (const outcome of declined)
@@ -756,9 +790,11 @@ export class EventForwardService extends PuterService {
         // A pair inside its disconnect window is one this region expects back;
         // the leave already scheduled, on this node or another, decides.
         if (this.#leaveTimers.has(key)) return;
-        if (await this.stores.presence.holdsConnection(pair.userId, app))
-            return;
-        if (await this.stores.presence.isLeaving(pair.userId, app)) return;
+        const [held, leaving] = await Promise.all([
+            this.stores.presence.holdsConnection(pair.userId, app),
+            this.stores.presence.isLeaving(pair.userId, app),
+        ]);
+        if (held || leaving) return;
         if (!(await this.stores.presence.claimRetire(pair.userId, app))) return;
 
         try {
@@ -797,6 +833,7 @@ export class EventForwardService extends PuterService {
                   }
                 : {}),
             ...(delivery.skipHandler ? { skipHandler: true as const } : {}),
+            ...(delivery.toHandlers ? { toHandlers: true as const } : {}),
         };
         this.#queueFor().push(region, item);
     }
@@ -825,12 +862,23 @@ export class EventForwardService extends PuterService {
         // A peer answering "I hold no session for this token" is
         // authoritative — this region's own remote-watch entry for it is
         // stale, so it stops sending there.
-        for (const stale of reply?.noWatch ?? [])
-            await this.stores.eventSubscription
-                .noteRemoteWatch(stale.userId, stale.token, peerId, 'drop')
-                .catch((err: unknown) => {
-                    console.warn('[events] remote-watch repair failed', err);
-                });
+        const repaired = await runWithConcurrencyLimitSettled(
+            reply?.noWatch ?? [],
+            EventForwardService.RECEIVE_CONCURRENCY,
+            (stale) =>
+                this.stores.eventSubscription.noteRemoteWatch(
+                    stale.userId,
+                    stale.token,
+                    peerId,
+                    'drop',
+                ),
+        );
+        for (const outcome of repaired)
+            if (outcome.status === 'rejected')
+                console.warn(
+                    '[events] remote-watch repair failed',
+                    outcome.reason,
+                );
     }
 
     /**
@@ -866,8 +914,8 @@ export class EventForwardService extends PuterService {
             'events_forward_overflow',
             'Events queued for another region were dropped to stay inside the queue bound',
             { peerId, dropped: dropped.length },
-            'warning',
-            { dedup: true },
+            'info',
+            { dedup: true, channel: 'platform' },
         );
         return markers;
     }
@@ -922,7 +970,7 @@ export class EventForwardService extends PuterService {
         const userUuid = actor.user?.uuid;
         if (typeof userId !== 'number' || !userUuid) return null;
         const appUid = presenceApp(actor.effectiveApp?.uid ?? null);
-        this.#rememberUuid(userId, userUuid);
+        this.#uuids.set(userId, userUuid);
         return { userId, userUuid, appUid, key: `${userId}|${appUid}` };
     }
 
@@ -933,20 +981,10 @@ export class EventForwardService extends PuterService {
             const user = await this.stores.user.getById(userId);
             const uuid = user?.uuid;
             if (!uuid) return null;
-            this.#rememberUuid(userId, uuid);
+            this.#uuids.set(userId, uuid);
             return uuid;
         } catch {
             return null;
-        }
-    }
-
-    #rememberUuid(userId: number, uuid: string): void {
-        this.#uuids.delete(userId);
-        this.#uuids.set(userId, uuid);
-        while (this.#uuids.size > UUID_CACHE_MAX) {
-            const oldest = this.#uuids.keys().next();
-            if (oldest.done) break;
-            this.#uuids.delete(oldest.value);
         }
     }
 }
