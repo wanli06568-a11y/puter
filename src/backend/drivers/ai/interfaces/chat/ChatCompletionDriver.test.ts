@@ -1137,6 +1137,143 @@ describe('ChatCompletionDriver.complete credit gate and max_tokens cap', () => {
                 server.clients.event.off('metering.out-of-credits', refill);
             }
         });
+
+        it('buys a top-up for a request another one holds the overdraft against', async () => {
+            const d = await capme();
+            const OVERDRAFT = 5_000_000;
+            // The first request runs on the overdraft and holds all of it.
+            const held = 100_000 + OVERDRAFT;
+            const headroom = vi
+                .spyOn(server.services.metering, 'getUsageHeadroom')
+                .mockResolvedValueOnce({ balance: 100_000, held })
+                .mockResolvedValue({ balance: 100_000_000, held });
+            // Grants an overdraft only when what is not held covers the request.
+            const relief = vi.fn(
+                (
+                    _key: string,
+                    refusal: {
+                        balance: number;
+                        held?: number;
+                        required: number;
+                        refilled: boolean;
+                        overdraft?: number;
+                    },
+                ) => {
+                    if (
+                        refusal.balance - (refusal.held ?? 0) + OVERDRAFT >=
+                        refusal.required
+                    ) {
+                        refusal.overdraft = OVERDRAFT;
+                    } else {
+                        refusal.refilled = true;
+                    }
+                },
+            );
+            server.clients.event.on('metering.out-of-credits', relief as never);
+            try {
+                expect(await completeCapme(d)).toBe(8192);
+                expect(relief.mock.calls[0]![1]).toMatchObject({
+                    balance: 100_000,
+                    held,
+                    refilled: true,
+                });
+                expect(headroom).toHaveBeenCalledTimes(2);
+            } finally {
+                server.clients.event.off(
+                    'metering.out-of-credits',
+                    relief as never,
+                );
+            }
+        });
+
+        describe('on an overdraft a listener grants', () => {
+            const OVERDRAFT = 5_000_000;
+            const grant = vi.fn(
+                (_key: string, refusal: { overdraft?: number }) => {
+                    refusal.overdraft = OVERDRAFT;
+                },
+            );
+            beforeEach(() => {
+                grant.mockClear();
+                server.clients.event.on(
+                    'metering.out-of-credits',
+                    grant as never,
+                );
+            });
+            afterEach(() => {
+                server.clients.event.off(
+                    'metering.out-of-credits',
+                    grant as never,
+                );
+            });
+
+            it('gives the reply its full output limit when the two cover it', async () => {
+                const d = await capme();
+                const headroom = vi
+                    .spyOn(server.services.metering, 'getUsageHeadroom')
+                    .mockResolvedValue({ balance: 15_000_000, held: 0 });
+                const reserve = vi.spyOn(
+                    server.services.metering,
+                    'reserveCredits',
+                );
+
+                expect(await completeCapme(d)).toBe(8192);
+                expect(grant).toHaveBeenCalledTimes(1);
+                const refusal = grant.mock.calls[0]![1] as {
+                    balance: number;
+                    required: number;
+                };
+                expect(refusal.balance).toBe(15_000_000);
+                // The prompt and one token of reply, not the full reply.
+                expect(refusal.required).toBeGreaterThanOrEqual(2000);
+                expect(refusal.required).toBeLessThan(1_000_000);
+                // The balance is as it was, so it isn't read again.
+                expect(headroom).toHaveBeenCalledTimes(1);
+                expect(reserve.mock.calls[0]![2]).toMatchObject({
+                    within: { balance: 15_000_000, overdraft: OVERDRAFT },
+                });
+            });
+
+            it('tells the listener what running requests hold', async () => {
+                const d = await capme();
+                vi.spyOn(
+                    server.services.metering,
+                    'getUsageHeadroom',
+                ).mockResolvedValue({ balance: 15_000_000, held: 12_000_000 });
+
+                await completeCapme(d);
+                expect(grant.mock.calls[0]![1]).toMatchObject({
+                    balance: 15_000_000,
+                    held: 12_000_000,
+                });
+            });
+
+            it('caps the reply at the balance plus the overdraft', async () => {
+                const d = await capme();
+                vi.spyOn(
+                    server.services.metering,
+                    'getUsageHeadroom',
+                ).mockResolvedValue({ balance: 100_000, held: 0 });
+
+                const maxTokens = await completeCapme(d);
+                // 100_000 µ¢ alone buys 50 tokens; with the overdraft, 2550.
+                expect(maxTokens).toBeGreaterThan(2000);
+                expect(maxTokens).toBeLessThanOrEqual(2550);
+            });
+
+            it('refuses a prompt the two together cannot pay for', async () => {
+                const d = await capme();
+                vi.spyOn(
+                    server.services.metering,
+                    'getUsageHeadroom',
+                ).mockResolvedValue({ balance: -OVERDRAFT, held: 0 });
+
+                await expect(completeCapme(d)).rejects.toMatchObject({
+                    statusCode: 402,
+                    legacyCode: 'insufficient_funds',
+                });
+            });
+        });
     });
 
     it('caps `max_tokens` so output cannot exceed remaining credits', async () => {

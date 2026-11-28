@@ -18,7 +18,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { addonCreditsBudget, addonCreditsRemaining, meterPercent, monthlyUsageOrThrow, usageBudget } from './usageBudget.js';
+import { addonCreditsRemaining, meterPercent, monthlyBalance, monthlyUsageOrThrow, usageBudget } from './usageBudget.js';
 
 const info = (allowance, addons = {}) => ({
     monthUsageAllowance: allowance,
@@ -146,40 +146,54 @@ describe('addonCreditsRemaining', () => {
             consumedPurchaseCredits: NaN,
         }))).toBe(1_000);
     });
+
+    it('is below zero by what an account that never bought any owes', () => {
+        expect(addonCreditsRemaining(info(900_000_000, { overdrawn: 400 }))).toBe(-400);
+    });
+
+    it('takes what is owed off the credit that is left', () => {
+        expect(addonCreditsRemaining(info(0, {
+            purchasedCredits: 2_500,
+            consumedPurchaseCredits: 0,
+            overdrawn: 100,
+        }))).toBe(2_400);
+        expect(addonCreditsRemaining(info(0, {
+            purchasedCredits: 1_000,
+            consumedPurchaseCredits: 1_000,
+            overdrawn: 50,
+        }))).toBe(-50);
+    });
+
+    it('counts a counter below zero as credit, and zero as nothing', () => {
+        expect(addonCreditsRemaining(info(0, { overdrawn: 0 }))).toBeNull();
+        expect(addonCreditsRemaining(info(0, { overdrawn: -30 }))).toBe(30);
+    });
 });
 
-describe('addonCreditsBudget', () => {
-    it('has no meter for an account that never had add-on credit', () => {
-        expect(addonCreditsBudget(info(900_000_000))).toBeNull();
-        expect(addonCreditsBudget(info(900_000_000, { purchasedCredits: 0 }))).toBeNull();
-        expect(addonCreditsBudget(undefined)).toBeNull();
+describe('monthlyBalance', () => {
+    it('is the allowance minus what the allowance paid for', () => {
+        expect(monthlyBalance({ total: 3_420, allowanceUsed: 3_420 }, info(10_000))).toBe(6_580);
     });
 
-    it('meters what was spent of the credit bought', () => {
-        expect(addonCreditsBudget(info(900_000_000, {
-            purchasedCredits: 2_500,
-            consumedPurchaseCredits: 850,
-        }))).toEqual({ used: 850, capacity: 2_500, percent: 34, barPercent: 34 });
+    it('ignores spend that top-up credit paid for', () => {
+        expect(monthlyBalance({ total: 18_000, allowanceUsed: 10_000 }, info(10_000))).toBe(0);
+        expect(monthlyBalance({ total: 4_000, allowanceUsed: 1_000 }, info(10_000))).toBe(9_000);
     });
 
-    it('starts empty when nothing has been spent, or the spend is unreadable', () => {
-        expect(addonCreditsBudget(info(0, { purchasedCredits: 1_000 })))
-            .toEqual({ used: 0, capacity: 1_000, percent: 0, barPercent: 0 });
-        expect(addonCreditsBudget(info(0, { purchasedCredits: 1_000, consumedPurchaseCredits: NaN })).used).toBe(0);
+    it('never goes below zero', () => {
+        expect(monthlyBalance({ total: 12_000, allowanceUsed: 12_000 }, info(10_000))).toBe(0);
     });
 
-    it('reads full, never past it, once the pool is spent', () => {
-        expect(addonCreditsBudget(info(0, {
-            purchasedCredits: 1_000,
-            consumedPurchaseCredits: 1_200,
-        }))).toEqual({ used: 1_000, capacity: 1_000, percent: 100, barPercent: 100 });
+    it('counts overdrawn spend the allowance paid off', () => {
+        expect(monthlyBalance(
+            { total: 1_000, allowanceUsed: 1_000, overdraftSettled: 1_500 },
+            info(10_000),
+        )).toBe(7_500);
     });
 
-    it('holds at 99% while any credit is left', () => {
-        expect(addonCreditsBudget(info(0, {
-            purchasedCredits: 100_000,
-            consumedPurchaseCredits: 99_999,
-        })).percent).toBe(99);
+    it('is zero with no allowance or no report', () => {
+        expect(monthlyBalance({ total: 0 }, info(0))).toBe(0);
+        expect(monthlyBalance(undefined, undefined)).toBe(0);
     });
 });
 
